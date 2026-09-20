@@ -1,0 +1,293 @@
+/*
+    tools.js: the brush tools that turn a drag into a STROKE frame.
+
+    A drag is sampled in screen space, thinned to roughly one sample per
+    MIN_SAMPLE_PX of travel and only then unprojected, which keeps a stroke a
+    few dozen rays instead of a few thousand -- the server smooths the curve
+    along the surface anyway, so denser sampling buys nothing.
+
+    Rays leave in mesh space because Session::projectStroke expects them there;
+    Viewer.screenRay is what guarantees that.
+*/
+
+import { MessageType } from './protocol.js';
+
+/** Minimum travel, in CSS pixels, between two samples of a stroke. */
+const MIN_SAMPLE_PX = 6;
+
+/** A press that never travels further than this is a click, not a stroke. */
+const CLICK_SLOP_PX = 4;
+
+/** How near a click has to land on a projected handle to delete its stroke. */
+const HANDLE_HIT_PX = 14;
+
+/** Search radius handed to Session::eraseStrokeNear, in average edge lengths. */
+const ERASE_RADIUS_EDGES = 2;
+
+const NAVIGATION_HINT = 'Right-drag or shift-drag pans, wheel zooms.';
+
+/**
+ * The five selectable tools.  `kind` is what goes into the STROKE header: the
+ * two persistent brushes use the numeric StrokeKind the C++ enum defines, the
+ * attractors name themselves instead because they leave no stroke behind.
+ */
+export const TOOLS = [
+    {
+        id: 'orbit',
+        label: 'Orbit',
+        kind: null,
+        hint: `Left-drag orbits. ${NAVIGATION_HINT}`,
+    },
+    {
+        id: 'comb',
+        label: 'Orientation Comb',
+        kind: 0,
+        hint: 'Drag across the surface to comb the orientation field.',
+    },
+    {
+        id: 'orient-attractor',
+        label: 'Orientation Singularity Attractor',
+        kind: 'attractor_orientation',
+        hint: 'Drag from an orientation singularity to move, create or cancel it.',
+    },
+    {
+        id: 'edge',
+        label: 'Edge Brush',
+        kind: 1,
+        hint: 'Drag to pin an edge path of the output mesh onto the surface.',
+    },
+    {
+        id: 'pos-attractor',
+        label: 'Position Singularity Attractor',
+        kind: 'attractor_position',
+        hint: 'Drag from a position singularity to move, create or cancel it.',
+    },
+];
+
+const TOOLS_BY_ID = new Map(TOOLS.map((tool) => [tool.id, tool]));
+
+export class ToolController {
+    /**
+     * @param {import('./renderer.js').Viewer} viewer
+     * @param {import('./net.js').Connection} connection
+     * @param {{onToolChange?: (tool: object) => void,
+     *          onNotice?: (message: string) => void}} callbacks
+     */
+    constructor(viewer, connection, { onToolChange = null, onNotice = null } = {}) {
+        this.viewer = viewer;
+        this.connection = connection;
+        this._onToolChange = onToolChange;
+        this._onNotice = onNotice;
+
+        this._tool = TOOLS_BY_ID.get('orbit');
+        this._pointerId = null;
+        this._drawing = false;
+        this._samples = [];
+        this._rect = null;
+        this._press = null;
+        this._travel = 0;
+
+        const canvas = viewer.canvas;
+        this._listeners = [
+            [canvas, 'pointerdown', (event) => this._onPointerDown(event)],
+            [canvas, 'pointermove', (event) => this._onPointerMove(event)],
+            [canvas, 'pointerup', (event) => this._onPointerUp(event)],
+            [canvas, 'pointercancel', () => this.cancelStroke()],
+            [window, 'keydown', (event) => this._onKeyDown(event)],
+            [window, 'blur', () => this.cancelStroke()],
+        ];
+        for (const [target, type, handler] of this._listeners) {
+            target.addEventListener(type, handler);
+        }
+
+        this.setTool('orbit');
+    }
+
+    get tool() {
+        return this._tool;
+    }
+
+    /** @param {'orbit'|'comb'|'orient-attractor'|'edge'|'pos-attractor'} id */
+    setTool(id) {
+        const tool = TOOLS_BY_ID.get(id);
+        if (!tool) throw new Error(`unknown tool "${id}"`);
+
+        this.cancelStroke();
+        this._tool = tool;
+        this.viewer.setControlsEnabled(tool.kind === null);
+        if (this._onToolChange) this._onToolChange(tool);
+    }
+
+    /** Drop the stroke being drawn without sending anything. */
+    cancelStroke() {
+        if (this._pointerId !== null) {
+            try {
+                this.viewer.canvas.releasePointerCapture(this._pointerId);
+            } catch {
+                /* The pointer is already gone; nothing left to release. */
+            }
+        }
+        this._pointerId = null;
+        this._drawing = false;
+        this._samples = [];
+        this._press = null;
+        this._travel = 0;
+        this.viewer.setPreviewStroke(null);
+    }
+
+    dispose() {
+        this.cancelStroke();
+        for (const [target, type, handler] of this._listeners) {
+            target.removeEventListener(type, handler);
+        }
+        this._listeners = [];
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  Pointer handling                                               */
+    /* -------------------------------------------------------------- */
+
+    _onPointerDown(event) {
+        if (event.button !== 0 || this._pointerId !== null) return;
+
+        this._pointerId = event.pointerId;
+        this._rect = this.viewer.canvas.getBoundingClientRect();
+        this._press = { clientX: event.clientX, clientY: event.clientY };
+        this._travel = 0;
+        this._drawing = this._tool.kind !== null;
+        this._samples = this._drawing ? [this._sample(event)] : [];
+
+        if (this._drawing) {
+            /* Capture keeps a stroke alive when the drag leaves the canvas. It
+               is an optimisation, not a precondition: if the pointer is already
+               gone the stroke still works over the canvas itself. */
+            try {
+                this.viewer.canvas.setPointerCapture(event.pointerId);
+            } catch {
+                /* No active pointer with this id. */
+            }
+        }
+    }
+
+    _onPointerMove(event) {
+        if (event.pointerId !== this._pointerId) return;
+
+        this._travel = Math.max(this._travel, this._distanceFromPress(event));
+        if (!this._drawing) return;
+
+        const last = this._samples[this._samples.length - 1];
+        if (Math.hypot(event.clientX - last.clientX, event.clientY - last.clientY) < MIN_SAMPLE_PX) {
+            return;
+        }
+        this._samples.push(this._sample(event));
+        this.viewer.setPreviewStroke(this._samples.slice());
+    }
+
+    _onPointerUp(event) {
+        if (event.pointerId !== this._pointerId) return;
+
+        const drawing = this._drawing;
+        const samples = this._samples;
+        const travel = Math.max(this._travel, this._distanceFromPress(event));
+
+        /* The release point closes the stroke, so a drag shorter than one
+           sampling step still produces the two samples a curve needs. */
+        if (drawing && travel > CLICK_SLOP_PX) samples.push(this._sample(event));
+
+        this.cancelStroke();
+
+        if (travel <= CLICK_SLOP_PX) {
+            this._eraseStrokeAt(event.clientX, event.clientY);
+        } else if (drawing && samples.length >= 2) {
+            this._sendStroke(samples);
+        }
+    }
+
+    _onKeyDown(event) {
+        if (event.key !== 'Escape' || this._pointerId === null) return;
+        this.cancelStroke();
+        this._notify('Stroke cancelled');
+    }
+
+    _sample(event) {
+        return {
+            clientX: event.clientX,
+            clientY: event.clientY,
+            x: event.clientX - this._rect.left,
+            y: event.clientY - this._rect.top,
+        };
+    }
+
+    _distanceFromPress(event) {
+        return Math.hypot(event.clientX - this._press.clientX, event.clientY - this._press.clientY);
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  Frames                                                         */
+    /* -------------------------------------------------------------- */
+
+    _sendStroke(samples) {
+        if (!this.viewer.mesh) {
+            this._notify('No mesh loaded yet');
+            return;
+        }
+
+        const count = samples.length;
+        const origins = new Float32Array(count * 3);
+        const directions = new Float32Array(count * 3);
+        for (let i = 0; i < count; ++i) {
+            const ray = this.viewer.screenRay(samples[i].clientX, samples[i].clientY);
+            origins.set(ray.origin, i * 3);
+            directions.set(ray.direction, i * 3);
+        }
+
+        this.connection.send(
+            MessageType.STROKE,
+            { kind: this._tool.kind, solve: true },
+            {
+                ray_origins: { data: origins, shape: [count, 3] },
+                ray_directions: { data: directions, shape: [count, 3] },
+            }
+        );
+    }
+
+    /**
+     * A click on a stroke's handle deletes that stroke.  The server does the
+     * actual matching through Session::eraseStrokeNear, so it needs the handle
+     * position, the eye it has to be visible from, and a search radius.
+     */
+    _eraseStrokeAt(clientX, clientY) {
+        const handle = this._handleAt(clientX, clientY);
+        if (!handle) return;
+
+        const eye = this.viewer.eye();
+        this.connection.send(MessageType.ERASE_STROKE, {
+            point: [handle.position.x, handle.position.y, handle.position.z],
+            eye: [eye[0], eye[1], eye[2]],
+            radius: this.viewer.averageEdgeLength * ERASE_RADIUS_EDGES,
+        });
+    }
+
+    _handleAt(clientX, clientY) {
+        const rect = this.viewer.canvas.getBoundingClientRect();
+        const x = clientX - rect.left;
+        const y = clientY - rect.top;
+
+        let best = null;
+        let bestDistance = HANDLE_HIT_PX;
+        for (const handle of this.viewer.strokeHandles()) {
+            const screen = this.viewer.projectToScreen(handle.position);
+            if (!screen) continue;
+            const distance = Math.hypot(screen.x - x, screen.y - y);
+            if (distance <= bestDistance) {
+                bestDistance = distance;
+                best = handle;
+            }
+        }
+        return best;
+    }
+
+    _notify(message) {
+        if (this._onNotice) this._onNotice(message);
+    }
+}

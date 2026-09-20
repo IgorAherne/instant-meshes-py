@@ -1,0 +1,54 @@
+name: Build wheels
+
+# Produces self-contained binary wheels so users do not need a C++ toolchain.
+# The extension links nothing but the C++ runtime -- TBB was replaced by a
+# header-only std::thread shim -- so no library needs to be bundled or repaired
+# beyond what auditwheel/delocate do by default.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  wheels:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ext/dset, ext/pss and ext/pcg32 are header-only and required;
+          # ext/nanogui is only needed for the optional desktop GUI.
+          submodules: false
+
+      - name: Fetch the header-only submodules
+        run: git submodule update --init ext/dset ext/pss ext/pcg32
+
+      - uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-*
+          CIBW_SKIP: "*-musllinux_i686 *-win32 *_i686"
+          CIBW_ARCHS_MACOS: universal2
+          CIBW_TEST_REQUIRES: pytest numpy trimesh
+          CIBW_TEST_COMMAND: pytest {project}/tests -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init ext/dset ext/pss ext/pcg32
+      - run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz

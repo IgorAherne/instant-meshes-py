@@ -14,10 +14,19 @@
 #pragma once
 
 #if defined(_WIN32)
-    #define NOMINMAX
+    #if !defined(NOMINMAX)
+        #define NOMINMAX
+    #endif
+    /* M_PI and friends are not in the C++ standard; MSVC only exposes them when
+       this is defined before <cmath> is first pulled in.  The GUI build used to
+       inherit it from NanoGUI, which the Python extension does not link. */
+    #if !defined(_USE_MATH_DEFINES)
+        #define _USE_MATH_DEFINES
+    #endif
     #pragma warning(disable: 4244 4018 4100 4610 4510 4127 4512 4146 4267 4503 4800 4706)
 #endif
 
+#include <cmath>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <iostream>

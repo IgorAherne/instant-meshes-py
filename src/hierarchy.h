@@ -29,6 +29,16 @@ struct MultiResolutionHierarchy {
     enum { MAX_DEPTH = 25 };
 public:
     MultiResolutionHierarchy();
+
+    /* The adjacency matrices are raw Link arrays, so without this the memory
+       survives the object. The desktop app only ever freed them on reload; a
+       server that builds one hierarchy per browser session needs them released
+       when the session goes away. */
+    ~MultiResolutionHierarchy() { free(); }
+
+    MultiResolutionHierarchy(const MultiResolutionHierarchy &) = delete;
+    MultiResolutionHierarchy &operator=(const MultiResolutionHierarchy &) = delete;
+
     void free();
     void save(Serializer &state);
     void load(const Serializer &state);

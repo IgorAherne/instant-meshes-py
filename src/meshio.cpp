@@ -359,7 +359,12 @@ void load_obj(const std::string &filename, MatrixXu &F, MatrixXf &V,
     };
 
     /// Hash function for obj_vertex
-    struct obj_vertexHash : std::unary_function<obj_vertex, size_t> {
+    /* std::unary_function was deprecated in C++11 and removed in C++17; the
+       typedefs it provided are unused here, so the base class simply goes away. */
+    struct obj_vertexHash {
+        typedef obj_vertex argument_type;
+        typedef std::size_t result_type;
+
         std::size_t operator()(const obj_vertex &v) const {
             size_t hash = std::hash<uint32_t>()(v.p);
             hash = hash * 37 + std::hash<uint32_t>()(v.uv);

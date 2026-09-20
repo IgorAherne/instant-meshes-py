@@ -21,3 +21,14 @@ datasets
 *.filters
 *.sdf
 *.sln
+# Python build artefacts
+.venv/
+build/
+build_test/
+*.egg-info/
+__pycache__/
+*.pyd
+*.so
+
+# Vendored Eigen (fetched by CMake when absent)
+/ext/eigen/

@@ -189,6 +189,19 @@ public:
     int level() const { return mLevel; }
     Float progress() const { return mProgress; }
 
+    /* How often (ms) an interactive hierarchical solve propagates its state
+       down to level 0 so a client can display it mid-solve. */
+    void setPreviewInterval(int ms) { mPreviewInterval = ms > 0 ? ms : 1; }
+    int previewInterval() const { return mPreviewInterval; }
+
+    /* Message from the last exception the solver thread swallowed, or empty.
+       Call under mRes.mutex(); it clears the slot as it reads. */
+    std::string takeLastError() {
+        std::string error;
+        error.swap(mLastError);
+        return error;
+    }
+
 #ifdef VISUALIZE_ERROR
     const VectorXf &error() { return mError; }
 #endif
@@ -203,7 +216,9 @@ public:
 protected:
     MultiResolutionHierarchy &mRes;
     std::vector<std::pair<bool, std::vector<uint32_t>>> mAttractorStrokes;
-    bool mRunning;
+    /* shutdown() clears this without holding mRes.mutex(), while run() and
+       wait() read it while holding it, so it has to be atomic. */
+    std::atomic<bool> mRunning;
     bool mOptimizeOrientations;
     bool mOptimizePositions;
     std::thread mThread;
@@ -215,6 +230,8 @@ protected:
     bool mInteractive;
     double mLastUpdate;
     Float mProgress;
+    int mPreviewInterval;
+    std::string mLastError;
 #ifdef VISUALIZE_ERROR
     VectorXf mError;
 #endif

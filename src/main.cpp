@@ -20,7 +20,8 @@
 /* Force usage of discrete GPU on laptops */
 NANOGUI_FORCE_DISCRETE_GPU();
 
-int nprocs = -1;
+/* Defined in globals.cpp so that a library built from the core alone links. */
+extern int nprocs;
 
 int main(int argc, char **argv) {
     std::vector<std::string> args;

@@ -1,0 +1,697 @@
+"""HTTP and WebSocket front end for the brushing UI.
+
+``build_app`` returns a plain :class:`fastapi.FastAPI` that serves the viewer,
+mints sessions and speaks the binary protocol in :mod:`.protocol`.  It is
+deliberately mount-agnostic: a Gradio layer can call
+``gradio.mount_gradio_app(build_app(), blocks, path="/")`` afterwards, and
+because Starlette dispatches the first matching route in registration order,
+everything registered here -- the WebSocket included -- keeps winning over the
+Gradio mount.
+
+Each connection runs two coroutines against one :class:`.session_manager.
+BrushSession`: a reader that dispatches client frames, and a streamer that
+polls the solver's version counters and pushes a field update only when they
+move.  Neither ever calls into C++ directly; the session's own worker thread
+does that, so the event loop keeps answering pings during a multi-minute solve.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import secrets
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
+
+import numpy as np
+import trimesh
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import _core, protocol
+from .protocol import MessageType
+from .session_manager import (
+    BrushSession,
+    Extraction,
+    Geometry,
+    SessionError,
+    SessionLimitError,
+    SessionRegistry,
+    Singularities,
+    SolveState,
+    StrokeResult,
+    default_registry,
+)
+
+LOG = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).parent / "static"
+INDEX_HTML = STATIC_DIR / "index.html"
+
+DEFAULT_FPS = 15
+MIN_FPS = 1
+MAX_FPS = 60
+
+#: A mesh upload is one WebSocket frame, and uvicorn's 16 MiB default would
+#: close the socket with 1009 rather than report an error.
+WS_MAX_SIZE = 256 * 1024 * 1024
+
+#: Stroke flavours a client may name, mapped to the session call they select.
+_STROKE_KINDS: Dict[Any, str] = {
+    int(_core.StrokeKind.ORIENTATION): "orientation",
+    int(_core.StrokeKind.EDGE): "edge",
+    "orientation": "orientation",
+    "edge": "edge",
+    "attractor_orientation": "attractor_orientation",
+    "attractor_position": "attractor_position",
+}
+
+#: What a brush stroke re-solves, following Viewer::mouseButtonEvent.
+#:
+#: Every stroke constrains the orientation field (session.cpp fills CQ/CQw for
+#: both kinds), so both brushes have to re-solve it; the edge brush also pins
+#: CO and therefore continues into the positions, which is what the viewer's
+#: mContinueWithPositions does.  Attractors are absent on purpose: the core
+#: starts the frozen level-0 solve their move needs, and the session follows it.
+_SOLVE_PLANS: Dict[str, Tuple[str, int]] = {
+    "orientation": ("both", -1),
+    "edge": ("both", -1),
+}
+
+
+# ---------------------------------------------------------------------------
+#  Mesh input
+# ---------------------------------------------------------------------------
+
+
+def _rows(array: Any, width: int, what: str) -> np.ndarray:
+    """Accept either an ``(N, width)`` array or the flat form of one."""
+    if array is None:
+        raise SessionError(f"missing array {what!r}")
+    values = np.asarray(array)
+    if values.ndim == 1:
+        if values.size % width:
+            raise SessionError(
+                f"{what}: {values.size} values do not divide into rows of {width}"
+            )
+        return values.reshape(-1, width)
+    if values.ndim != 2 or values.shape[1] != width:
+        raise SessionError(f"{what}: expected an (N, {width}) array, got shape {values.shape}")
+    return values
+
+
+def load_mesh_file(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Read any trimesh-supported file down to triangles and merged vertices."""
+    if not path.is_file():
+        raise SessionError(f"no such mesh file: {path}")
+    try:
+        loaded = trimesh.load(path, force="mesh", process=True)
+    except Exception as exc:
+        raise SessionError(f"could not read {path.name}: {exc}") from exc
+
+    if not isinstance(loaded, trimesh.Trimesh):
+        raise SessionError(
+            f"{path.name} is a {type(loaded).__name__}, not a triangle mesh; "
+            "point clouds and curves are not supported"
+        )
+    faces = np.asarray(loaded.faces)
+    if faces.ndim != 2 or faces.shape[1] != 3 or faces.shape[0] == 0:
+        raise SessionError(f"{path.name} does not contain any triangles")
+    return np.asarray(loaded.vertices, dtype=np.float32), faces.astype(np.uint32, copy=False)
+
+
+def _as_config(values: Any, what: str) -> Optional[Mapping[str, Any]]:
+    if values is None or isinstance(values, Mapping):
+        return values
+    raise SessionError(
+        f"{what} expects a mapping of config values, got {type(values).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Frame builders
+# ---------------------------------------------------------------------------
+
+
+def _geometry_frame(geometry: Geometry) -> bytes:
+    lo = geometry.vertices.min(axis=0)
+    hi = geometry.vertices.max(axis=0)
+    header = {
+        "name": geometry.name,
+        "n_vertices": int(geometry.vertices.shape[0]),
+        "n_faces": int(geometry.faces.shape[0]),
+        "scale": float(geometry.scale),
+        "bbox": [float(v) for v in (*lo, *hi)],
+        # Lifted out of the config because the renderer needs the symmetries to
+        # pick its field shader before it has looked at anything else.
+        "rosy": int(geometry.config["rosy"]),
+        "posy": int(geometry.config["posy"]),
+        "config": geometry.config,
+    }
+    arrays = {
+        "vertices": geometry.vertices,
+        "faces": geometry.faces,
+        "normals": geometry.normals,
+    }
+    return protocol.encode(MessageType.GEOMETRY, header, arrays)
+
+
+def _field_frame(
+    orientation: np.ndarray, position: np.ndarray, state: SolveState, solving: bool
+) -> bytes:
+    header = dict(state.as_dict())
+    header["n_vertices"] = int(orientation.shape[0])
+    header["solving"] = solving
+    return protocol.encode(
+        MessageType.FIELD, header, {"orientation": orientation, "position": position}
+    )
+
+
+def _singularity_frame(singularities: Singularities) -> bytes:
+    header = {
+        "n_orientation": int(singularities.orientation_positions.shape[0]),
+        "n_position": int(singularities.position_positions.shape[0]),
+    }
+    arrays = {
+        "orientation_positions": singularities.orientation_positions,
+        "orientation_colors": singularities.orientation_colors,
+        "position_positions": singularities.position_positions,
+        "position_colors": singularities.position_colors,
+    }
+    return protocol.encode(MessageType.SINGULARITIES, header, arrays)
+
+
+def _stroke_frame(result: StrokeResult) -> bytes:
+    header = {
+        "stroke_id": int(result.stroke_id),
+        "kind": result.kind,
+        "n_points": int(result.positions.shape[0]),
+    }
+    arrays = {
+        "positions": result.positions,
+        "normals": result.normals,
+        "faces": result.faces,
+    }
+    return protocol.encode(MessageType.STROKE_RESULT, header, arrays)
+
+
+def _extracted_frame(extraction: Extraction) -> bytes:
+    header = {
+        "n_vertices": int(extraction.vertices.shape[0]),
+        "n_faces": int(extraction.faces.shape[0]),
+        "posy": int(extraction.faces.shape[1]) if extraction.faces.size else 0,
+    }
+    arrays = {
+        "vertices": extraction.vertices,
+        "faces": extraction.faces,
+        "face_normals": extraction.face_normals,
+        "wireframe": extraction.wireframe,
+        "wireframe_color": extraction.wireframe_color,
+    }
+    return protocol.encode(MessageType.EXTRACTED, header, arrays)
+
+
+# ---------------------------------------------------------------------------
+#  One WebSocket connection
+# ---------------------------------------------------------------------------
+
+
+class _Connection:
+    """Reader plus field streamer for a single browser socket."""
+
+    def __init__(self, websocket: WebSocket, session: BrushSession) -> None:
+        self.ws = websocket
+        self.session = session
+        self.fps = DEFAULT_FPS
+        self._send_lock = asyncio.Lock()
+        self._streamer: Optional[asyncio.Task] = None
+        #: (active, solving) as last *sent*, wherever it was sent from. The
+        #: streamer's change detector reads it, so a reply that a handler
+        #: pushed out of band still counts as having been reported.
+        self._last_summary: Optional[Tuple[bool, bool]] = None
+        #: Geometry version as last *sent*, so a mesh loaded from the Gradio
+        #: panel -- or any other holder of this session -- reaches this socket.
+        self._sent_geometry_version = -1
+
+    # -- transport ---------------------------------------------------------
+
+    async def _send(self, frame: bytes) -> None:
+        # The streamer and the reader both write here; uvicorn's WebSocket
+        # implementation is not safe against interleaved sends.
+        async with self._send_lock:
+            try:
+                await self.ws.send_bytes(frame)
+            except RuntimeError as exc:
+                # Starlette reports a send on a socket it has already closed as
+                # a RuntimeError. To every caller here that is simply a client
+                # that left, and one exception type means one way to handle it.
+                raise WebSocketDisconnect(code=1006) from exc
+
+    async def _send_error(self, message: str, *, fatal: bool = False) -> None:
+        await self._send(protocol.error(message, fatal=fatal))
+
+    async def run(self) -> None:
+        self._streamer = asyncio.create_task(
+            self._stream_fields(), name=f"imb-stream-{self.session.id}"
+        )
+        try:
+            while True:
+                message = await self.ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                raw = message.get("bytes")
+                if raw is None:
+                    await self._send_error("this endpoint only accepts binary frames")
+                    continue
+                self.session.touch()
+                await self._dispatch(raw)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            self._streamer.cancel()
+            await asyncio.gather(self._streamer, return_exceptions=True)
+            # The C++ solver thread outlives the socket unless it is told not
+            # to; the session itself stays for a reconnect until the TTL sweep.
+            with contextlib.suppress(Exception):
+                await self.session.stop()
+
+    async def _dispatch(self, raw: bytes) -> None:
+        try:
+            message = protocol.decode(raw)
+        except protocol.ProtocolError as exc:
+            await self._send_error(str(exc), fatal=True)
+            return
+
+        handler = self._HANDLERS.get(message.type)
+        if handler is None:
+            await self._send_error(f"unsupported message type {message.type}")
+            return
+
+        try:
+            await handler(self, message)
+        except WebSocketDisconnect:
+            # The client left mid-reply. That is not a handler failure, and
+            # answering it with an error frame would only raise again.
+            raise
+        except SessionError as exc:
+            await self._send_error(str(exc))
+        except Exception as exc:  # a bad frame must never drop the socket
+            LOG.exception("handler for message type %d failed", message.type)
+            await self._send_error(f"{type(exc).__name__}: {exc}")
+
+    # -- field streaming ---------------------------------------------------
+
+    async def _stream_fields(self) -> None:
+        """Push Q/O whenever the solver's version counters move.
+
+        Each iteration awaits its own send, so a slow client throttles the
+        stream instead of accumulating a backlog of already-stale frames.
+        """
+        last_version: Optional[Tuple[int, int]] = None
+        was_active = False
+        try:
+            while True:
+                await asyncio.sleep(1.0 / self.fps)
+                if self.session.closed:
+                    break
+                # Keep the registry's idle sweeper away from a live socket that
+                # is only watching a long solve.
+                self.session.touch()
+
+                try:
+                    # A mesh can arrive from the Gradio panel rather than from
+                    # this socket, so the geometry gets the same change
+                    # detection the fields do.
+                    if await self._send_geometry_if_new():
+                        last_version = None
+                        was_active = False
+
+                    state = await self.session.status()
+                    await self._flush_solver_error()
+                    # A solve that ends without touching the counters again --
+                    # its last sweep may not have published -- still owes the
+                    # client a final, exact frame: hence the idle transition.
+                    settled = was_active and not state.active
+                    was_active = state.active
+
+                    if state.has_field and (state.version != last_version or settled):
+                        last_version = await self._send_field()
+
+                    # The solver can go idle without any counter moving, so the
+                    # run state gets its own change detector; without it a
+                    # client is left believing a finished solve still runs.
+                    if (state.active, self.session.solving) != self._last_summary:
+                        await self._send_status()
+                except SessionError:
+                    # A mesh being swapped in, or a session reaped mid-frame:
+                    # the next tick re-reads whatever the session became.
+                    LOG.debug("streamer skipped a tick", exc_info=True)
+            # Only the idle sweeper closes a session out from under its socket,
+            # and a client that is told can offer a reload instead of hanging.
+            await self._send_error("this session expired; reload the page", fatal=True)
+        except asyncio.CancelledError:
+            raise
+        except WebSocketDisconnect:
+            pass  # the socket went away; run()'s finally does the tidying up
+        except Exception:
+            LOG.info("field streamer for session %s stopped", self.session.id, exc_info=True)
+
+    async def _send_geometry(self, geometry: Geometry) -> None:
+        """Answer a mesh change this socket asked for.
+
+        Marking the version as sent keeps the streamer from immediately
+        repeating the same frame on its next tick.
+        """
+        self._sent_geometry_version = self.session.geometry_version
+        await self._send(_geometry_frame(geometry))
+        await self._send_status()
+
+    async def _send_geometry_if_new(self) -> bool:
+        """Push the working mesh if it changed since this socket last saw it.
+
+        Returns True when a frame went out, which tells the streamer to forget
+        the field versions it was tracking: they belong to the previous mesh.
+        """
+        version = self.session.geometry_version
+        if version == self._sent_geometry_version:
+            return False
+
+        geometry = self.session.geometry
+        # Record the version either way: an invalidated session has nothing to
+        # send, and re-checking it every tick would be pointless.
+        self._sent_geometry_version = version
+        if geometry is None:
+            return False
+
+        await self._send(_geometry_frame(geometry))
+        await self._send_status()
+        return True
+
+    async def _send_field(self) -> Optional[Tuple[int, int]]:
+        """Send one field update plus, once the solver is idle, its markers."""
+        snapshot = await self.session.snapshot_field()
+        if snapshot is None:
+            return None
+        await self._send(
+            _field_frame(
+                snapshot.orientation,
+                snapshot.position,
+                snapshot.state,
+                self.session.solving,
+            )
+        )
+        if not snapshot.state.active:
+            await self._send(_singularity_frame(await self.session.singularities()))
+        return snapshot.state.version
+
+    # -- replies -----------------------------------------------------------
+
+    async def _send_status(self) -> None:
+        state = await self.session.status()
+        solving = self.session.solving
+        header = dict(state.as_dict())
+        header.update(
+            session_id=self.session.id,
+            protocol=protocol.PROTOCOL_VERSION,
+            ready=self.session.ready,
+            solving=solving,
+            mesh=self.session.mesh_name,
+            fps=self.fps,
+            config=self.session.config,
+        )
+        # Record what actually went out, not what a caller intended to report:
+        # a handler that answers SOLVE with active=True must leave the streamer
+        # knowing that the matching "it finished" frame is still owed.
+        self._last_summary = (state.active, solving)
+        await self._flush_solver_error()
+        await self._send(protocol.encode(MessageType.STATUS, header))
+
+    async def _flush_solver_error(self) -> None:
+        """Report a solver-thread failure once, to whoever asks first.
+
+        The core clears the message as the status is read, so the session keeps
+        it; without this the optimizer would abort a solve in silence and the
+        client would keep waiting for a field that is never coming.
+        """
+        error = self.session.take_error()
+        if error:
+            await self._send_error(f"the solver stopped: {error}")
+
+    async def _send_stroke_list(self) -> None:
+        strokes = await self.session.strokes()
+        await self._send(
+            protocol.encode(
+                MessageType.STROKE_LIST, {"strokes": strokes, "count": len(strokes)}
+            )
+        )
+
+    # -- handlers ----------------------------------------------------------
+
+    async def _on_hello(self, message: protocol.Message) -> None:
+        await self._send_status()
+
+    async def _on_ping(self, message: protocol.Message) -> None:
+        await self._send(protocol.encode(MessageType.PONG, dict(message.header)))
+
+    async def _on_load_mesh(self, message: protocol.Message) -> None:
+        config = _as_config(message.get("config"), "LOAD_MESH")
+        # The name ends up in a file name on export, so it has to be text.
+        name = message.get("name")
+        name = str(name) if name is not None else None
+        if "vertices" in message.arrays and "faces" in message.arrays:
+            vertices = _rows(message.arrays["vertices"], 3, "vertices")
+            faces = _rows(message.arrays["faces"], 3, "faces")
+        elif message.get("path"):
+            source = Path(str(message.get("path")))
+            vertices, faces = await asyncio.to_thread(load_mesh_file, source)
+            name = name or source.name
+        else:
+            raise SessionError(
+                "LOAD_MESH needs either vertices/faces arrays or a 'path' header"
+            )
+
+        geometry = await self.session.load_mesh(vertices, faces, name or "mesh", config)
+        await self._send_geometry(geometry)
+
+    async def _on_set_config(self, message: protocol.Message) -> None:
+        # The config may be nested under "config" or simply be the header. An
+        # empty nested config is still a config -- it means "re-preprocess with
+        # what I already set" -- so this tests for absence, not emptiness.
+        values = _as_config(message.get("config"), "SET_CONFIG")
+        if values is None:
+            values = message.header
+        geometry = await self.session.set_config(values)
+        await self._send_geometry(geometry)
+
+    async def _on_stroke(self, message: protocol.Message) -> None:
+        raw_kind = message.get("kind", int(_core.StrokeKind.ORIENTATION))
+        kind = _STROKE_KINDS.get(raw_kind)
+        if kind is None:
+            known = sorted(str(k) for k in _STROKE_KINDS)
+            raise SessionError(f"unknown stroke kind {raw_kind!r}; expected one of {known}")
+        origins = _rows(message.arrays.get("ray_origins"), 3, "ray_origins")
+        directions = _rows(message.arrays.get("ray_directions"), 3, "ray_directions")
+
+        if kind.startswith("attractor_"):
+            # The drag is the solve here, so "solve" has nothing left to say:
+            # the session is already following the one the core started.
+            result = await self.session.apply_attractor(
+                origins, directions, orientation=kind == "attractor_orientation"
+            )
+            await self._send(_stroke_frame(result))
+        else:
+            stroke_kind = (
+                _core.StrokeKind.ORIENTATION
+                if kind == "orientation"
+                else _core.StrokeKind.EDGE
+            )
+            result = await self.session.project_and_add_stroke(
+                origins, directions, int(stroke_kind)
+            )
+            await self._send(_stroke_frame(result))
+            if message.get("solve", False):
+                field, level = _SOLVE_PLANS[kind]
+                await self.session.solve(field, level)
+        await self._send_status()
+
+    async def _on_erase_stroke(self, message: protocol.Message) -> None:
+        stroke_id = message.get("stroke_id")
+        if stroke_id is not None:
+            await self.session.erase_stroke(int(stroke_id))
+        elif message.get("point") is not None and message.get("eye") is not None:
+            await self.session.erase_stroke_near(
+                message.get("point"), message.get("eye"), float(message.get("radius", 0.0))
+            )
+        else:
+            raise SessionError("ERASE_STROKE needs a 'stroke_id', or a 'point' plus an 'eye'")
+        await self._send_stroke_list()
+
+    async def _on_clear_strokes(self, message: protocol.Message) -> None:
+        await self.session.clear_strokes()
+        await self._send_stroke_list()
+
+    async def _on_solve(self, message: protocol.Message) -> None:
+        field = str(message.get("field", "both"))
+        await self.session.solve(field, int(message.get("level", -1)))
+        await self._send_status()
+
+    async def _on_stop(self, message: protocol.Message) -> None:
+        await self.session.stop()
+        await self._send_status()
+
+    async def _on_extract(self, message: protocol.Message) -> None:
+        extraction = await self.session.extract()
+        await self._send(_extracted_frame(extraction))
+        await self._send_status()
+
+    async def _on_export(self, message: protocol.Message) -> None:
+        fmt = str(message.get("format", "obj"))
+        path = await self.session.export_mesh(fmt)
+        header = {
+            "url": f"/api/session/{self.session.id}/export",
+            "filename": path.name,
+            # The written suffix, not the spelling asked for: "OBJ" and ".obj"
+            # are both accepted, and the client labels its download with this.
+            "format": path.suffix.lstrip("."),
+            "bytes": int(path.stat().st_size),
+        }
+        await self._send(protocol.encode(MessageType.EXPORT_READY, header))
+
+    async def _on_subscribe(self, message: protocol.Message) -> None:
+        self.fps = max(MIN_FPS, min(MAX_FPS, int(message.get("fps", DEFAULT_FPS))))
+        preview_ms = message.get("preview_ms")
+        if preview_ms is not None and self.session.ready:
+            await self.session.set_preview_interval(int(preview_ms))
+        await self._send_status()
+
+    _HANDLERS: Dict[int, Callable[["_Connection", protocol.Message], Awaitable[None]]] = {
+        MessageType.HELLO: _on_hello,
+        MessageType.LOAD_MESH: _on_load_mesh,
+        MessageType.SET_CONFIG: _on_set_config,
+        MessageType.STROKE: _on_stroke,
+        MessageType.ERASE_STROKE: _on_erase_stroke,
+        MessageType.SOLVE: _on_solve,
+        MessageType.STOP: _on_stop,
+        MessageType.EXTRACT: _on_extract,
+        MessageType.EXPORT: _on_export,
+        MessageType.CLEAR_STROKES: _on_clear_strokes,
+        MessageType.SUBSCRIBE: _on_subscribe,
+        MessageType.PING: _on_ping,
+    }
+
+
+# ---------------------------------------------------------------------------
+#  Application
+# ---------------------------------------------------------------------------
+
+
+def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
+    """Assemble the viewer app around ``registry`` (the shared one by default)."""
+    sessions = registry if registry is not None else default_registry()
+
+    # The algorithm narrates its progress on stdout, which is noise in a server.
+    _core.set_verbose(False)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await sessions.start()
+        try:
+            yield
+        finally:
+            # Ctrl-C must not leave solver threads behind: every C++ session
+            # joins its thread here, while there is still a loop to await on.
+            await sessions.aclose()
+
+    app = FastAPI(title="instant-meshes-brush", lifespan=lifespan)
+    app.state.registry = sessions
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/viewer", include_in_schema=False)
+    async def viewer() -> FileResponse:
+        if not INDEX_HTML.is_file():
+            raise HTTPException(status_code=404, detail=f"{INDEX_HTML.name} is not installed")
+        return FileResponse(INDEX_HTML, media_type="text/html")
+
+    @app.post("/api/session")
+    async def create_session() -> Dict[str, str]:
+        try:
+            session = await sessions.create()
+        except SessionLimitError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"session_id": session.id, "ws_url": f"/ws/{session.id}"}
+
+    @app.get("/api/session/{session_id}/export")
+    async def download_export(session_id: str) -> FileResponse:
+        session = sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        path = session.export_path
+        if path is None or not path.is_file():
+            raise HTTPException(
+                status_code=404, detail="this session has not exported a mesh yet"
+            )
+        return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+    @app.websocket("/ws/{session_id}")
+    async def viewer_socket(websocket: WebSocket, session_id: str) -> None:
+        session = sessions.get(session_id)
+        if session is None:
+            await websocket.close(code=4404, reason="unknown session")
+            return
+        await websocket.accept()
+        await _Connection(websocket, session).run()
+
+    return app
+
+
+def run(
+    host: str = "127.0.0.1",
+    port: int = 7860,
+    share: bool = False,
+    app: Optional[FastAPI] = None,
+) -> None:
+    """Serve the app with uvicorn, optionally behind a public Gradio tunnel."""
+    config = uvicorn.Config(
+        app if app is not None else build_app(),
+        host=host,
+        port=port,
+        ws="auto",
+        ws_max_size=WS_MAX_SIZE,
+        # float32 geometry barely compresses, so deflate would only burn
+        # event-loop CPU and add latency per megabyte.
+        ws_per_message_deflate=False,
+    )
+    asyncio.run(_serve(config, share))
+
+
+async def _serve(config: uvicorn.Config, share: bool) -> None:
+    server = uvicorn.Server(config)
+    serving = asyncio.create_task(server.serve(), name="imb-uvicorn")
+    if share:
+        await _announce_share_url(server, config, serving)
+    await serving
+
+
+async def _announce_share_url(
+    server: uvicorn.Server, config: uvicorn.Config, serving: asyncio.Task
+) -> None:
+    """Publish the local port through Gradio's tunnel once uvicorn is up."""
+    from gradio import networking  # only needed for share=True
+
+    while not server.started:
+        if serving.done():
+            return
+        await asyncio.sleep(0.1)
+
+    url = await asyncio.to_thread(
+        networking.setup_tunnel,
+        local_host=config.host,
+        local_port=config.port,
+        share_token=secrets.token_urlsafe(32),
+        share_server_address=None,
+        share_server_tls_certificate=None,
+    )
+    print(f"Public viewer URL: {url}/viewer")

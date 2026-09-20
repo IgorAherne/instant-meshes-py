@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Instant Meshes - brush guidance</title>
+    <!--
+      This document is served from /viewer, not from the directory it lives in,
+      so every asset URL has to name the /static mount explicitly.  Relative
+      URLs would resolve against the site root and 404.
+    -->
+    <link rel="stylesheet" href="/static/style.css" />
+    <!--
+      OrbitControls imports the bare specifier 'three', so the vendored module
+      has to be reachable under that name before any module script runs.
+    -->
+    <script type="importmap">
+      { "imports": { "three": "/static/vendor/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <div id="stage">
+      <canvas id="view"></canvas>
+      <!-- The in-progress stroke is a pure 2D screen polyline, as in the native
+           viewer's NanoVG overlay, so it lives on its own 2D canvas. -->
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div id="toolbar">
+      <div class="group" role="radiogroup" aria-label="Tools">
+        <button class="tool" data-tool="orbit" role="radio" aria-checked="true" title="Orbit: rotate, pan and zoom the camera">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.2" /><ellipse cx="8" cy="8" rx="7" ry="3" transform="rotate(-30 8 8)" /></svg>
+          <span class="label">Orbit</span>
+        </button>
+        <button class="tool" data-tool="comb" role="radio" aria-checked="false" title="Orientation comb: make local adjustments to the orientation field">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 5.5c2.3-2.6 4.6-2.6 7 0s4.7 2.6 7 0" /><path d="M3 8v4M6.5 8.6v4M10 8.6v4M13.5 8v4" /></svg>
+          <span class="label">Comb</span>
+        </button>
+        <button class="tool" data-tool="orient-attractor" role="radio" aria-checked="false" title="Orientation singularity attractor: move, create or cancel orientation singularities">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 12.5c5-1 8.5-3.5 9.5-8.5" /><path d="M7.5 3.2h3.8V7" /><circle cx="3.4" cy="12.6" r="1.6" /></svg>
+          <span class="label">O-Attractor</span>
+        </button>
+        <button class="tool" data-tool="edge" role="radio" aria-checked="false" title="Edge brush: specify edge paths of the output mesh">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 13L14 3" /><rect x="0.8" y="11.8" width="2.6" height="2.6" /><rect x="12.6" y="1.6" width="2.6" height="2.6" /></svg>
+          <span class="label">Edge</span>
+        </button>
+        <button class="tool" data-tool="pos-attractor" role="radio" aria-checked="false" title="Position singularity attractor: move, create or cancel position singularities">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 5.5h13M1.5 10.5h13M5.5 1.5v13M10.5 1.5v13" /><circle cx="10.5" cy="5.5" r="2.1" class="fill" /></svg>
+          <span class="label">P-Attractor</span>
+        </button>
+      </div>
+
+      <div class="group" aria-label="Layers">
+        <label class="layer"><input type="checkbox" data-layer="mesh" checked /><span>Mesh</span></label>
+        <label class="layer"><input type="checkbox" data-layer="grid" checked /><span>Grid</span></label>
+        <label class="layer"><input type="checkbox" data-layer="strokes" checked /><span>Strokes</span></label>
+        <label class="layer"><input type="checkbox" data-layer="singularities" checked /><span>Singularities</span></label>
+        <label class="layer"><input type="checkbox" data-layer="output" /><span>Output</span></label>
+      </div>
+
+      <div class="group" aria-label="Actions">
+        <button class="action" id="btn-solve">Solve</button>
+        <button class="action" id="btn-stop">Stop</button>
+        <button class="action primary" id="btn-extract">Extract</button>
+      </div>
+    </div>
+
+    <div id="status">
+      <span id="link" class="dot" title="Connection state"></span>
+      <span id="link-text">Connecting</span>
+      <span class="sep"></span>
+      <span id="tool-name">Selected tool: Orbit</span>
+      <span class="sep"></span>
+      <div id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="progress-fill"></div>
+      </div>
+      <span id="status-text">Waiting for geometry</span>
+    </div>
+
+    <p id="hint">Left-drag orbits, right-drag or shift-drag pans, wheel zooms.</p>
+
+    <!-- main.js and its siblings import each other relatively, which resolves
+         correctly once this entry point is loaded from /static. -->
+    <script type="module" src="/static/main.js"></script>
+  </body>
+</html>

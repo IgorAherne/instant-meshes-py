@@ -1459,12 +1459,15 @@ Optimizer::Optimizer(MultiResolutionHierarchy &mRes, bool interactive)
     : mRes(mRes), mRunning(true), mOptimizeOrientations(false),
       mOptimizePositions(false), mLevel(-1), mLevelIterations(0),
       mHierarchical(false), mRoSy(-1), mPoSy(-1), mExtrinsic(true),
-      mInteractive(interactive), mLastUpdate(0.0f), mProgress(1.f) {
+      mInteractive(interactive), mLastUpdate(0.0f), mProgress(1.f),
+      mPreviewInterval(500) {
     mThread = std::thread(&Optimizer::run, this);
 }
 
 void Optimizer::save(Serializer &state) {
-    state.set("running", mRunning);
+    /* mRunning is atomic for thread safety; the serializer only knows plain
+       types, so round-trip it through one. */
+    state.set("running", mRunning.load());
     state.set("optimizeOrientations", mOptimizeOrientations);
     state.set("optimizePositions", mOptimizePositions);
     state.set("hierarchical", mHierarchical);
@@ -1478,7 +1481,9 @@ void Optimizer::save(Serializer &state) {
 }
 
 void Optimizer::load(const Serializer &state) {
-    state.get("running", mRunning);
+    bool running = mRunning.load();
+    state.get("running", running);
+    mRunning.store(running);
     state.get("optimizeOrientations", mOptimizeOrientations);
     state.get("optimizePositions", mOptimizePositions);
     state.get("hierarchical", mHierarchical);
@@ -1556,6 +1561,16 @@ void Optimizer::run() {
 
         if (!mRunning)
             break;
+
+        /* move_orientation_singularity / move_position_singularity throw when
+           an attractor path is not a chain of edge-adjacent faces. Letting that
+           escape a std::thread calls std::terminate and kills the whole process
+           -- fatal for a long-running server. Abandon the solve instead and
+           keep the error for the caller to read.
+
+           The guarded body keeps its original indentation so that this stays a
+           two-line diff against upstream rather than a whole-function rewrite. */
+        try {
         int level = mLevel;
         if (mLevelIterations++ == 0 && mHierarchical && level == mRes.levels() - 1)
             operations = 0;
@@ -1563,7 +1578,7 @@ void Optimizer::run() {
         bool lastIterationAtLevel = mHierarchical &&
                                     mLevelIterations >= levelIterations;
 
-        bool updateView = (mInteractive && mTimer.value() > 500) || !mHierarchical;
+        bool updateView = (mInteractive && mTimer.value() > (size_t) mPreviewInterval) || !mHierarchical;
 #ifdef VISUALIZE_ERROR
         updateView = true;
 #endif
@@ -1688,6 +1703,14 @@ void Optimizer::run() {
         }
         if (updateView)
             mTimer.reset();
+
+        } catch (const std::exception &e) {
+            cerr << "Optimizer: " << e.what() << endl;
+            mLastError = e.what();
+            mAttractorStrokes.clear();
+            mOptimizePositions = mOptimizeOrientations = false;
+            mCond.notify_all();
+        }
     }
 }
 
