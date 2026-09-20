@@ -19,15 +19,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import secrets
+import tempfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import trimesh
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -58,6 +68,10 @@ MAX_FPS = 60
 #: A mesh upload is one WebSocket frame, and uvicorn's 16 MiB default would
 #: close the socket with 1009 rather than report an error.
 WS_MAX_SIZE = 256 * 1024 * 1024
+
+#: Formats load_mesh_file can read. Kept here so the upload route can reject an
+#: unusable file before it reaches a parser.
+MESH_SUFFIXES = frozenset({".obj", ".ply", ".stl", ".off"})
 
 #: Stroke flavours a client may name, mapped to the session call they select.
 _STROKE_KINDS: Dict[Any, str] = {
@@ -622,6 +636,66 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
         except SessionLimitError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"session_id": session.id, "ws_url": f"/ws/{session.id}"}
+
+    @app.post("/api/session/{session_id}/mesh")
+    async def upload_mesh(
+        session_id: str,
+        file: UploadFile = File(...),
+        config: Optional[str] = Form(default=None),
+    ) -> Dict[str, Any]:
+        """Load a mesh straight from the viewport's own file picker.
+
+        The reply is deliberately just a summary: the geometry itself reaches
+        every socket attached to this session through the streamer, so a second
+        viewport watching the same session updates too.
+        """
+        session = sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+        suffix = Path(file.filename or "mesh.obj").suffix.lower()
+        if suffix not in MESH_SUFFIXES:
+            raise HTTPException(
+                status_code=415,
+                detail=f"unsupported mesh format '{suffix}'; "
+                       f"use one of {', '.join(sorted(MESH_SUFFIXES))}",
+            )
+
+        settings: Optional[Mapping[str, Any]] = None
+        if config:
+            try:
+                settings = _as_config(json.loads(config), "upload config")
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"bad config: {exc}") from exc
+
+        payload = await file.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="the uploaded file is empty")
+
+        # trimesh reads from disk, and a parser should never see the raw upload
+        # path, so it lands in a scratch file that is removed either way.
+        with tempfile.TemporaryDirectory(prefix="imb-upload-") as scratch:
+            path = Path(scratch) / f"mesh{suffix}"
+            path.write_bytes(payload)
+            try:
+                vertices, faces = await asyncio.to_thread(load_mesh_file, path)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            try:
+                geometry = await session.load_mesh(
+                    vertices, faces, Path(file.filename or "mesh").name, settings
+                )
+            except SessionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return {
+            "name": geometry.name,
+            "n_vertices": int(geometry.vertices.shape[0]),
+            "n_faces": int(geometry.faces.shape[0]),
+            "scale": float(geometry.scale),
+            "config": session.config,
+        }
 
     @app.get("/api/session/{session_id}/export")
     async def download_export(session_id: str) -> FileResponse:

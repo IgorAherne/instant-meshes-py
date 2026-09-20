@@ -1,6 +1,10 @@
 /*
     main.js: page wiring.
 
+    The whole UI lives in this document: panel.js owns the controls, this file
+    owns the session and the frames that flow through it.  A host page embeds
+    the viewer with one <iframe> and reproduces none of it.
+
     Network frames are never applied straight away.  Each one is folded into a
     small pending set and drained once per animation frame, so a burst of FIELD
     updates that outruns the display costs one GPU upload rather than ten, and
@@ -12,25 +16,10 @@ import { MessageType } from './protocol.js';
 import { Connection } from './net.js';
 import { Viewer } from './renderer.js';
 import { TOOLS, ToolController } from './tools.js';
+import { Panel } from './panel.js';
 
 /** Preview rate asked of the server; the RAF loop coalesces anything faster. */
 const SUBSCRIBE_FPS = 15;
-
-const ui = {
-    canvas: document.getElementById('view'),
-    overlay: document.getElementById('overlay'),
-    toolbar: document.getElementById('toolbar'),
-    link: document.getElementById('link'),
-    linkText: document.getElementById('link-text'),
-    toolName: document.getElementById('tool-name'),
-    progress: document.getElementById('progress'),
-    progressFill: document.getElementById('progress-fill'),
-    statusText: document.getElementById('status-text'),
-    hint: document.getElementById('hint'),
-    solve: document.getElementById('btn-solve'),
-    stop: document.getElementById('btn-stop'),
-    extract: document.getElementById('btn-extract'),
-};
 
 /* ------------------------------------------------------------------ */
 /*  Frame decoding                                                     */
@@ -135,9 +124,11 @@ function describeStroke(header) {
 /* ------------------------------------------------------------------ */
 
 class App {
-    constructor(viewer, connection) {
+    constructor(viewer, connection, panel, sessionId) {
         this.viewer = viewer;
         this.connection = connection;
+        this.panel = panel;
+        this.sessionId = sessionId;
 
         /* Drained by the render loop; see the module comment. */
         this.pending = {
@@ -148,16 +139,21 @@ class App {
             extracted: null,
         };
         this.strokes = new Map();
+        this.posy = 4;
 
         this.tools = new ToolController(viewer, connection, {
-            onToolChange: (tool) => this._showTool(tool),
-            onNotice: (message) => this._setStatus(message, false),
+            onToolChange: (tool) => this.panel.showTool(tool),
+            onNotice: (message) => this.panel.setStatus(message, false),
         });
 
         viewer.onFrame = () => this._drain();
 
-        this._bindToolbar();
+        this._bindPanel();
         this._bindConnection();
+
+        for (const name of ['mesh', 'grid', 'strokes', 'singularities', 'output']) {
+            this.viewer.setLayerVisible(name, this.panel.layerState(name));
+        }
     }
 
     /* -------------------------------------------------------------- */
@@ -187,6 +183,7 @@ class App {
             pending.strokes = false;
             const strokes = [...this.strokes.values()];
             this._apply(() => this.viewer.setStrokes(strokes));
+            this.panel.showStrokes(strokes.length);
         }
 
         const singularities = pending.singularities;
@@ -200,7 +197,9 @@ class App {
         const extracted = pending.extracted;
         if (extracted) {
             pending.extracted = null;
-            this._apply(() => this.viewer.setExtracted(extracted.wireframe, extracted.colors));
+            this._apply(() =>
+                this.viewer.setExtracted(extracted.wireframe, extracted.colors, extracted.surface)
+            );
         }
     }
 
@@ -208,7 +207,75 @@ class App {
         try {
             update();
         } catch (err) {
-            this._setStatus(err.message, true);
+            this.panel.setStatus(err.message, true);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  Panel                                                          */
+    /* -------------------------------------------------------------- */
+
+    _bindPanel() {
+        const send = (type, header) => this.connection.send(type, header || {});
+
+        this.panel.handlers.onSelectTool = (id) => this.tools.setTool(id);
+        this.panel.handlers.onClearStrokes = () => send(MessageType.CLEAR_STROKES);
+
+        /* Level -1 is the hierarchical schedule, which terminates on its own;
+           'both' runs orientations then positions, as Session.solve_all does. */
+        this.panel.handlers.onSolve = (field) => send(MessageType.SOLVE, { field, level: -1 });
+        this.panel.handlers.onStop = () => send(MessageType.STOP);
+        this.panel.handlers.onExtract = () => send(MessageType.EXTRACT);
+        this.panel.handlers.onExport = (options) => send(MessageType.EXPORT, options);
+        this.panel.handlers.onApplyConfig = (config) => send(MessageType.SET_CONFIG, { config });
+
+        this.panel.handlers.onLayerToggle = (name, visible) =>
+            this._apply(() => this.viewer.setLayerVisible(name, visible));
+
+        /* "Show output only" is a view preset rather than a layer of its own:
+           it hides the input surface and its grid so the result stands alone. */
+        this.panel.handlers.onShowOutputOnly = (only) => {
+            this._setLayer('output', true);
+            this._setLayer('mesh', !only);
+            this._setLayer('grid', !only);
+        };
+
+        this.panel.handlers.onOpenFile = (file) => this._uploadMesh(file);
+    }
+
+    _setLayer(name, checked) {
+        if (this.panel.setLayerChecked(name, checked)) {
+            this._apply(() => this.viewer.setLayerVisible(name, checked));
+        }
+    }
+
+    /**
+     * Upload through HTTP rather than the socket.
+     *
+     * The server parses the file with trimesh and loads it into the session;
+     * the geometry itself comes back over the WebSocket, so a second viewport
+     * watching the same session updates too.
+     */
+    async _uploadMesh(file) {
+        this.panel.setStatus(`Loading ${file.name}...`, false);
+        const body = new FormData();
+        body.append('file', file, file.name);
+        body.append('config', JSON.stringify(this.panel.readConfig()));
+
+        try {
+            const response = await fetch(
+                `/api/session/${encodeURIComponent(this.sessionId)}/mesh`,
+                { method: 'POST', body }
+            );
+            if (!response.ok) {
+                const detail = await response.json().catch(() => ({}));
+                throw new Error(detail.detail || `upload failed (${response.status})`);
+            }
+            /* The GEOMETRY frame that follows fills in the rest. */
+            this.panel.showDownload(null);
+            this.panel.showOutput('Not extracted yet');
+        } catch (err) {
+            this.panel.setStatus(err.message, true);
         }
     }
 
@@ -224,13 +291,14 @@ class App {
             const indices = pickArray(arrays, 'indices', 'faces');
             const normals = pickArray(arrays, 'normals');
             if (!positions || !indices || !normals) {
-                this._setStatus('Geometry frame is missing an array', true);
+                this.panel.setStatus('Geometry frame is missing an array', true);
                 return;
             }
             if (!(header.scale > 0)) {
-                this._setStatus(`Geometry frame has no usable scale (${header.scale})`, true);
+                this.panel.setStatus(`Geometry frame has no usable scale (${header.scale})`, true);
                 return;
             }
+            this.posy = header.posy ?? 4;
             this.pending.geometry = {
                 positions,
                 indices,
@@ -238,7 +306,7 @@ class App {
                 scale: header.scale,
                 /* Config defaults, for a server that only sends non-default symmetries. */
                 rosy: header.rosy ?? 4,
-                posy: header.posy ?? 4,
+                posy: this.posy,
             };
             /* Session::preprocess drops every stroke, because the vertex indices
                they were projected onto no longer exist.  Forget them here too,
@@ -246,10 +314,20 @@ class App {
                STROKE_LIST that follows repopulates whatever really remains. */
             this.strokes.clear();
             this.pending.strokes = true;
-            this._setStatus(
-                `${positions.length / 3} vertices, ${indices.length / 3} faces`,
-                false
-            );
+            this.pending.extracted = { wireframe: null, colors: null, surface: null };
+
+            this.panel.showConfig(header.config);
+            this.panel.showMesh({
+                name: header.name,
+                vertices: positions.length / 3,
+                faces: indices.length / 3,
+                scale: header.scale,
+                targetVertices: header.config ? header.config.vertex_count : 0,
+            });
+            this.panel.showFieldState({ orientation: 'not solved', position: 'not solved' });
+            this.panel.showOutput('Not extracted yet');
+            this.panel.setReady(true);
+            this.panel.setStatus('Mesh loaded -- press Solve both fields', false);
         });
 
         conn.on(MessageType.FIELD, (header, arrays) => {
@@ -268,7 +346,7 @@ class App {
 
         conn.on(MessageType.STROKE_RESULT, (header, arrays) => {
             if (header.ok === false || header.accepted === false || header.reason) {
-                this._setStatus(describeStroke(header), true);
+                this.panel.setStatus(describeStroke(header), true);
                 return;
             }
             const stroke = decodeStrokeResult(header, arrays);
@@ -279,124 +357,75 @@ class App {
 
         conn.on(MessageType.SINGULARITIES, (header, arrays) => {
             this.pending.singularities = decodeSingularities(arrays);
+            const orientation = header.n_orientation;
+            const position = header.n_position;
+            this.panel.showFieldState({
+                orientation:
+                    orientation === undefined ? undefined : `${orientation} singularities`,
+                position: position === undefined ? undefined : `${position} singularities`,
+            });
         });
 
         conn.on(MessageType.EXTRACTED, (header, arrays) => {
             const wireframe = pickArray(arrays, 'wireframe');
             const colors = pickArray(arrays, 'wireframe_color', 'wireframeColor', 'colors');
             if (!wireframe || !colors) {
-                this._setStatus('Extraction frame is missing its wireframe', true);
+                this.panel.setStatus('Extraction frame is missing its wireframe', true);
                 return;
             }
-            this.pending.extracted = { wireframe, colors };
-            const faces = header.n_faces ?? header.face_count;
-            this._setStatus(
-                faces === undefined
-                    ? `Extracted ${wireframe.length / 6} wireframe segments`
-                    : `Extracted ${faces} faces`,
-                false
+            const vertices = pickArray(arrays, 'vertices');
+            const faces = pickArray(arrays, 'faces');
+            const faceNormals = pickArray(arrays, 'face_normals', 'faceNormals');
+            this.pending.extracted = {
+                wireframe,
+                colors,
+                surface:
+                    vertices && faces && faceNormals
+                        ? { vertices, faces, faceNormals, posy: header.posy ?? this.posy }
+                        : null,
+            };
+
+            const faceCount = header.n_faces ?? header.face_count ?? 0;
+            const vertexCount = header.n_vertices ?? 0;
+            this.panel.showOutput(
+                `${vertexCount.toLocaleString()} vertices / ${faceCount.toLocaleString()} faces`
             );
-            this._setLayerChecked('output', true);
+            this.panel.setStatus(`Extracted ${faceCount} faces`, false);
+            /* Showing the result is the whole point of pressing Extract. */
+            this._setLayer('output', true);
+        });
+
+        conn.on(MessageType.EXPORT_READY, (header) => {
+            this.panel.showDownload(header.url, header.filename, header.bytes);
+            this.panel.setStatus(`Exported ${header.filename}`, false);
         });
 
         conn.on(MessageType.STATUS, (header) => this._showStatus(header));
-        conn.on(MessageType.PROGRESS, (header) => this._showProgress(header.progress, true));
+        conn.on(MessageType.PROGRESS, (header) => this.panel.setProgress(header.progress, true));
 
         conn.on(MessageType.ERROR, (header) => {
             const suffix = header.fatal ? ' -- reload the page' : '';
-            this._setStatus(`${header.message}${suffix}`, true);
+            this.panel.setStatus(`${header.message}${suffix}`, true);
         });
 
-        conn.onStatus((status) => this._showLink(status));
-    }
-
-    /* -------------------------------------------------------------- */
-    /*  Toolbar                                                        */
-    /* -------------------------------------------------------------- */
-
-    _bindToolbar() {
-        for (const button of ui.toolbar.querySelectorAll('button.tool')) {
-            button.addEventListener('click', () => this.tools.setTool(button.dataset.tool));
-        }
-
-        for (const input of ui.toolbar.querySelectorAll('input[data-layer]')) {
-            this.viewer.setLayerVisible(input.dataset.layer, input.checked);
-            input.addEventListener('change', () =>
-                this.viewer.setLayerVisible(input.dataset.layer, input.checked)
-            );
-        }
-
-        /* 'both' runs orientations then positions, which is Session.solve_all;
-           level -1 is the hierarchical schedule that terminates on its own. */
-        ui.solve.addEventListener('click', () =>
-            this.connection.send(MessageType.SOLVE, { field: 'both', level: -1 })
-        );
-        ui.stop.addEventListener('click', () => this.connection.send(MessageType.STOP, {}));
-        ui.extract.addEventListener('click', () => this.connection.send(MessageType.EXTRACT, {}));
-        ui.stop.disabled = true;
-    }
-
-    _setLayerChecked(name, checked) {
-        const input = ui.toolbar.querySelector(`input[data-layer="${name}"]`);
-        if (!input || input.checked === checked) return;
-        input.checked = checked;
-        this.viewer.setLayerVisible(name, checked);
-    }
-
-    /* -------------------------------------------------------------- */
-    /*  Status strip                                                   */
-    /* -------------------------------------------------------------- */
-
-    _showTool(tool) {
-        for (const button of ui.toolbar.querySelectorAll('button.tool')) {
-            button.setAttribute('aria-checked', String(button.dataset.tool === tool.id));
-        }
-        ui.toolName.textContent = `Selected tool: ${tool.label}`;
-        ui.hint.textContent =
-            tool.kind === null
-                ? tool.hint
-                : `${tool.hint} Click a stroke handle to delete it, Esc cancels a stroke.`;
-    }
-
-    _showLink(status) {
-        ui.link.dataset.state = status.state;
-        ui.linkText.textContent =
-            status.state === 'connecting' && status.attempt > 0
-                ? `Reconnecting (${status.attempt})`
-                : capitalise(status.state);
+        conn.onStatus((status) => this.panel.showLink(status));
     }
 
     _showStatus(header) {
         const active = Boolean(header.active);
-        ui.solve.disabled = active;
-        ui.stop.disabled = !active;
+        if (header.ready !== undefined) this.panel.setReady(Boolean(header.ready));
+        this.panel.setSolving(active);
+        this.panel.setProgress(header.progress, active);
 
-        this._showProgress(header.progress, active);
+        if (header.config) this.panel.showConfig(header.config);
+
         const level = header.level ?? 0;
         const versions = `Q ${header.iterations_q ?? 0} / O ${header.iterations_o ?? 0}`;
-        this._setStatus(active ? `Solving level ${level} -- ${versions}` : `Idle -- ${versions}`, false);
+        this.panel.setStatus(
+            active ? `Solving level ${level} -- ${versions}` : `Idle -- ${versions}`,
+            false
+        );
     }
-
-    /**
-     * A hierarchical solve reports real progress; an in-place refinement at
-     * level 0 reports 1 the whole time, which reads better as a busy bar.
-     */
-    _showProgress(progress, active) {
-        const value = typeof progress === 'number' ? progress : 0;
-        const busy = active && value >= 1;
-        ui.progress.classList.toggle('indeterminate', busy);
-        ui.progressFill.style.width = busy ? '100%' : `${Math.round(value * 100)}%`;
-        ui.progress.setAttribute('aria-valuenow', String(Math.round(value * 100)));
-    }
-
-    _setStatus(message, isError) {
-        ui.statusText.textContent = message;
-        ui.statusText.classList.toggle('error', Boolean(isError));
-    }
-}
-
-function capitalise(text) {
-    return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -404,10 +433,11 @@ function capitalise(text) {
 /* ------------------------------------------------------------------ */
 
 function fail(message) {
-    ui.statusText.textContent = message;
-    ui.statusText.classList.add('error');
-    ui.link.dataset.state = 'closed';
-    ui.linkText.textContent = 'Closed';
+    const text = document.getElementById('status-text');
+    if (text) {
+        text.textContent = message;
+        text.classList.add('error');
+    }
 }
 
 function boot() {
@@ -418,8 +448,10 @@ function boot() {
     }
 
     let viewer;
+    let panel;
     try {
-        viewer = new Viewer(ui.canvas, ui.overlay);
+        panel = new Panel({});
+        viewer = new Viewer(document.getElementById('view'), document.getElementById('overlay'));
     } catch (err) {
         fail(err.message);
         return;
@@ -434,7 +466,7 @@ function boot() {
     });
 
     /* Kept on window so a dev console can poke at a live session. */
-    window.app = new App(viewer, connection);
+    window.app = new App(viewer, connection, panel, sessionId);
     connection.connect();
 }
 

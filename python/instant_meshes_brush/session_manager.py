@@ -815,7 +815,12 @@ class BrushSession:
             directory = await self._ensure_export_dir()
             stem = Path(self.mesh_name or "mesh").stem or "mesh"
             target = directory / f"{stem}_remeshed.{suffix}"
-            await self._call(core.write_mesh, str(target), mesh)
+            # Per-face normals are written as `f v//n` with a different n for
+            # every face, so a loader that keys vertices on (position, normal)
+            # -- trimesh does -- splits the mesh into disconnected faces on
+            # re-import. The normals are recoverable from the geometry, the
+            # connectivity is not, so they are left out.
+            await self._call(core.write_mesh, str(target), mesh, False)
             self.export_path = target
             return target
 

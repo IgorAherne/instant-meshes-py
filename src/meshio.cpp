@@ -413,25 +413,22 @@ void load_obj(const std::string &filename, MatrixXu &F, MatrixXf &V,
             normals.push_back(n);
             */
         } else if (prefix == "f") {
-            std::string v1, v2, v3, v4;
-            line >> v1 >> v2 >> v3 >> v4;
-            obj_vertex tri[6];
-            int nVertices = 3;
+            /* An OBJ face may have any number of corners. This used to read a
+               fixed four and silently drop the rest, which punched a
+               wedge-shaped hole into every polygon with five or more sides --
+               including the n-gons this program's own writer emits, so its
+               output could not be re-imported without losing geometry. */
+            std::vector<obj_vertex> corners;
+            std::string token;
+            while (line >> token)
+                corners.push_back(obj_vertex(token));
 
-            tri[0] = obj_vertex(v1);
-            tri[1] = obj_vertex(v2);
-            tri[2] = obj_vertex(v3);
+            if (corners.size() < 3)
+                continue;
 
-            if (!v4.empty()) {
-                /* This is a quad, split into two triangles */
-                tri[3] = obj_vertex(v4);
-                tri[4] = tri[0];
-                tri[5] = tri[2];
-                nVertices = 6;
-            }
-            /* Convert to an indexed vertex list */
-            for (int i=0; i<nVertices; ++i) {
-                const obj_vertex &v = tri[i];
+            /* Convert to an indexed vertex list, fan-triangulating around the
+               first corner so the winding of every triangle matches the face. */
+            auto emit = [&](const obj_vertex &v) {
                 VertexMap::const_iterator it = vertexMap.find(v);
                 if (it == vertexMap.end()) {
                     vertexMap[v] = (uint32_t) vertices.size();
@@ -440,6 +437,12 @@ void load_obj(const std::string &filename, MatrixXu &F, MatrixXf &V,
                 } else {
                     indices.push_back(it->second);
                 }
+            };
+
+            for (size_t i = 2; i < corners.size(); ++i) {
+                emit(corners[0]);
+                emit(corners[i - 1]);
+                emit(corners[i]);
             }
         }
     }

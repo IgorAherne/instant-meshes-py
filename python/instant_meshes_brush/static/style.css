@@ -1,311 +1,455 @@
 /*
-    Dark chrome for the brushing viewer, tuned to sit close to the native
-    NanoGUI application: rgb(45,45,48) background, small flat controls, and a
-    single system font stack so the page stays usable offline.
+    style.css: the viewer's own chrome.
+
+    The palette follows the desktop application -- a 0x2d2d30 stage with a
+    slightly lighter panel -- so an embedded viewport does not look like a
+    different program from the one the screenshots show.  Nothing here depends
+    on the host page's stylesheet, and nothing leaks out of the iframe.
 */
 
 :root {
-  --bg: rgb(45, 45, 48);
-  --panel: rgba(56, 56, 60, 0.94);
-  --panel-solid: rgb(56, 56, 60);
-  --edge: rgb(28, 28, 30);
-  --edge-soft: rgb(72, 72, 78);
-  --text: rgb(214, 214, 218);
-  --muted: rgb(138, 138, 146);
-  --accent: rgb(75, 139, 212);
-  --accent-dim: rgb(48, 90, 140);
-  --ok: rgb(108, 196, 116);
-  --warn: rgb(226, 168, 78);
-  --bad: rgb(214, 96, 92);
-  --radius: 3px;
-  --strip: 26px;
+    --stage: #2d2d30;
+    --panel: #26262a;
+    --panel-edge: #3a3a40;
+    --raised: #34343a;
+    --raised-hover: #3e3e46;
+    --text: #d8d8dd;
+    --muted: #8b8b94;
+    --accent: #4a78d0;
+    --accent-hot: #5a88e0;
+    --danger: #d06a5a;
+    --focus: #7aa3f0;
+    --panel-width: 232px;
 }
 
 * {
-  box-sizing: border-box;
+    box-sizing: border-box;
 }
 
 html,
 body {
-  height: 100%;
-  margin: 0;
-  overflow: hidden;
-  background: var(--bg);
-  color: var(--text);
-  font: 12px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: var(--stage);
+    color: var(--text);
+    font: 12px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+#app {
+    display: flex;
+    height: 100%;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Canvas stack                                                       */
+/*  Control panel                                                      */
+/* ------------------------------------------------------------------ */
+
+#panel {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 var(--panel-width);
+    min-width: 0;
+    background: var(--panel);
+    border-right: 1px solid var(--panel-edge);
+}
+
+#panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--panel-edge);
+}
+
+.brand {
+    flex: 1;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+/* The panel is the only scrollable region: the stage must never scroll away,
+   which is what made the controls unreachable when they lived on the host page. */
+#panel-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+#panel-scroll::-webkit-scrollbar {
+    width: 9px;
+}
+
+#panel-scroll::-webkit-scrollbar-thumb {
+    background: #44444c;
+    border-radius: 5px;
+}
+
+.block {
+    padding: 11px 12px 13px;
+    border-bottom: 1px solid var(--panel-edge);
+}
+
+.block:last-child {
+    border-bottom: 0;
+}
+
+.block h2 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.explain {
+    margin: -2px 0 8px;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Controls                                                           */
+/* ------------------------------------------------------------------ */
+
+button,
+select,
+input[type="number"] {
+    font: inherit;
+    color: var(--text);
+    background: var(--raised);
+    border: 1px solid var(--panel-edge);
+    border-radius: 4px;
+    padding: 5px 8px;
+}
+
+button {
+    cursor: pointer;
+}
+
+button:hover:not(:disabled),
+select:hover {
+    background: var(--raised-hover);
+}
+
+button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+a:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
+}
+
+button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+    background: var(--accent-hot);
+}
+
+button.wide,
+select,
+input[type="range"] {
+    display: block;
+    width: 100%;
+}
+
+button.wide {
+    margin-bottom: 6px;
+}
+
+button.wide:last-child {
+    margin-bottom: 0;
+}
+
+.row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.row.split {
+    margin-bottom: 6px;
+}
+
+.row.split > button {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.link-button {
+    background: none;
+    border: 0;
+    padding: 2px 4px;
+    color: var(--accent-hot);
+    text-decoration: underline;
+}
+
+.link-button:hover:not(:disabled) {
+    background: none;
+    color: #8fb4ff;
+}
+
+.field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 7px 0 5px;
+}
+
+.field > span {
+    color: var(--muted);
+}
+
+.field input[type="number"],
+.field select {
+    width: 78px;
+    flex: 0 0 auto;
+}
+
+.check {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 5px 0;
+    cursor: pointer;
+}
+
+.check input {
+    accent-color: var(--accent);
+    margin: 0;
+}
+
+input[type="range"] {
+    accent-color: var(--accent);
+    margin: 2px 0 8px;
+}
+
+.muted {
+    margin: 6px 0 0;
+    color: var(--muted);
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 8px;
+    margin: 8px 0 0;
+    font-size: 11px;
+}
+
+.stats dt {
+    color: var(--muted);
+}
+
+.stats dd {
+    margin: 0;
+    text-align: right;
+}
+
+.download {
+    display: block;
+    margin-top: 6px;
+    padding: 5px 8px;
+    border-radius: 4px;
+    background: #2f4a2f;
+    border: 1px solid #3f6a3f;
+    color: #cfe8cf;
+    text-align: center;
+    text-decoration: none;
+}
+
+.download:hover {
+    background: #395a39;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Tools                                                              */
+/* ------------------------------------------------------------------ */
+
+.tools {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 8px;
+}
+
+.tool {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    text-align: left;
+}
+
+.tool svg {
+    flex: 0 0 auto;
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.35;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.tool svg .fill {
+    fill: currentColor;
+    stroke: none;
+}
+
+.tool[aria-checked="true"] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Stage                                                              */
 /* ------------------------------------------------------------------ */
 
 #stage {
-  position: fixed;
-  inset: 0;
+    position: relative;
+    flex: 1;
+    min-width: 0;
 }
 
-#stage canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  display: block;
-}
-
-/* The preview polyline must never swallow a pointer event meant for the
-   WebGL canvas underneath it. */
+#view,
 #overlay {
-  pointer-events: none;
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
 }
 
-#view {
-  touch-action: none;
-  outline: none;
+/* The preview polyline is drawn above the scene but must never swallow the
+   pointer events the brush tools listen for. */
+#overlay {
+    pointer-events: none;
 }
-
-#view.drawing {
-  cursor: crosshair;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Floating toolbar                                                   */
-/* ------------------------------------------------------------------ */
-
-#toolbar {
-  position: fixed;
-  top: 10px;
-  left: 10px;
-  right: 10px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: flex-start;
-  pointer-events: none;
-}
-
-#toolbar .group {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px;
-  padding: 3px;
-  background: var(--panel);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(3px);
-  pointer-events: auto;
-}
-
-#toolbar .group[aria-label="Actions"] {
-  margin-left: auto;
-}
-
-button.tool,
-button.action {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 24px;
-  padding: 0 8px;
-  color: var(--text);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 2px;
-  font: inherit;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-button.tool:hover,
-button.action:hover {
-  background: rgba(255, 255, 255, 0.07);
-}
-
-button.tool:active,
-button.action:active {
-  background: rgba(0, 0, 0, 0.25);
-}
-
-button.tool[aria-checked="true"] {
-  background: var(--accent-dim);
-  border-color: var(--accent);
-  color: #fff;
-}
-
-button.action.primary {
-  border-color: var(--edge-soft);
-}
-
-button.action:disabled {
-  color: var(--muted);
-  cursor: default;
-  background: transparent;
-}
-
-button.tool svg {
-  width: 16px;
-  height: 16px;
-  flex: none;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.3;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-button.tool svg .fill {
-  fill: currentColor;
-  stroke: none;
-}
-
-label.layer {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 24px;
-  padding: 0 7px 0 5px;
-  border-radius: 2px;
-  color: var(--muted);
-  cursor: pointer;
-  user-select: none;
-}
-
-label.layer:hover {
-  background: rgba(255, 255, 255, 0.07);
-}
-
-label.layer:has(input:checked) {
-  color: var(--text);
-}
-
-label.layer input {
-  width: 12px;
-  height: 12px;
-  margin: 0;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Status strip and hint                                              */
-/* ------------------------------------------------------------------ */
 
 #status {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: var(--strip);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 10px;
-  background: var(--panel-solid);
-  border-top: 1px solid var(--edge);
-  color: var(--muted);
-  white-space: nowrap;
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 12px;
+    background: rgba(24, 24, 27, 0.82);
+    border-top: 1px solid var(--panel-edge);
+    font-size: 11px;
 }
 
 #status .sep {
-  width: 1px;
-  height: 13px;
-  flex: none;
-  background: var(--edge-soft);
-}
-
-#status .dot {
-  width: 8px;
-  height: 8px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--warn);
-}
-
-#status .dot[data-state="open"] {
-  background: var(--ok);
-}
-
-#status .dot[data-state="closed"] {
-  background: var(--bad);
+    width: 1px;
+    height: 12px;
+    background: var(--panel-edge);
 }
 
 #tool-name {
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
+    font-weight: 600;
 }
 
 #progress {
-  flex: 1 1 120px;
-  min-width: 60px;
-  max-width: 320px;
-  height: 6px;
-  border: 1px solid var(--edge);
-  border-radius: 2px;
-  background: rgb(38, 38, 41);
-  overflow: hidden;
+    flex: 1;
+    height: 4px;
+    min-width: 40px;
+    border-radius: 2px;
+    background: #3a3a42;
+    overflow: hidden;
 }
 
 #progress-fill {
-  width: 0;
-  height: 100%;
-  background: var(--accent);
-  transition: width 90ms linear;
-}
-
-#progress.indeterminate #progress-fill {
-  width: 100%;
-  background: var(--accent-dim);
+    width: 0;
+    height: 100%;
+    background: var(--accent);
+    transition: width 120ms linear;
 }
 
 #status-text {
-  flex: 0 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
+    max-width: 55%;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 #status-text.error {
-  color: var(--bad);
+    color: var(--danger);
 }
 
 #hint {
-  position: fixed;
-  left: 10px;
-  right: 10px;
-  bottom: calc(var(--strip) + 7px);
-  margin: 0;
-  color: var(--muted);
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
-  pointer-events: none;
+    position: absolute;
+    left: 12px;
+    bottom: 30px;
+    margin: 0;
+    color: var(--muted);
+    pointer-events: none;
+}
+
+.dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+}
+
+.dot.online {
+    background: #4caf50;
+}
+
+.dot.offline {
+    background: var(--danger);
 }
 
 /* ------------------------------------------------------------------ */
-/*  Narrow layouts                                                     */
+/*  Hover help                                                         */
 /* ------------------------------------------------------------------ */
 
-@media (max-width: 980px) {
-  button.tool .label {
-    display: none;
-  }
-
-  button.tool {
-    padding: 0 6px;
-  }
+#tip {
+    position: fixed;
+    z-index: 10;
+    max-width: 290px;
+    padding: 7px 10px;
+    border-radius: 5px;
+    background: #16161a;
+    border: 1px solid var(--panel-edge);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+    color: var(--text);
+    font-size: 11.5px;
+    line-height: 1.5;
+    pointer-events: none;
 }
 
-@media (max-width: 700px) {
-  #toolbar .group[aria-label="Actions"] {
-    margin-left: 0;
-  }
+/* ------------------------------------------------------------------ */
+/*  Narrow embeds                                                      */
+/* ------------------------------------------------------------------ */
 
-  label.layer {
-    padding: 0 5px 0 4px;
-  }
+@media (max-width: 720px) {
+    :root {
+        --panel-width: 190px;
+    }
 
-  #status .sep:first-of-type,
-  #link-text {
-    display: none;
-  }
+    .tool .label {
+        font-size: 11px;
+    }
+
+    #hint {
+        display: none;
+    }
 }

@@ -80,7 +80,14 @@ install, then `ext/eigen`, and finally a download of Eigen 3.4.0.
 instant-meshes-brush
 ```
 
-Open the URL it prints. Load a mesh, pick a tool, and draw on the model.
+Open the URL it prints. Everything is in the panel down the left of the
+viewport: open a mesh, set the target resolution, pick a brush, solve, extract
+and download. Hovering any control explains what it does.
+
+The usual order is **Open mesh -> Solve both fields -> brush -> Solve again ->
+Extract**. Brush strokes are constraints on the orientation field, so they only
+change anything once a field is re-solved; the viewport does that for you after
+each stroke.
 
 | Tool | What the stroke does |
 |---|---|
@@ -94,32 +101,27 @@ being dragged. The other two tools work anywhere on the surface.
 
 Clicking a stroke's handle deletes it and re-solves.
 
-To embed the viewport in your own Gradio app, mount the FastAPI application and
-drop the viewer in an iframe:
+Every control lives **inside** the viewport, so embedding it in your own Gradio
+app is one call and you reproduce none of the UI:
 
 ```python
 import gradio as gr
+from instant_meshes_brush.app import viewport
 from instant_meshes_brush.server import build_app
-from instant_meshes_brush.session_manager import default_registry
-
-api = build_app()          # FastAPI: /viewer, /static/..., /ws/{session_id}
 
 with gr.Blocks() as demo:
-    frame = gr.HTML()
+    gr.Markdown("## My tool")
+    viewport(height="80vh")      # mints a session per browser tab
 
-    async def open_session():
-        session = await default_registry().create()
-        return (f'<iframe src="/viewer?session={session.id}" '
-                'style="width:100%;height:80vh;border:0"></iframe>')
-
-    demo.load(open_session, outputs=frame)
-
-app = gr.mount_gradio_app(api, demo, path="/")   # uvicorn app --port 7860
+app = gr.mount_gradio_app(build_app(), demo, path="/")   # uvicorn app:app
 ```
 
-`build_app()` and the Gradio blocks share one `SessionRegistry`, so your own
-buttons can drive the same session the canvas is showing — call the registry's
-`get(session_id)` and use the `BrushSession` coroutines directly.
+`build_app()` serves `/viewer`, `/static/...`, the mesh upload route and the
+WebSocket; `viewport()` creates a session and drops in the iframe. Both share
+one `SessionRegistry`, so if you do want your own buttons, fetch the session
+with `default_registry().get(session_id)` and call the `BrushSession`
+coroutines — the viewport picks the change up over its own socket, including a
+mesh you load from outside it.
 
 ---
 
@@ -209,9 +211,14 @@ ext/pss_shim/               likewise for the pss parallel sort
 python/instant_meshes_brush/
     protocol.py             binary WebSocket framing (paired with protocol.js)
     session_manager.py      one C++ session per browser, with a TTL sweeper
-    server.py               FastAPI: /viewer, /static, /ws/{session}
-    app.py                  the Gradio control panel
-    static/                 WebGL2 viewer, ported field shaders, three.js
+    server.py               FastAPI: /viewer, /static, /ws/{session}, uploads
+    app.py                  the Gradio wrapper -- an iframe and nothing else
+    static/
+        index.html          the viewport, controls included
+        panel.js            the control panel and its hover help
+        main.js             session wiring and frame coalescing
+        renderer.js         three.js scene: surface, strokes, output mesh
+        field_material.js   the field grid, ported to WebGL2
 ```
 
 The original desktop application still builds:

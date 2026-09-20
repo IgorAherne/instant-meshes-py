@@ -185,6 +185,53 @@ def test_a_mesh_loaded_elsewhere_reaches_an_attached_viewport(
     assert len(geometry.arrays["vertices"]) == geometry.get("n_vertices")
 
 
+def test_uploaded_file_reaches_an_attached_viewport(client, torus, tmp_path) -> None:
+    """The viewport's own Open button posts a file; the socket must see it."""
+    source = tmp_path / "torus.obj"
+    with source.open("w") as handle:
+        for v in torus.vertices:
+            handle.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for f in torus.faces:
+            handle.write(f"f {f[0] + 1} {f[1] + 1} {f[2] + 1}\n")
+
+    session_id = open_session(client)
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        socket = Socket(ws)
+        socket.send(MessageType.SUBSCRIBE, {"fps": 60})
+        socket.expect(MessageType.STATUS)
+
+        response = client.post(
+            f"/api/session/{session_id}/mesh",
+            files={"file": ("torus.obj", source.read_bytes(), "text/plain")},
+            data={"config": '{"vertex_count": 150, "deterministic": true}'},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["name"] == "torus.obj"
+
+        geometry = socket.expect(MessageType.GEOMETRY)
+
+    assert geometry.get("name") == "torus.obj"
+    assert geometry.arrays["vertices"].shape[1] == 3
+
+
+def test_upload_rejects_an_unsupported_format(client) -> None:
+    session_id = open_session(client)
+    response = client.post(
+        f"/api/session/{session_id}/mesh",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    assert response.status_code == 415
+    assert "unsupported mesh format" in response.json()["detail"]
+
+
+def test_upload_to_an_unknown_session_is_404(client) -> None:
+    response = client.post(
+        "/api/session/nope/mesh",
+        files={"file": ("a.obj", b"v 0 0 0\n", "text/plain")},
+    )
+    assert response.status_code == 404
+
+
 def test_geometry_is_not_resent_once_the_socket_has_it(client, torus) -> None:
     """The streamer must not repeat a frame the handler already answered with."""
     with client.websocket_connect(f"/ws/{open_session(client)}") as ws:

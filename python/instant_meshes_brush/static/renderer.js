@@ -172,6 +172,106 @@ function replaceGeometry(object, geometry) {
     object.visible = hasVertices(object);
 }
 
+/**
+ * Shading for the extracted mesh, a direct port of resources/shader_quadmesh.
+ *
+ * It carries its own light rather than using a scene light, so the output reads
+ * the same as the input surface, which the field material also lights itself.
+ */
+function buildOutputMaterial() {
+    return new THREE.ShaderMaterial({
+        uniforms: { light_position: { value: new THREE.Vector3(0.0, 0.3, 5.0) } },
+        vertexShader: `
+            uniform vec3 light_position;
+            out vec3 v_to_eye;
+            out vec3 v_to_light;
+            out vec3 v_normal;
+
+            void main() {
+                vec4 pos_camera = modelViewMatrix * vec4(position, 1.0);
+                gl_Position = projectionMatrix * pos_camera;
+                v_to_light = (viewMatrix * vec4(light_position, 1.0)).xyz - pos_camera.xyz;
+                v_to_eye = -pos_camera.xyz;
+                v_normal = normalMatrix * normal;
+            }
+        `,
+        fragmentShader: `
+            precision highp float;
+            in vec3 v_to_eye;
+            in vec3 v_to_light;
+            in vec3 v_normal;
+            out vec4 outColor;
+
+            void main() {
+                vec3 Kd = vec3(0.4, 0.5, 0.7);
+                vec3 Ks = vec3(1.0);
+                vec3 Ka = Kd * 0.2;
+
+                vec3 to_light = normalize(v_to_light);
+                vec3 to_eye = normalize(v_to_eye);
+                /* Quads are not planar, so the face normal can face away from
+                   the camera on the half the camera sees; flipping keeps the
+                   surface lit instead of black. */
+                vec3 normal = normalize(v_normal);
+                if (!gl_FrontFacing) normal = -normal;
+                vec3 refl = reflect(-to_light, normal);
+
+                float diffuse_factor = max(0.0, dot(to_light, normal));
+                float specular_factor = pow(max(dot(to_eye, refl), 0.0), 10.0);
+                outColor = vec4(Ka + Kd * diffuse_factor + Ks * specular_factor, 1.0);
+            }
+        `,
+        glslVersion: THREE.GLSL3,
+        side: THREE.DoubleSide,
+    });
+}
+
+/**
+ * Triangulate the extracted faces into a flat-shaded surface.
+ *
+ * Faces arrive posy-wide with a triangle stored as a quad whose last two
+ * indices repeat, and carry one normal each, so the triangles are written out
+ * un-indexed with that normal repeated -- which is exactly the flat shading the
+ * desktop app uses for its output mesh.
+ */
+function buildOutputSurface(vertices, faces, faceNormals, posy) {
+    const faceCount = Math.floor(faces.length / posy);
+    const corners = [];
+    for (let f = 0; f < faceCount; ++f) {
+        const base = f * posy;
+        const isTriangle = posy === 4 && faces[base + 2] === faces[base + 3];
+        const fan = isTriangle ? 3 : posy;
+        for (let i = 2; i < fan; ++i) {
+            corners.push(f, faces[base], faces[base + i - 1], faces[base + i]);
+        }
+    }
+
+    /* Four values per triangle -- its face plus three vertex ids -- so the
+       buffer holds exactly triangleCount * 9 floats and never a trailing
+       all-zero triangle at the origin. */
+    const triangleCount = corners.length / 4;
+    const positions = new Float32Array(triangleCount * 9);
+    const normals = new Float32Array(triangleCount * 9);
+    for (let t = 0; t < triangleCount; ++t) {
+        const face = corners[t * 4];
+        for (let k = 0; k < 3; ++k) {
+            const vertex = corners[t * 4 + 1 + k];
+            const out = t * 9 + k * 3;
+            positions[out] = vertices[vertex * 3];
+            positions[out + 1] = vertices[vertex * 3 + 1];
+            positions[out + 2] = vertices[vertex * 3 + 2];
+            normals[out] = faceNormals[face * 3];
+            normals[out + 1] = faceNormals[face * 3 + 1];
+            normals[out + 2] = faceNormals[face * 3 + 2];
+        }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    return geometry;
+}
+
 /** Both endpoints pure black: the phantom edge of a triangle stored as a quad. */
 function isBlackSegment(colors, offset) {
     for (let k = 0; k < 6; ++k) {
@@ -535,6 +635,15 @@ export class Viewer {
         this.singularityMarkers.name = 'singularities';
         this.scene.add(this.singularityMarkers);
 
+        /* The extracted mesh is drawn twice, as the desktop app does: a shaded
+           surface so the result reads as a solid object, and the quad edges on
+           top of it so the topology is legible. */
+        this.outputSurface = new THREE.Mesh(emptyGeometry(), buildOutputMaterial());
+        this.outputSurface.frustumCulled = false;
+        this.outputSurface.visible = false;
+        this.outputSurface.name = 'output-surface';
+        this.scene.add(this.outputSurface);
+
         this.outputWireframe = new THREE.LineSegments(
             emptyGeometry(),
             new THREE.LineBasicMaterial({ vertexColors: true })
@@ -682,10 +791,34 @@ export class Viewer {
      * pure black; dropping those segments here is the same thing done on the
      * CPU, and it keeps them out of the vertex buffer entirely.
      *
+     * The shaded surface is optional: passing only the wireframe leaves the
+     * previous surface in place, which is what a caller that just wants to
+     * recolour the edges wants.
+     *
      * @param {Float32Array} wireframe       (2 * nF * posy, 3) endpoints
      * @param {Float32Array} wireframeColor  (2 * nF * posy, 3) endpoint colours
+     * @param {object} [surface]             {vertices, faces, faceNormals, posy}
      */
-    setExtracted(wireframe, wireframeColor) {
+    setExtracted(wireframe, wireframeColor, surface) {
+        if (surface && surface.faces && surface.faces.length) {
+            replaceGeometry(
+                this.outputSurface,
+                buildOutputSurface(
+                    surface.vertices,
+                    surface.faces,
+                    surface.faceNormals,
+                    surface.posy || 4
+                )
+            );
+        } else if (!wireframe) {
+            replaceGeometry(this.outputSurface, emptyGeometry());
+        }
+        this._setExtractedWireframe(wireframe, wireframeColor);
+        this.outputSurface.visible =
+            this._layers.output && hasVertices(this.outputSurface);
+    }
+
+    _setExtractedWireframe(wireframe, wireframeColor) {
         const segments = wireframe ? Math.floor(wireframe.length / 6) : 0;
         const keep = new Uint8Array(segments);
         let kept = 0;
@@ -741,6 +874,7 @@ export class Viewer {
                 break;
             default:
                 this.outputWireframe.visible = visible && this._hasOutput;
+                this.outputSurface.visible = visible && hasVertices(this.outputSurface);
                 break;
         }
     }
@@ -878,6 +1012,14 @@ export class Viewer {
 
         this.controls.update();
         if (this._field) this._field.update(this.camera, this.mesh);
+        if (this.outputSurface.visible) {
+            /* The desktop app fixes its light in eye space; re-deriving the
+               world position each frame keeps the highlight on the output mesh
+               matching the one on the input surface as the camera orbits. */
+            this.outputSurface.material.uniforms.light_position.value
+                .set(0.0, 0.3, 0.0)
+                .applyMatrix4(this.camera.matrixWorld);
+        }
         this.renderer.render(this.scene, this.camera);
 
         if (this._previewDirty) this._drawPreview();
@@ -952,6 +1094,7 @@ export class Viewer {
             this.strokeHandleMarkers,
             this.singularityMarkers,
             this.outputWireframe,
+            this.outputSurface,
         ]) {
             object.geometry.dispose();
             object.material.dispose();
