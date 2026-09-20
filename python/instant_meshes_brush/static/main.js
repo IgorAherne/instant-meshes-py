@@ -144,6 +144,9 @@ class App {
         this.hasOutput = false;
         /* The atlas is cut from the extraction, so it goes stale with it. */
         this.hasUv = false;
+        /* One build of each kind in flight; see _chooseSurface. */
+        this._pendingExtract = false;
+        this._pendingUv = false;
         /* Markers per field, and which field the selected brush can reach. */
         this._singularityCounts = { orientation: 0, position: 0 };
         this._singularityField = null;
@@ -258,6 +261,8 @@ class App {
         if (uv) {
             pending.uv = null;
             this._apply(() => this.viewer.setUvLayout(uv.layout));
+            /* The layout is what Result UV was waiting for. */
+            this._refreshSurface();
         }
     }
 
@@ -290,6 +295,8 @@ class App {
             this._invalidateOutput();
             if (this.panel.surface() !== 'output') return;
             this.panel.setStatus('Extracting...', false);
+            if (this._pendingExtract) return;
+            this._pendingExtract = true;
             send(MessageType.EXTRACT, options);
         };
 
@@ -325,12 +332,20 @@ class App {
      * IS the request to produce one. Anything that changes the field marks
      * both stale, so this rebuilds rather than showing what was made before
      * the last stroke.
+     *
+     * At most one build of each kind is ever in flight. The server answers
+     * frames in order and an extraction of a large mesh takes seconds, so
+     * without this a hand resting on the number keys queues a minute of work
+     * that nobody is waiting for any more.
      */
     _chooseSurface(which) {
         this._setSurface(which);
         if (which === 'output' && !this.hasOutput) {
             this.panel.setStatus('Extracting...', false);
-            this.connection.send(MessageType.EXTRACT, this.panel.extractOptions());
+            if (!this._pendingExtract) {
+                this._pendingExtract = true;
+                this.connection.send(MessageType.EXTRACT, this.panel.extractOptions());
+            }
         } else if (which === 'uv' && !this.hasUv) {
             this._requestUv();
         }
@@ -345,10 +360,12 @@ class App {
      * field instead, and _showStatus picks it up when the solve ends.
      */
     _requestUv() {
+        if (this._pendingUv) return;
         if (this._solving) {
             this.panel.setStatus('Unwrapping once the field has settled...', false);
             return;
         }
+        this._pendingUv = true;
         /* Said here rather than waiting for the server's first report: that
            one cannot arrive until the request has crossed the socket and the
            streamer has ticked, and a control that sits silent for a fifth of
@@ -379,15 +396,32 @@ class App {
      * a brush needs something to draw on.
      */
     _setSurface(which) {
-        if (this.panel.setSurface(which)) this._applySurface(which);
+        this.panel.setSurface(which);
+        this._applySurface(which);
     }
 
+    /**
+     * Show the chosen view, or hold the input up until it exists.
+     *
+     * Picking a result that has not been built yet is a request, and a
+     * request takes as long as it takes; blanking the stage for the duration
+     * answers it with nothing at all. The selection stands -- the button says
+     * what was asked for -- and the model stays visible underneath until the
+     * answer arrives, which is what setUvVisible already did for the layout.
+     */
     _applySurface(which) {
+        const output = which === 'output' && this.hasOutput;
+        const layout = which === 'uv' && this.hasUv;
         this._apply(() => {
-            this.viewer.setLayerVisible('mesh', which === 'mesh');
-            this.viewer.setLayerVisible('output', which === 'output');
+            this.viewer.setLayerVisible('output', output);
             this.viewer.setUvVisible(which === 'uv');
+            this.viewer.setLayerVisible('mesh', !output && !layout);
         });
+    }
+
+    /** Re-apply the current view, for when what it needs has just arrived. */
+    _refreshSurface() {
+        this._applySurface(this.panel.surface());
     }
 
     /**
@@ -569,6 +603,7 @@ class App {
                 },
             };
             this.hasUv = true;
+            this._pendingUv = false;
             this.panel.showUv({ charts: header.n_charts ?? 0, leniency: header.leniency });
             this.panel.setStatus(null, false);
         });
@@ -597,9 +632,13 @@ class App {
             this.panel.showOutput({ vertices: vertexCount, faces: faceCount });
             this.panel.setStatus(`Extracted ${faceCount} faces`, false);
             this.hasOutput = faceCount > 0;
-            /* Showing the result is the whole point of pressing Extract, and
-               the input surface sits a hair in front of it in places. */
-            this._setSurface('output');
+            this._pendingExtract = false;
+            /* Shown rather than selected: whoever asked for this already
+               chose the view, and an extraction of a large mesh lands long
+               enough afterwards that they may well have moved on. Pulling
+               them back to it here is what made a burst of 1/2/3 end up
+               somewhere nobody pressed. */
+            this._refreshSurface();
         });
 
         conn.on(MessageType.EXPORT_READY, (header) => {
@@ -607,6 +646,9 @@ class App {
                arriving rather than waiting behind a second button. */
             this.panel.startDownload(header.url, header.filename);
             this.panel.setStatus(`Exported ${header.filename}`, false);
+            /* The one place a result is worth switching to unasked: this is
+               what was just written, and seeing it is the point of the file. */
+            this._setSurface('output');
         });
 
         /* Its own frame rather than a field on STATUS: the unwrapper holds the
@@ -624,6 +666,10 @@ class App {
             /* An unwrap that failed on its way in may never have been seen
                running, so nothing else would take the label back down. */
             this.panel.showUnwrapping(null);
+            /* A build that answered with an error answered all the same, and
+               nothing else clears the way for the next attempt. */
+            this._pendingExtract = false;
+            this._pendingUv = false;
         });
 
         conn.onStatus((status) => this.panel.showLink(status));

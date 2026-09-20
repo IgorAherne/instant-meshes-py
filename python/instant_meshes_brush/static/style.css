@@ -76,10 +76,15 @@ body {
 }
 
 /* The panel is the only scrollable region: the stage must never scroll away,
-   which is what made the controls unreachable when they lived on the host page. */
+   which is what made the controls unreachable when they lived on the host page.
+   Its sections are laid out as a column whose spare height goes into the gaps
+   between them, so Output mesh sits on the floor and the rest are spread. */
 #panel-scroll {
+    display: flex;
+    flex-direction: column;
     flex: 1;
     min-height: 0;
+    padding: 14px 0 16px;
     overflow-y: auto;
     overscroll-behavior: contain;
 }
@@ -93,16 +98,28 @@ body {
     border-radius: 5px;
 }
 
-/* Generous: the sections are five different subjects, and reading which
-   control belongs to which is worth more panel height than the controls it
-   would otherwise buy. */
+/* A section is exactly as tall as what is in it; the air between them belongs
+   to the gaps below, which is what lets the spare height be shared out rather
+   than landing wherever the last section happens to end. */
 .block {
-    padding: 17px 12px 19px;
-    border-bottom: 1px solid var(--panel-edge);
+    flex: 0 0 auto;
+    padding: 0 12px;
 }
 
-.block:last-child {
-    border-bottom: 0;
+/* The space between two sections, and the rule drawn across the middle of it.
+   A flex item rather than a border, so the leftover panel height divides
+   equally between the gaps instead of collecting under the last section --
+   and the rule stays centred in whatever height each one ends up with.
+   It never shrinks: a panel too short for its contents scrolls instead. */
+.gap {
+    flex: 1 0 36px;
+    margin: 0;
+    border: 0;
+    background:
+        linear-gradient(
+            var(--panel-edge) 0 0
+        )
+        no-repeat center / 100% 1px;
 }
 
 .block h2 {
