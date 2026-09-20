@@ -283,9 +283,11 @@ def test_extraction_options_change_the_output_without_a_rebuild(
 ) -> None:
     """The only two config fields extract() reads rather than preprocess().
 
-    Routing them through preprocess would work, and would also drop every brush
-    stroke and renumber the vertices they were projected onto, so the setter
-    exists to keep an interactive client from paying that price for a checkbox.
+    The setter exists so a client can change them without rebuilding. It is
+    the escape hatch, not the ordinary route for ``pure_quad``: preprocess
+    aims the resolution target at a quarter of itself when subdivision is on,
+    and setting the flag here leaves that aim where it was -- which is exactly
+    the fourfold overshoot the test below pins down.
     """
     vertices = solved_session.vertices.copy()
     mixed = solved_session.extract()
@@ -299,6 +301,32 @@ def test_extraction_options_change_the_output_without_a_rebuild(
     assert pure.faces.shape[0] > mixed.faces.shape[0]
     # The working mesh is the thing that must not have moved.
     np.testing.assert_array_equal(solved_session.vertices, vertices)
+
+
+def test_a_pure_quad_target_counts_the_mesh_that_comes_out(torus) -> None:
+    """The resolution target names the output, subdivision included.
+
+    A pure quad mesh is produced by splitting every extracted quad into four,
+    so a field aimed straight at the target overshoots it roughly fourfold --
+    a request for 2,500 vertices used to return ten thousand. preprocess aims
+    at a quarter instead, and hands the request back untouched so a UI's own
+    box is never rewritten.
+    """
+    target = 800
+    counts = {}
+    for pure_quad in (False, True):
+        session = imb.Session()
+        session.set_mesh(*torus)
+        session.preprocess(
+            imb.Config(vertex_count=target, pure_quad=pure_quad, deterministic=True)
+        )
+        session.solve_all()
+        counts[pure_quad] = session.extract().vertices.shape[0]
+        assert session.config.vertex_count == target
+
+    assert counts[True] == pytest.approx(target, rel=0.25)
+    # Both land near the target, so neither is a multiple of the other.
+    assert counts[True] == pytest.approx(counts[False], rel=0.25)
 
 
 def test_session_rejects_use_before_preprocess() -> None:

@@ -77,6 +77,9 @@ struct ExtractedMesh {
 struct Config {
     int rosy = 4;                  ///< 2, 4 or 6
     int posy = 4;                  ///< 3, 4 (6 is expressed as posy == 3)
+    /* The three targets describe the mesh extract() returns, subdivision
+       included: with pureQuad set, preprocess aims the field at a quarter of
+       what is asked for, because the pure quad step multiplies it by four. */
     Float scale = -1;              ///< target edge length; < 0 to derive it
     int faceCount = -1;            ///< target face count; < 0 to derive it
     int vertexCount = -1;          ///< target vertex count; < 0 to derive it

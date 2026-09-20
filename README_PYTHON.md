@@ -130,23 +130,34 @@ a Blender user expects it:
 | Wheel | Zoom |
 | `F` | Frame the model, keeping the angle |
 | `C` / `E` | Orientation comb / edge brush |
+| `1` / `2` / `3` | Input / Result / Result UV |
 | `Esc` | Cancel the stroke being drawn |
 
-The pair of buttons above **Export** picks one surface or the other — the input
-you brush on, or the extracted result — never both, since they occupy the same
-space. Choosing the output builds one; drawing a stroke switches back to the
-input, and marks the result stale so the next look at it is rebuilt from the
-field you just changed.
+The three buttons above **Export** pick the view: **Input** is the surface you
+brush on, **Result** the extracted quad mesh, **Result UV** that mesh flattened
+into its texture space. Never two at once — the first two occupy the same
+space. Choosing either result builds one; drawing a stroke switches back to the
+input and marks both stale, so the next look at them is rebuilt from the field
+you just changed.
 
 **UV chunks** cuts the atlas, and is the only xatlas control there is. The
 slider is how far one chunk may stretch before xatlas gives up on it and starts
 another: the right-hand end is fewer, larger chunks with more distortion, the
 left-hand end more, smaller ones that each stay closer to their true shape, and
-the number beside the label is what came out. Hovering anywhere on that control
-puts the flattened layout on the stage in place of the model, each chunk in its
-own colour — which is the only form in which the setting means anything.
-Exporting an OBJ carries the layout with it whether or not you ever looked at
-it; a PLY does not, having no per-corner form for one.
+the number beside the label is what came out. Touching it switches to **Result
+UV**, because that picture is the only form in which the setting means
+anything; while the unwrapper runs, the label carries its progress. Exporting
+an OBJ carries the layout with it whether or not you ever looked at it; a PLY
+does not, having no per-corner form for one.
+
+The four toggles under the resolution — **Smooth Flow**, **Follow Borders**,
+**Sharp Creases**, **Force Quads** — all change how the field is solved, so
+each one rebuilds and re-solves. Force Quads subdivides the result into quads
+only, which splits every quad into four; the field is aimed at a quarter of the
+target vertex count to compensate, so the number you ask for is still roughly
+the number you get. An exported OBJ still writes the few per cent of quads a UV
+seam runs through as their two triangles, which is the only way they can carry
+one.
 
 Every control lives **inside** the viewport, so embedding it in your own Gradio
 app is one call and you reproduce none of the UI:
@@ -259,13 +270,19 @@ rejects any variable-length binary PLY). `Config(pure_quad=True)` subdivides
 away the triangles and makes the PLY uniform, and therefore portable.
 
 `pure_quad` and `smooth_iter` are the only settings `extract` reads rather than
-`preprocess`, so they can be changed without a rebuild — and without losing the
-strokes a rebuild would take with it:
+`preprocess`, so they can be changed without a rebuild:
 
 ```python
 session.set_extraction_options(smooth_iter=4, pure_quad=True)
 mesh = session.extract()
 ```
+
+That is an escape hatch rather than the ordinary route for `pure_quad`. The
+pure-quad step splits every extracted quad into four, so `preprocess` aims the
+field at a quarter of `vertex_count` when the flag is set — a request for 2,500
+vertices returns about 2,500 rather than ten thousand, and `session.config`
+hands the request back unchanged. Setting the flag afterwards leaves that aim
+where it was, and the output comes out four times over.
 
 ### Texture coordinates
 
@@ -275,7 +292,7 @@ the `[app]` extra) and hands the result back **on the quads**:
 ```python
 from instant_meshes_brush import uv
 
-layout = uv.unwrap(mesh.vertices, mesh.faces, leniency=0.5)   # 0..1
+layout = uv.unwrap(mesh.vertices, mesh.faces, leniency=0.5, progress=print)
 uv.write_obj("out.obj", mesh.vertices, mesh.faces, layout)
 print(layout.chart_count, "chunks,", layout.unmapped, "faces without UVs")
 ```
@@ -293,6 +310,10 @@ answers.
 `write_obj` exists because the C++ writer emits `vt` lines that none of its
 faces reference; this one writes `f v/vt` per corner, and leaves a face without
 texture indices rather than pointing it at the origin.
+
+`progress` is called with a fraction in [0, 1]. xatlas's Python binding takes
+no progress callback, so its own call is one opaque block — the number holds
+there and then jumps; the rest of the pipeline reports honestly.
 
 ### Reproducible output
 

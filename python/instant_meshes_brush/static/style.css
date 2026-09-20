@@ -19,7 +19,10 @@
     --accent-hot: #5a88e0;
     --danger: #d06a5a;
     --focus: #7aa3f0;
-    --panel-width: 232px;
+    /* Wide enough for three view buttons with their shortcut keys on them,
+       and for four option toggles across one row -- with the scrollbar out,
+       which takes another eight pixels off the widest of them. */
+    --panel-width: 252px;
 }
 
 * {
@@ -195,13 +198,22 @@ button.wide:last-child {
 }
 
 .segmented > button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
     flex: 1 1 0;
     min-width: 0;
+    padding: 5px 3px;
     border-radius: 0;
-    text-align: center;
+    font-size: 10.5px;
+    white-space: nowrap;
+}
+
+.segmented .label {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
 }
 
 .segmented > button:first-child {
@@ -214,13 +226,14 @@ button.wide:last-child {
     border-radius: 0 4px 4px 0;
 }
 
+/* Colour alone, as on the brush buttons: bolding the selected one widens its
+   label past the third of the row it has, and "Result UV" ellipsises. */
 .segmented > button[aria-checked="true"] {
     position: relative;
     z-index: 1;
     background: var(--accent);
     border-color: var(--accent);
     color: #fff;
-    font-weight: 600;
 }
 
 .segmented > button[aria-checked="true"]:hover {
@@ -393,7 +406,8 @@ input[type="range"] {
     text-overflow: ellipsis;
 }
 
-.tool kbd {
+/* Shortcut badge, on the brushes and on the view buttons alike. */
+kbd {
     flex: 0 0 auto;
     padding: 0 4px;
     border: 1px solid var(--panel-edge);
@@ -404,7 +418,7 @@ input[type="range"] {
     color: var(--muted);
 }
 
-.tool[aria-checked="true"] kbd {
+[aria-checked="true"] > kbd {
     border-color: rgba(255, 255, 255, 0.35);
     color: #fff;
 }
@@ -435,6 +449,38 @@ input[type="range"] {
    `button:hover` is the more specific rule and the selected brush turns grey
    the moment you move back over it, which reads as having lost the selection. */
 .tool[aria-checked="true"]:hover {
+    background: var(--accent-hot);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Option toggles                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Four settings of one kind across one row: they all change how the field is
+   solved, and four checkboxes down the panel spent four rows saying it. */
+.toggles {
+    display: flex;
+    gap: 3px;
+    margin: 8px 0;
+}
+
+.toggle {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 4px 2px;
+    font-size: 10px;
+    line-height: 1.3;
+    text-align: center;
+}
+
+.toggle[aria-pressed="true"] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+}
+
+.toggle[aria-pressed="true"]:hover {
     background: var(--accent-hot);
 }
 
@@ -563,11 +609,17 @@ input[type="range"] {
 
 @media (max-width: 720px) {
     :root {
-        --panel-width: 190px;
+        --panel-width: 196px;
     }
 
     .tool .label {
         font-size: 11px;
+    }
+
+    /* The view buttons need every pixel for their names here; the keys still
+       work, and the hint still names them. */
+    .seg kbd {
+        display: none;
     }
 
     /* The tool help is the first thing to go: it is the longest thing on

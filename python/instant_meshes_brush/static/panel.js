@@ -161,9 +161,6 @@ export class Panel {
             symmetry: byId('symmetry'),
             target: byId('target'),
             targetRange: byId('target-range'),
-            extrinsic: byId('opt-extrinsic'),
-            boundaries: byId('opt-boundaries'),
-            creases: byId('opt-creases'),
 
             strokeCount: byId('stroke-count'),
             clear: byId('btn-clear'),
@@ -171,11 +168,11 @@ export class Panel {
 
             uvZone: byId('uv-zone'),
             uvLeniency: byId('uv-leniency'),
+            uvLabel: byId('uv-label'),
             uvCharts: byId('uv-charts'),
 
             outputStats: byId('output-stats'),
             format: byId('format'),
-            pureQuad: byId('opt-pure-quad'),
             smoothing: byId('smoothing'),
             export: byId('btn-export'),
             download: byId('download'),
@@ -193,8 +190,6 @@ export class Panel {
         this._appliedConfig = null;
         this._settleTimer = 0;
         this._uvTimer = 0;
-        this._uvHovered = false;
-        this._uvDragging = false;
 
         /* The one status line shows the selected brush's help by default and
            borrows the space for a message, so both have to be remembered. */
@@ -241,8 +236,16 @@ export class Panel {
                a rejected one must not be left on screen looking accepted. */
             this.el.target.value = String(clampTarget(this.el.target.value));
         });
-        for (const key of ['symmetry', 'extrinsic', 'boundaries', 'creases']) {
-            on(this.el[key], 'change', () => this._settleConfig());
+        on(this.el.symmetry, 'change', () => this._settleConfig());
+
+        /* Every one of these four is baked in by preprocess, so each is a
+           rebuild -- including Force Quads, which decides what the target
+           vertex count has to be aimed at. */
+        for (const button of document.querySelectorAll('button.toggle')) {
+            on(button, 'click', () => {
+                this.setOption(button.dataset.opt, !this.option(button.dataset.opt));
+                this._settleConfig();
+            });
         }
 
         for (const button of document.querySelectorAll('button.tool')) {
@@ -254,14 +257,12 @@ export class Panel {
             on(button, 'click', () => call('onSurfaceChange', button.dataset.surface));
         }
 
-        /* These two are read at extraction time, so changing one makes the
-           result on screen stale. `change` rather than `input`, so a typed
-           smoothing count is not re-extracted once per keystroke. */
-        for (const key of ['pureQuad', 'smoothing']) {
-            on(this.el[key], 'change', () =>
-                call('onExtractOptionsChange', this.extractOptions())
-            );
-        }
+        /* Read at extraction time, so changing it makes the result on screen
+           stale without needing a rebuild. `change` rather than `input`, so a
+           typed count is not re-extracted once per keystroke. */
+        on(this.el.smoothing, 'change', () =>
+            call('onExtractOptionsChange', this.extractOptions())
+        );
 
         /* The chart size travels with the export as well as with a preview:
            moving the slider and pressing Export without ever hovering would
@@ -284,36 +285,21 @@ export class Panel {
     }
 
     /**
-     * The UV control, which is a slider and a hover in one.
+     * The UV control, which selects the view that shows what it does.
      *
-     * A flattened mesh cannot be judged from a number, so the control shows
-     * its own result: the pointer entering it puts the layout on the stage,
-     * and leaving puts the model back. Dragging the slider off the control's
-     * own bounds is still dragging the slider, so the preview survives it --
-     * otherwise the layout would vanish exactly while it was being changed.
+     * A flattened mesh cannot be judged from a number, so touching the slider
+     * switches to Result UV: reaching for this control is the request to see
+     * a layout. Merely passing over it is not, which is why this is a press
+     * and not a hover.
      */
     _bindUv(on, call) {
+        on(this.el.uvZone, 'pointerdown', () => call('onSurfaceChange', 'uv'));
         on(this.el.uvLeniency, 'input', () => {
             clearTimeout(this._uvTimer);
             this._uvTimer = setTimeout(
                 () => call('onUvChange', this.uvLeniency()),
                 UV_SETTLE_MS
             );
-        });
-
-        on(this.el.uvZone, 'pointerenter', () => {
-            this._uvHovered = true;
-            call('onUvPreview', true);
-        });
-        on(this.el.uvZone, 'pointerleave', () => {
-            this._uvHovered = false;
-            if (!this._uvDragging) call('onUvPreview', false);
-        });
-        on(this.el.uvZone, 'pointerdown', () => { this._uvDragging = true; });
-        on(document, 'pointerup', () => {
-            if (!this._uvDragging) return;
-            this._uvDragging = false;
-            if (!this._uvHovered) call('onUvPreview', false);
         });
     }
 
@@ -349,24 +335,39 @@ export class Panel {
         return {
             ...symmetry,
             vertex_count: clampTarget(this.el.target.value),
-            extrinsic: this.el.extrinsic.checked,
-            align_to_boundaries: this.el.boundaries.checked,
-            crease_angle: this.el.creases.checked ? CREASE_ANGLE : -1.0,
+            extrinsic: this.option('extrinsic'),
+            align_to_boundaries: this.option('boundaries'),
+            crease_angle: this.option('creases') ? CREASE_ANGLE : -1.0,
+            // Goes through preprocess rather than through extract, because the
+            // pure quad step subdivides afterwards: the target vertex count
+            // has to be aimed at a quarter of itself to still come true.
+            pure_quad: this.option('pure-quad'),
         };
     }
 
-    /** Which surface the Show toggle currently has selected. */
+    /** Which view the segmented control currently has selected. */
     surface() {
         const chosen = document.querySelector('button.seg[aria-checked="true"]');
         return chosen ? chosen.dataset.surface : 'mesh';
     }
 
-    /** The two settings extract() reads, which need no rebuild. */
+    /** The one setting extract() reads, which needs no rebuild. */
     extractOptions() {
-        return {
-            pure_quad: this.el.pureQuad.checked,
-            smooth_iter: Math.max(0, Number(this.el.smoothing.value) || 0),
-        };
+        return { smooth_iter: Math.max(0, Number(this.el.smoothing.value) || 0) };
+    }
+
+    _toggle(name) {
+        return document.querySelector(`button.toggle[data-opt="${name}"]`);
+    }
+
+    option(name) {
+        const button = this._toggle(name);
+        return Boolean(button && button.getAttribute('aria-pressed') === 'true');
+    }
+
+    setOption(name, on) {
+        const button = this._toggle(name);
+        if (button) button.setAttribute('aria-pressed', String(Boolean(on)));
     }
 
     layerState(name) {
@@ -428,13 +429,10 @@ export class Panel {
             this.el.target.value = String(clampTarget(config.vertex_count));
             this.el.targetRange.value = targetToSlider(config.vertex_count);
         }
-        if (settable(this.el.extrinsic)) this.el.extrinsic.checked = Boolean(config.extrinsic);
-        if (settable(this.el.boundaries)) {
-            this.el.boundaries.checked = Boolean(config.align_to_boundaries);
-        }
-        if (settable(this.el.creases)) {
-            this.el.creases.checked = Number(config.crease_angle) >= 0;
-        }
+        this.setOption('extrinsic', config.extrinsic);
+        this.setOption('boundaries', config.align_to_boundaries);
+        this.setOption('creases', Number(config.crease_angle) >= 0);
+        this.setOption('pure-quad', config.pure_quad);
 
         /* Whatever the controls now read is, by definition, what is built. */
         this._appliedConfig = this.readConfig();
@@ -482,14 +480,31 @@ export class Panel {
         }
         const charts = Number(layout.charts) || 0;
         this.el.uvCharts.textContent = `${charts.toLocaleString()}`;
-        if (layout.leniency !== undefined && this.el.uvLeniency !== document.activeElement
-            && !this._uvDragging) {
+        if (layout.leniency !== undefined && this.el.uvLeniency !== document.activeElement) {
             const span = Number(this.el.uvLeniency.max) || 100;
             this.el.uvLeniency.value = String(Math.round(layout.leniency * span));
         }
     }
 
-    /** The extracted mesh's size, or null once it is stale. */
+    /**
+     * How far along the unwrapper is, or null when it is not running.
+     *
+     * It borrows the control's own label rather than the status line, which
+     * belongs to the brush: the wait is this slider's, and so is the place
+     * that reports it.
+     */
+    showUnwrapping(progress) {
+        this.el.uvLabel.textContent =
+            progress === null || progress === undefined
+                ? 'UV chunks'
+                : `UV chunks (unwrapping ${Math.round(progress * 100)}%)`;
+    }
+
+    /** The extracted mesh's size, or null once it is stale.
+     *
+     * Vertices only: that is the number the target above is expressed in, so
+     * it is the one worth checking the result against.
+     */
     showOutput(counts) {
         const line = this.el.outputStats;
         if (!counts) {
@@ -497,9 +512,7 @@ export class Panel {
             return;
         }
         line.hidden = false;
-        line.textContent =
-            `${counts.vertices.toLocaleString()} v /` +
-            ` ${counts.faces.toLocaleString()} faces`;
+        line.textContent = `${counts.vertices.toLocaleString()} v`;
     }
 
     /**

@@ -27,9 +27,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+#: Fractions :func:`unwrap` reports, in the order it reaches them.
+#:
+#: xatlas's Python binding takes no progress callback, so its own call is one
+#: opaque block -- the largest of them.  The number therefore holds at
+#: ``_AFTER_TRIANGULATION`` for as long as the library is working and then
+#: jumps; the rest of the pipeline is ours and reports honestly, including the
+#: chart search, which is the slowest part on a big mesh.
+_AFTER_TRIANGULATION = 0.08
+_AFTER_XATLAS = 0.62
+_AFTER_MAPPING = 0.74
+_AFTER_CHARTS = 0.97
+
+#: How often the chart search reports, in triangles.
+_CHART_REPORT_EVERY = 4096
 
 #: Chart cost the leniency slider spans, as xatlas's ``ChartOptions.max_cost``.
 #:
@@ -229,7 +244,11 @@ def _corner_indices(
     return corners, matched, cut, incomplete
 
 
-def _components(matched: np.ndarray, placed: np.ndarray) -> Tuple[np.ndarray, int]:
+def _components(
+    matched: np.ndarray,
+    placed: np.ndarray,
+    report: Optional[Callable[[float], None]] = None,
+) -> Tuple[np.ndarray, int]:
     """Label each triangle with the chart it landed in.
 
     xatlas's Python binding publishes the chart *count* but not which triangle
@@ -250,17 +269,26 @@ def _components(matched: np.ndarray, placed: np.ndarray) -> Tuple[np.ndarray, in
             x = parent[x]
         return x
 
+    # Two passes over every triangle, so the reported fraction counts both.
+    total = 2 * rows.size
+    done = 0
     for row in rows:
         root = find(int(matched[row, 0]))
         for corner in (1, 2):
             other = find(int(matched[row, corner]))
             if other != root:
                 parent[other] = root
+        done += 1
+        if report and done % _CHART_REPORT_EVERY == 0:
+            report(done / total)
 
     seen: dict = {}
     for row in rows:
         root = find(int(matched[row, 0]))
         labels[row] = seen.setdefault(root, len(seen))
+        done += 1
+        if report and done % _CHART_REPORT_EVERY == 0:
+            report(done / total)
     return labels, len(seen)
 
 
@@ -317,16 +345,21 @@ def _fill_degenerate_corner(faces: np.ndarray, corners: np.ndarray) -> None:
 
 
 def unwrap(
-    vertices: np.ndarray, faces: np.ndarray, leniency: float = DEFAULT_LENIENCY
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    leniency: float = DEFAULT_LENIENCY,
+    progress: Optional[Callable[[float], None]] = None,
 ) -> UvLayout:
     """Flatten ``faces`` into a texture space, keeping the faces intact.
 
     ``vertices`` is (nV, 3) and ``faces`` is (nF, 3) or (nF, 4) as the
     extractor produces it, quad-dominant with triangles stored as degenerate
     quads.  ``leniency`` runs from 0 (many small chunks, little distortion) to
-    1 (few large ones).
+    1 (few large ones).  ``progress`` is called with a fraction in [0, 1]; see
+    the note on the constants above for where it can and cannot move.
     """
     xatlas = _import_xatlas()
+    report = progress or (lambda _fraction: None)
 
     v = np.ascontiguousarray(vertices, dtype=np.float32)
     f = np.asarray(faces)
@@ -336,6 +369,7 @@ def unwrap(
         raise UnwrapError("the mesh has no faces to unwrap")
 
     triangles, tri_face, tri_corner = _triangulate(f)
+    report(_AFTER_TRIANGULATION)
 
     atlas = xatlas.Atlas()
     atlas.add_mesh(v, triangles)
@@ -345,6 +379,7 @@ def unwrap(
         atlas.generate(chart_options=options)
     except Exception as exc:  # xatlas raises bare RuntimeErrors
         raise UnwrapError(f"xatlas could not unwrap this mesh: {exc}") from exc
+    report(_AFTER_XATLAS)
 
     vmapping, out_triangles, coordinates = atlas[0]
     corners, matched, was_cut, incomplete = _corner_indices(
@@ -356,9 +391,14 @@ def unwrap(
         np.asarray(out_triangles),
     )
     _fill_degenerate_corner(f, corners)
+    report(_AFTER_MAPPING)
 
     placed = matched[:, 0] >= 0
-    labels, chart_count = _components(matched, placed)
+    span = _AFTER_CHARTS - _AFTER_MAPPING
+    labels, chart_count = _components(
+        matched, placed, lambda done: report(_AFTER_MAPPING + span * done)
+    )
+    report(_AFTER_CHARTS)
 
     # A whole face takes the chart of any of its triangles -- they agree, or it
     # would not be whole. The rest travel as triangles, each with its own.

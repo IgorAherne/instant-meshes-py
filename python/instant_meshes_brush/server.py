@@ -307,6 +307,8 @@ class _Connection:
         #: Geometry version as last *sent*, so a mesh loaded from the Gradio
         #: panel -- or any other holder of this session -- reaches this socket.
         self._sent_geometry_version = -1
+        #: Unwrap progress as last sent, in whole percent; -1 for "not running".
+        self._sent_uv_percent = -1
 
     # -- transport ---------------------------------------------------------
 
@@ -397,6 +399,13 @@ class _Connection:
                 # is only watching a long solve.
                 self.session.touch()
 
+                # Before anything else, and alone: an unwrap owns the
+                # session's worker thread for its duration, so the status read
+                # below would queue behind it and arrive once, at the end,
+                # describing a wait that was already over.
+                if await self._send_uv_progress():
+                    continue
+
                 try:
                     # A mesh can arrive from the Gradio panel rather than from
                     # this socket, so the geometry gets the same change
@@ -455,6 +464,19 @@ class _Connection:
             pass  # the socket went away; run()'s finally does the tidying up
         except Exception:
             LOG.info("field streamer for session %s stopped", self.session.id, exc_info=True)
+
+    async def _send_uv_progress(self) -> bool:
+        """Publish how far the unwrapper has got. True while one is running.
+
+        Quantised to the percent the panel prints, so a fraction that moves
+        smoothly does not cost a frame per report.
+        """
+        progress = self.session.uv_progress
+        percent = -1 if progress is None else int(progress * 100)
+        if percent != self._sent_uv_percent:
+            self._sent_uv_percent = percent
+            await self._send(protocol.encode(MessageType.PROGRESS, {"uv": progress}))
+        return progress is not None
 
     async def _send_geometry(self, geometry: Geometry) -> None:
         """Answer a mesh change this socket asked for.

@@ -77,6 +77,13 @@ export const TOOLS = [
 /** The first tool, which is what left-drag does until another is picked. */
 export const DEFAULT_TOOL = TOOLS[0].id;
 
+/** Number keys for the three views, in the order the panel lists them. */
+export const SURFACE_KEYS = Object.freeze({
+    1: 'mesh',
+    2: 'output',
+    3: 'uv',
+});
+
 /**
  * Walk a drag at a fixed screen-space spacing.
  *
@@ -137,13 +144,14 @@ export class ToolController {
     constructor(
         viewer,
         connection,
-        { onToolChange = null, onNotice = null, onUndo = null } = {}
+        { onToolChange = null, onNotice = null, onUndo = null, onSurface = null } = {}
     ) {
         this.viewer = viewer;
         this.connection = connection;
         this._onToolChange = onToolChange;
         this._onNotice = onNotice;
         this._onUndo = onUndo;
+        this._onSurface = onSurface;
 
         this._tool = TOOLS_BY_ID.get(DEFAULT_TOOL);
         this._pointerId = null;
@@ -297,6 +305,12 @@ export class ToolController {
             if (this._pointerId === null) return;
             this.cancelStroke();
             this._notify('Stroke cancelled');
+            return;
+        }
+
+        if (SURFACE_KEYS[event.key]) {
+            event.preventDefault();
+            if (this._onSurface) this._onSurface(SURFACE_KEYS[event.key]);
             return;
         }
 

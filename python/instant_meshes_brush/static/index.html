@@ -78,15 +78,6 @@
                 <span class="label">Pos. attractor</span>
               </button>
             </div>
-            <!-- The two overlays a brush aims at, next to the brushes that aim
-                 at them: the grid is what combing turns, and the markers are
-                 what an attractor drags. -->
-            <div class="row">
-              <label class="check"><input type="checkbox" data-layer="grid" checked
-                data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
-              <label class="check push"><input type="checkbox" data-layer="singularities"
-                data-hint="The red and blue dots marking where the grid cannot stay regular -- where three or five edges meet instead of four. Picking either attractor brush turns them on, since those drag a marker you have to be able to see." /><span>Singularities</span></label>
-            </div>
             <div class="row">
               <span id="stroke-count" class="muted">No strokes</span>
               <button id="btn-clear" class="link-button" disabled
@@ -96,6 +87,15 @@
               <!-- How many markers are on screen right now, which is the one
                    number the attractors are aimed at. -->
               <span id="singularity-count" class="muted push" hidden></span>
+            </div>
+            <!-- The two overlays a brush aims at, under the brushes that aim
+                 at them: the grid is what combing turns, and the markers are
+                 what an attractor drags. -->
+            <div class="row">
+              <label class="check"><input type="checkbox" data-layer="grid" checked
+                data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
+              <label class="check push"><input type="checkbox" data-layer="singularities"
+                data-hint="The red and blue dots marking where the grid cannot stay regular -- where three or five edges meet instead of four. Picking either attractor brush turns them on, since those drag a marker you have to be able to see." /><span>Singularities</span></label>
             </div>
           </section>
 
@@ -118,14 +118,19 @@
                  vertices, so the useful low end is not crushed into 5 pixels. -->
             <input type="range" id="target-range" min="0" max="1000" step="1" value="0" />
 
-            <label class="check"><input type="checkbox" id="opt-extrinsic" checked
-              data-hint="Smooth the flow through space rather than across the surface -- 'extrinsic' smoothing. It gives a calmer, more even grid and is what you normally want; turning it off lets the flow follow the surface's own curvature more closely, at the cost of more swirl." /><span>Smoother flow</span></label>
-            <label class="check"><input type="checkbox" id="opt-boundaries"
-              data-hint="Make edge loops run parallel to the open edges of the model, where it has any." /><span>Follow the boundaries</span></label>
-            <label class="check"><input type="checkbox" id="opt-creases"
-              data-hint="Keep sharp edges sharp instead of smoothing across them." /><span>Sharp creases</span></label>
-            <label class="check"><input type="checkbox" id="opt-pure-quad"
-              data-hint="Subdivide so the result contains quads only, with no triangles. Roughly quadruples the vertex and face count, which is why the output can come out much larger than the target above." /><span>Pure quad mesh</span></label>
+            <!-- Four settings of the same kind -- each one changes how the
+                 field is solved, so each one rebuilds -- and four checkboxes
+                 down the panel cost four rows to say it. -->
+            <div class="toggles" role="group" aria-label="Field options">
+              <button class="toggle" data-opt="extrinsic" aria-pressed="true"
+                data-hint="Smooth the flow through space rather than across the surface -- 'extrinsic' smoothing. It gives a calmer, more even grid and is what you normally want; turning it off lets the flow follow the surface's own curvature more closely, at the cost of more swirl.">Smooth<br />Flow</button>
+              <button class="toggle" data-opt="boundaries" aria-pressed="false"
+                data-hint="Make edge loops run parallel to the open edges of the model, where it has any.">Follow<br />Borders</button>
+              <button class="toggle" data-opt="creases" aria-pressed="false"
+                data-hint="Keep sharp edges sharp instead of smoothing across them.">Sharp<br />Creases</button>
+              <button class="toggle" data-opt="pure-quad" aria-pressed="false"
+                data-hint="Subdivide so the result contains quads only, with no triangles. The subdivision splits every quad into four, so the field is aimed at a quarter of the target above and the count you asked for is still what comes out.&#10;&#10;An exported OBJ still writes the few per cent of quads a UV seam runs through as their two triangles -- the only way they can carry it.">Force<br />Quads</button>
+            </div>
 
             <div class="field">
               <label for="smoothing">Smoothing</label>
@@ -138,29 +143,33 @@
               </select>
             </div>
 
-            <!-- The UV atlas, as one control. Hovering anywhere in here puts
-                 the flattened layout on the stage in place of the model, which
-                 is the only way to judge what the slider just did. -->
+            <!-- The UV atlas, as one control. Touching it selects the view
+                 that shows what it does, since the setting means nothing
+                 except as a picture of the layout it produces. -->
             <div id="uv-zone" hidden>
               <div class="field">
-                <span>UV chunks</span>
+                <span id="uv-label">UV chunks</span>
                 <span id="uv-charts"></span>
               </div>
               <input type="range" id="uv-leniency" min="0" max="100" step="1" value="50"
-                data-hint="How far xatlas may stretch one UV chunk before it cuts a seam and starts another. Right means fewer, larger chunks with more distortion; left means more, smaller ones that each stay closer to their true shape.&#10;&#10;Hover anywhere on this control to see the layout." />
+                data-hint="How far xatlas may stretch one UV chunk before it cuts a seam and starts another. Right means fewer, larger chunks with more distortion; left means more, smaller ones that each stay closer to their true shape.&#10;&#10;Dragging this switches the view to Result UV, so you can see what it did." />
             </div>
 
-            <!-- One surface or the other, never both: they occupy the same
-                 space, and the input in front of the output is what made the
-                 extracted mesh look like it had never appeared. -->
-            <div class="segmented" role="radiogroup" aria-label="Surface">
+            <!-- One view at a time: the first two occupy the same space, and
+                 the input in front of the output is what made an extracted
+                 mesh look like it had never appeared. -->
+            <div class="segmented" role="radiogroup" aria-label="View">
               <button class="seg" data-surface="mesh" role="radio" aria-checked="true"
                 data-hint="Show the model you imported, with the field grid on it. This is the surface you brush on, so drawing a stroke switches back here.">
-                Input surface
+                <span class="label">Input</span><kbd>1</kbd>
               </button>
               <button class="seg" data-surface="output" role="radio" aria-checked="false"
                 data-hint="Show the extracted quad mesh. It is built on demand, so choosing this after brushing rebuilds it from the field you have just changed.">
-                Output mesh
+                <span class="label">Result</span><kbd>2</kbd>
+              </button>
+              <button class="seg" data-surface="uv" role="radio" aria-checked="false"
+                data-hint="Show the result flattened into its texture space, one colour per UV chunk. Built on demand like the result itself.">
+                <span class="label">Result UV</span><kbd>3</kbd>
               </button>
             </div>
 

@@ -144,7 +144,6 @@ class App {
         this.hasOutput = false;
         /* The atlas is cut from the extraction, so it goes stale with it. */
         this.hasUv = false;
-        this._uvPreview = false;
         /* Markers per field, and which field the selected brush can reach. */
         this._singularityCounts = { orientation: 0, position: 0 };
         this._singularityField = null;
@@ -153,6 +152,7 @@ class App {
             onToolChange: (tool) => this._onToolChange(tool),
             onNotice: (message) => this.panel.setStatus(message, false),
             onUndo: () => this._undoStroke(),
+            onSurface: (which) => this._chooseSurface(which),
         });
 
         viewer.onFrame = () => this._drain();
@@ -281,17 +281,7 @@ class App {
 
         this.panel.handlers.onExport = (options) => send(MessageType.EXPORT, options);
 
-        /* There is no Extract button: asking to see the output IS the request
-           to build one, and so is exporting.  Anything that changes the field
-           marks the result stale, so this rebuilds rather than showing the
-           mesh that was extracted before the last stroke. */
-        this.panel.handlers.onSurfaceChange = (which) => {
-            this._setSurface(which);
-            if (which === 'output' && !this.hasOutput) {
-                this.panel.setStatus('Extracting...', false);
-                send(MessageType.EXTRACT, this.panel.extractOptions());
-            }
-        };
+        this.panel.handlers.onSurfaceChange = (which) => this._chooseSurface(which);
 
         /* Pure quad and smoothing are read at extraction time, so the result
            on screen no longer matches them. Rebuild it now if it is what the
@@ -316,25 +306,34 @@ class App {
 
         this.panel.handlers.onOpenFile = (file) => this._uploadMesh(file);
 
-        /* Hovering the UV control is the request to see the layout, and the
-           layout is cut from an extraction -- so this is also what builds one,
-           the same way asking to see the output mesh is. */
-        this.panel.handlers.onUvPreview = (on) => {
-            this._uvPreview = on;
-            this._apply(() => this.viewer.setUvVisible(on));
-            if (!on) {
-                this.panel.setStatus(null, false);
-            } else if (!this.hasUv) {
-                this._requestUv();
-            }
-        };
-
         /* A different chart size is a different atlas; the one on screen is
            only worth re-cutting while somebody is looking at it. */
         this.panel.handlers.onUvChange = () => {
             this.hasUv = false;
-            if (this._uvPreview) this._requestUv();
+            if (this._showingUv()) this._requestUv();
         };
+    }
+
+    _showingUv() {
+        return this.panel.surface() === 'uv';
+    }
+
+    /**
+     * Switch the view, building whatever it needs.
+     *
+     * There is no Extract button and no Unwrap button: asking to see a result
+     * IS the request to produce one. Anything that changes the field marks
+     * both stale, so this rebuilds rather than showing what was made before
+     * the last stroke.
+     */
+    _chooseSurface(which) {
+        this._setSurface(which);
+        if (which === 'output' && !this.hasOutput) {
+            this.panel.setStatus('Extracting...', false);
+            this.connection.send(MessageType.EXTRACT, this.panel.extractOptions());
+        } else if (which === 'uv' && !this.hasUv) {
+            this._requestUv();
+        }
     }
 
     /**
@@ -383,6 +382,7 @@ class App {
         this._apply(() => {
             this.viewer.setLayerVisible('mesh', which === 'mesh');
             this.viewer.setLayerVisible('output', which === 'output');
+            this.viewer.setUvVisible(which === 'uv');
         });
     }
 
@@ -414,7 +414,7 @@ class App {
         this.hasUv = false;
         this.panel.showUv(null);
         this.pending.uv = { layout: null };
-        if (this._uvPreview) this._requestUv();
+        if (this._showingUv()) this._requestUv();
     }
 
     /**
@@ -605,6 +605,13 @@ class App {
             this.panel.setStatus(`Exported ${header.filename}`, false);
         });
 
+        /* Its own frame rather than a field on STATUS: the unwrapper holds the
+           session's worker thread, and a status frame cannot be built without
+           it, so the only number that can reach here mid-unwrap is this one. */
+        conn.on(MessageType.PROGRESS, (header) =>
+            this.panel.showUnwrapping(header.uv ?? null)
+        );
+
         conn.on(MessageType.STATUS, (header) => this._showStatus(header));
 
         conn.on(MessageType.ERROR, (header) => {
@@ -645,7 +652,7 @@ class App {
 
         /* A layout asked for mid-solve was deferred rather than dropped. Last,
            so the request's own message is the one left on the line. */
-        if (!running && this._uvPreview && !this.hasUv) this._requestUv();
+        if (!running && this._showingUv() && !this.hasUv) this._requestUv();
     }
 }
 

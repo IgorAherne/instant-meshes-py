@@ -379,6 +379,11 @@ class BrushSession:
         #: cut at. Both are dropped with the extraction they describe.
         self._uv: Optional[UvLayout] = None
         self._uv_leniency = uv.DEFAULT_LENIENCY
+        #: How far the unwrapper has got, or None while it is not running.
+        #: Written from the worker thread and read from the event loop, which
+        #: is safe for a single attribute and is why it is not a queue: the
+        #: streamer samples it, so a report it misses costs nothing.
+        self._uv_progress: Optional[float] = None
         self._export_dir: Optional[Path] = None
 
         self._executor = ThreadPoolExecutor(
@@ -932,6 +937,11 @@ class BrushSession:
         """Where the chart-size control stands, in [0, 1]."""
         return self._uv_leniency
 
+    @property
+    def uv_progress(self) -> Optional[float]:
+        """How far an unwrap has got, or None when none is running."""
+        return self._uv_progress
+
     async def unwrap(self, leniency: Optional[float] = None) -> UvLayout:
         """Cut a UV atlas for the extracted mesh, extracting first if need be.
 
@@ -946,26 +956,39 @@ class BrushSession:
         target = uv.DEFAULT_LENIENCY if leniency is None else float(leniency)
         target = min(1.0, max(0.0, target))
 
-        # Outside the lock: extract() takes it, and takes it again through
-        # ensure_solved if nothing has ever been solved.
-        if self._extracted is None:
-            await self.extract()
+        # Set before the extraction rather than after it: on a mesh that has
+        # never been extracted that is most of the wait, and a control that
+        # says nothing for the first two seconds looks broken.
+        self._uv_progress = 0.0
+        try:
+            # Outside the lock: extract() takes it, and takes it again through
+            # ensure_solved if nothing has ever been solved.
+            if self._extracted is None:
+                await self.extract()
 
-        async with self._lock:
-            self._require_ready()
-            self._uv_leniency = target
-            cached = self._uv
-            if cached is not None and cached.leniency == target:
-                return cached
-            mesh = self._extracted
-            if mesh is None:
-                raise SessionError("nothing to unwrap")
-            try:
-                layout = await self._call(_unwrap_extraction, mesh, target)
-            except UnwrapError as exc:
-                raise SessionError(str(exc)) from exc
-            self._uv = layout
-            return layout
+            async with self._lock:
+                self._require_ready()
+                self._uv_leniency = target
+                cached = self._uv
+                if cached is not None and cached.leniency == target:
+                    return cached
+                mesh = self._extracted
+                if mesh is None:
+                    raise SessionError("nothing to unwrap")
+                try:
+                    layout = await self._call(
+                        _unwrap_extraction, mesh, target, self._report_uv_progress
+                    )
+                except UnwrapError as exc:
+                    raise SessionError(str(exc)) from exc
+                self._uv = layout
+                return layout
+        finally:
+            self._uv_progress = None
+
+    def _report_uv_progress(self, fraction: float) -> None:
+        """Called from the worker thread; the streamer samples the result."""
+        self._uv_progress = min(1.0, max(0.0, float(fraction)))
 
     async def extraction(self) -> Optional[Extraction]:
         """Read the extracted mesh on hand, without building a new one.
@@ -1032,9 +1055,13 @@ def _stroke_result(stroke_id: int, kind: str, curve: "_core.Curve") -> StrokeRes
     )
 
 
-def _unwrap_extraction(mesh: "_core.ExtractedMesh", leniency: float) -> UvLayout:
+def _unwrap_extraction(
+    mesh: "_core.ExtractedMesh",
+    leniency: float,
+    progress: Callable[[float], None],
+) -> UvLayout:
     """Read the extracted mesh and flatten it, both on the session's worker."""
-    return uv.unwrap(mesh.vertices, mesh.faces, leniency)
+    return uv.unwrap(mesh.vertices, mesh.faces, leniency, progress)
 
 
 def _write_textured_obj(path: str, mesh: "_core.ExtractedMesh", layout: UvLayout) -> None:

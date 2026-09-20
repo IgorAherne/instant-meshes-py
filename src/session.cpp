@@ -182,6 +182,25 @@ void Session::preprocess(const Config &cfg, const ProgressCallback &progress) {
     if (scale < 0 && vertexCount < 0 && faceCount < 0)
         vertexCount = (int) (V.cols() / 16);
 
+    /* A pure quad mesh is not the mesh the field is solved for: extract_faces
+       subdivides the extracted one afterwards, splitting every quad into four.
+       That multiplies the vertex and face counts by close to four -- 3.73 at a
+       1k target and 3.86 at 10k on the Stanford bunny -- so a caller who asks
+       for 2500 vertices and ticks pureQuad gets ten thousand.
+
+       The target names the mesh they end up with, so the field is aimed at a
+       quarter of it. mConfig below reports the request rather than the
+       quarter: that number is what a UI puts back in its own box. */
+    const bool subdivided = cfg.pureQuad && cfg.posy == 4;
+    if (subdivided) {
+        if (scale > 0)
+            scale *= 2;
+        if (faceCount > 0)
+            faceCount = std::max(1, faceCount / 4);
+        if (vertexCount > 0)
+            vertexCount = std::max(1, vertexCount / 4);
+    }
+
     /* Identical derivation to batch.cpp:78-90 and Viewer::loadInput. */
     if (scale > 0) {
         Float faceArea = cfg.posy == 4 ? (scale * scale)
@@ -199,9 +218,19 @@ void Session::preprocess(const Config &cfg, const ProgressCallback &progress) {
         scale = cfg.posy == 4 ? std::sqrt(faceArea)
                               : (2 * std::sqrt(faceArea * std::sqrt(1.f / 3.f)));
     }
+    /* Reported as the output rather than as the mesh the field is aimed at:
+       with subdivision on the two differ by a factor of four.  Whatever the
+       caller actually asked for is handed straight back, so a UI mirroring
+       this into its own box never sees its number rewritten by the rounding
+       of a trip through the quarter and out again. */
     mConfig.scale = scale;
     mConfig.faceCount = faceCount;
     mConfig.vertexCount = vertexCount;
+    if (subdivided) {
+        mConfig.scale = cfg.scale > 0 ? cfg.scale : scale / 2;
+        mConfig.faceCount = cfg.faceCount > 0 ? cfg.faceCount : faceCount * 4;
+        mConfig.vertexCount = cfg.vertexCount > 0 ? cfg.vertexCount : vertexCount * 4;
+    }
 
     /* Subdivide when the input cannot represent the requested edge length. */
     if (mStats.mMaximumEdgeLength * 2 > scale ||

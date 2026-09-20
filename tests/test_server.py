@@ -699,6 +699,71 @@ def test_unwrapping_extracts_a_mesh_to_flatten(client, torus) -> None:
     assert 0.0 <= coordinates.min() <= coordinates.max() <= 1.0
 
 
+@pytest.fixture
+def slow_unwrap(monkeypatch):
+    """An unwrapper that reports progress and dawdles, so it can be watched.
+
+    The real one finishes a test torus in milliseconds, which the streamer's
+    15 Hz tick would step straight over; and it needs xatlas, which this has
+    no opinion about. What is under test is the route from a worker thread to
+    the socket, so the layout it returns is a stub.
+    """
+
+    def fake(vertices, faces, leniency=uv.DEFAULT_LENIENCY, progress=None):
+        for fraction in (0.25, 0.5, 0.75):
+            if progress:
+                progress(fraction)
+            time.sleep(0.15)
+        count = len(faces)
+        return uv.UvLayout(
+            uv=np.zeros((1, 2), dtype=np.float32),
+            faces=np.zeros((count, 4), dtype=np.int32),
+            chart=np.zeros(count, dtype=np.int32),
+            cut=np.zeros((0, 3), dtype=np.int32),
+            cut_face=np.zeros(0, dtype=np.int32),
+            cut_slot=np.zeros((0, 3), dtype=np.int32),
+            cut_chart=np.zeros(0, dtype=np.int32),
+            chart_count=1,
+            leniency=leniency,
+        )
+
+    monkeypatch.setattr(uv, "unwrap", fake)
+    monkeypatch.setattr(uv, "available", lambda: True)
+
+
+def test_unwrapping_reports_its_progress_while_it_runs(
+    client, torus, slow_unwrap
+) -> None:
+    """The fraction has to arrive during the wait, not after it.
+
+    An unwrap holds the session's single worker thread, so the streamer cannot
+    build a status frame while one runs -- every call it would need is queued
+    behind the job being reported on. The progress frame is built from the
+    event loop's side alone, which is the only thing that can get out.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+
+        socket.send(MessageType.UNWRAP, {"leniency": 0.5})
+        # The reader is serial, so the first of these returns once the unwrap
+        # is done, carrying everything the streamer sent in the meantime; the
+        # rest wait for the tick that reports it finished.
+        reported: List[object] = []
+        for _ in range(20):
+            reported += [
+                m.get("uv") for m in socket.drain() if m.type == MessageType.PROGRESS
+            ]
+            if reported and reported[-1] is None:
+                break
+            time.sleep(0.05)
+    assert len(reported) >= 3, f"only saw {reported}"
+    assert reported[-1] is None, "the label is never cleared"
+    moving = [value for value in reported if value is not None]
+    assert moving == sorted(moving), f"progress went backwards: {moving}"
+    assert max(moving) >= 0.5
+
+
 @pytest.mark.skipif(not uv.available(), reason="xatlas is not installed")
 def test_an_exported_obj_carries_its_uv_layout(client, torus, tmp_path) -> None:
     """The atlas is only worth cutting if it leaves with the file.
