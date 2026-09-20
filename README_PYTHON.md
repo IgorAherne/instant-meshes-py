@@ -81,13 +81,13 @@ instant-meshes-brush
 ```
 
 Open the URL it prints. Everything is in the panel down the left of the
-viewport: open a mesh, set the target resolution, pick a brush, solve, extract
-and download. Hovering any control explains what it does.
+viewport: open a mesh, pick a brush, extract and download. Hovering any control
+explains what it does.
 
-The usual order is **Open mesh -> Solve both fields -> brush -> Solve again ->
-Extract**. Brush strokes are constraints on the orientation field, so they only
-change anything once a field is re-solved; the viewport does that for you after
-each stroke.
+The whole workflow is **Open mesh -> brush -> Extract -> Export**. There is no
+Apply step and no Solve step to remember: loading a mesh solves it, changing the
+target resolution rebuilds and re-solves it, and every stroke re-solves with the
+stroke in place. The Solve button is there to redo it, not to make it happen.
 
 | Tool | What the stroke does |
 |---|---|
@@ -101,6 +101,17 @@ being dragged. The other two tools work anywhere on the surface.
 
 Clicking a stroke's handle deletes it and re-solves.
 
+The left button always belongs to the selected brush, so navigation lives where
+a Blender user expects it:
+
+| | |
+|---|---|
+| Middle-drag, or Alt + left-drag | Orbit |
+| Right-drag | Pan |
+| Wheel | Zoom |
+| `F` | Frame the model, keeping the angle |
+| `Esc` | Cancel the stroke being drawn |
+
 Every control lives **inside** the viewport, so embedding it in your own Gradio
 app is one call and you reproduce none of the UI:
 
@@ -111,17 +122,21 @@ from instant_meshes_brush.server import build_app
 
 with gr.Blocks() as demo:
     gr.Markdown("## My tool")
-    viewport(height="80vh")      # mints a session per browser tab
+    viewport(width="70%", height="80vh")     # mints a session per browser tab
 
 app = gr.mount_gradio_app(build_app(), demo, path="/")   # uvicorn app:app
 ```
 
-`build_app()` serves `/viewer`, `/static/...`, the mesh upload route and the
-WebSocket; `viewport()` creates a session and drops in the iframe. Both share
-one `SessionRegistry`, so if you do want your own buttons, fetch the session
-with `default_registry().get(session_id)` and call the `BrushSession`
-coroutines — the viewport picks the change up over its own socket, including a
-mesh you load from outside it.
+`build_app()` serves `/viewer`, `/imb-assets/...`, the mesh upload route and the
+WebSocket. It deliberately avoids `/static`, which is Gradio's: routes
+registered on the FastAPI app win over the Gradio mount, so taking that prefix
+would 404 your page's own fonts.
+
+`viewport()` creates a session and drops in the iframe. Both share one
+`SessionRegistry`, so if you do want your own buttons, fetch the session with
+`default_registry().get(session_id)` and call the `BrushSession` coroutines —
+the viewport picks the change up over its own socket, including a mesh you load
+from outside it.
 
 ---
 
@@ -193,6 +208,15 @@ mixed face degrees is legal but not universally readable (trimesh, for one,
 rejects any variable-length binary PLY). `Config(pure_quad=True)` subdivides
 away the triangles and makes the PLY uniform, and therefore portable.
 
+`pure_quad` and `smooth_iter` are the only settings `extract` reads rather than
+`preprocess`, so they can be changed without a rebuild — and without losing the
+strokes a rebuild would take with it:
+
+```python
+session.set_extraction_options(smooth_iter=4, pure_quad=True)
+mesh = session.extract()
+```
+
 ### Reproducible output
 
 `Config(deterministic=True)` makes a run bit-identical, **including across
@@ -211,7 +235,7 @@ ext/pss_shim/               likewise for the pss parallel sort
 python/instant_meshes_brush/
     protocol.py             binary WebSocket framing (paired with protocol.js)
     session_manager.py      one C++ session per browser, with a TTL sweeper
-    server.py               FastAPI: /viewer, /static, /ws/{session}, uploads
+    server.py               FastAPI: /viewer, /imb-assets, /ws/{id}, uploads
     app.py                  the Gradio wrapper -- an iframe and nothing else
     static/
         index.html          the viewport, controls included

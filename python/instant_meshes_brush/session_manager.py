@@ -440,6 +440,15 @@ class BrushSession:
         return self._geometry
 
     @property
+    def has_extraction(self) -> bool:
+        """True while an extracted mesh is on hand and still current.
+
+        Cleared by anything that invalidates it: a rebuild, a new mesh, or a
+        change to the extraction options.
+        """
+        return self._extracted is not None
+
+    @property
     def geometry_version(self) -> int:
         """Increments whenever the working mesh is replaced.
 
@@ -457,9 +466,17 @@ class BrushSession:
         would show a UI a target edge length of -1.  The requested form is
         still what a later :meth:`set_config` builds on, so both are kept.
         """
-        if self._geometry is not None:
-            return dict(self._geometry.config)
-        return config_as_dict(self._config)
+        if self._geometry is None:
+            return config_as_dict(self._config)
+
+        values = dict(self._geometry.config)
+        # That snapshot was taken by preprocess. The two extraction options can
+        # be retargeted afterwards without one, so they are read live instead --
+        # otherwise a client would be told pure quads are off while the next
+        # extraction produces them.
+        values["smooth_iter"] = self._config.smooth_iter
+        values["pure_quad"] = self._config.pure_quad
+        return values
 
     def touch(self) -> None:
         """Mark the session as in use, postponing the registry's TTL sweep."""
@@ -790,10 +807,49 @@ class BrushSession:
         core = self._require_ready()
         return await self._call(_read_singularities, core, self._require_geometry())
 
-    async def extract(self) -> Extraction:
+    async def set_extraction_options(
+        self,
+        smooth_iter: Optional[int] = None,
+        pure_quad: Optional[bool] = None,
+    ) -> bool:
+        """Retarget the two options ``extract`` reads. True if they changed.
+
+        Everything else in the config is baked in by ``preprocess``, so changing
+        it means a rebuild and the loss of every stroke.  These two are read at
+        extraction time, so they are simply set -- and the extraction on hand,
+        which was built with the previous values, is dropped.
+        """
+        async with self._lock:
+            return await self._set_extraction_options_locked(smooth_iter, pure_quad)
+
+    async def _set_extraction_options_locked(
+        self, smooth_iter: Optional[int], pure_quad: Optional[bool]
+    ) -> bool:
+        core = self._require_ready()
+        smooth = (
+            self._config.smooth_iter if smooth_iter is None else max(0, int(smooth_iter))
+        )
+        pure = self._config.pure_quad if pure_quad is None else bool(pure_quad)
+        if (smooth, pure) == (self._config.smooth_iter, self._config.pure_quad):
+            return False
+
+        # Mirrored into the stored config as well as pushed into the core: a
+        # later set_config builds on it, and would otherwise revert them.
+        self._config.smooth_iter = smooth
+        self._config.pure_quad = pure
+        await self._call(core.set_extraction_options, smooth, pure)
+        self._extracted = None
+        return True
+
+    async def extract(
+        self,
+        smooth_iter: Optional[int] = None,
+        pure_quad: Optional[bool] = None,
+    ) -> Extraction:
         """Extract the output mesh, stopping the solve so it is self-consistent."""
         async with self._lock:
             core = self._require_ready()
+            await self._set_extraction_options_locked(smooth_iter, pure_quad)
             await self._stop_locked()
             mesh = await self._call(core.extract)
             self._extracted = mesh

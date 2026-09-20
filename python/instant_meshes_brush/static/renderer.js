@@ -565,6 +565,12 @@ export class Viewer {
         this.controls = new OrbitControls(this.camera, canvas);
         this.controls.screenSpacePanning = true;
         this.controls.zoomToCursor = true;
+        /* Blender's navigation, because that is what the people who brush
+           retopology already have in their hands: the middle button orbits,
+           the right button pans, and the left button is left to the brush. */
+        this.controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
+        this._leftButton = null;
+        this._installCameraModifiers();
 
         /* Called once per animation frame, before anything is drawn, so a
            caller can apply network updates at most once per displayed frame. */
@@ -574,6 +580,8 @@ export class Viewer {
         this.mesh = null;
         this._scale = 1;
         this._avgEdge = 1;
+        /* The working mesh's bounding sphere, kept so the F key can reframe. */
+        this._bounds = null;
 
         this._layers = {
             mesh: true,
@@ -597,6 +605,35 @@ export class Viewer {
 
         this._tick = this._tick.bind(this);
         this._raf = requestAnimationFrame(this._tick);
+    }
+
+    /**
+     * Give Alt-drag to the camera, and keep the middle button out of the
+     * browser's hands.
+     *
+     * OrbitControls reads `mouseButtons.LEFT` inside its own pointerdown
+     * listener, which is registered on the canvas before any of ours, so the
+     * decision has to be made earlier still: a capture-phase listener on the
+     * document runs before every listener on the canvas itself, whatever order
+     * those were added in.
+     */
+    _installCameraModifiers() {
+        this._onPointerDownCapture = (event) => {
+            if (event.button === 0) {
+                this.controls.mouseButtons.LEFT =
+                    event.altKey ? THREE.MOUSE.ROTATE : this._leftButton;
+            } else if (event.button === 1 && event.target === this.canvas) {
+                /* Suppressing the compatibility mouse events is what stops
+                   Chrome and Firefox opening autoscroll on a middle-drag. */
+                event.preventDefault();
+            }
+        };
+        document.addEventListener('pointerdown', this._onPointerDownCapture, true);
+
+        this._onAuxClick = (event) => {
+            if (event.button === 1) event.preventDefault();
+        };
+        this.canvas.addEventListener('auxclick', this._onAuxClick);
     }
 
     _buildLayers() {
@@ -697,21 +734,47 @@ export class Viewer {
         handleUniforms.maxPixels.value = handlePixels;
         this.singularityMarkers.material.uniforms.worldSize.value = this._scale * SINGULARITY_SCALE;
 
-        const sphere = boundingSphere(positions);
-        this._frameCamera(sphere.center, sphere.radius);
+        this._bounds = boundingSphere(positions);
+        this._frameCamera(this._bounds.center, this._bounds.radius);
         this.assertMeshSpaceIsWorldSpace();
     }
 
+    /**
+     * Put the whole model back in view from where the camera is now.
+     *
+     * The direction is kept and only the distance and the orbit centre are
+     * reset, which is what makes this useful after zooming into a detail: the
+     * model comes back at the angle it was being inspected from.
+     *
+     * @returns {boolean} false when there is no mesh to frame
+     */
+    frameModel() {
+        if (!this._bounds) return false;
+        this._frameCamera(this._bounds.center, this._bounds.radius, true);
+        return true;
+    }
+
     /** Distance that fits the bounding sphere in the vertical field of view. */
-    _frameCamera(center, radius) {
+    _frameCamera(center, radius, keepDirection = false) {
         const halfFov = THREE.MathUtils.degToRad(this.camera.fov) / 2;
-        const distance = (radius / Math.sin(halfFov)) * 1.05;
+        /* The horizontal field of view is the narrow one on a tall viewport,
+           so fitting only the vertical one would clip a wide model. */
+        const halfMin = Math.min(halfFov, Math.atan(Math.tan(halfFov) * this.camera.aspect));
+        const distance = (radius / Math.sin(halfMin)) * 1.05;
 
         this.camera.near = radius * 0.01;
         this.camera.far = distance + radius * 6;
-        this.camera.up.set(0, 1, 0);
-        this.camera.position.set(center.x, center.y, center.z + distance);
         this.camera.updateProjectionMatrix();
+
+        const direction = new THREE.Vector3(0, 0, 1);
+        if (keepDirection) {
+            direction.subVectors(this.camera.position, this.controls.target);
+            if (direction.lengthSq() < 1e-20) direction.set(0, 0, 1);
+            direction.normalize();
+        } else {
+            this.camera.up.set(0, 1, 0);
+        }
+        this.camera.position.copy(center).addScaledVector(direction, distance);
 
         this.controls.target.copy(center);
         this.controls.minDistance = radius * 0.02;
@@ -882,12 +945,15 @@ export class Viewer {
     /**
      * Hand the primary drag to a brush, or give it back to the camera.
      *
-     * Only the left button and the one-finger gesture change hands: the native
-     * viewer keeps the wheel and the right button working while a tool is
+     * Only the left button and the one-finger gesture change hands: the middle
+     * button, the right button and the wheel keep working while a tool is
      * selected, so navigating never requires putting the brush down.
      */
     setControlsEnabled(enabled) {
-        this.controls.mouseButtons.LEFT = enabled ? THREE.MOUSE.ROTATE : null;
+        /* Remembered rather than only assigned: an Alt-drag borrows the left
+           button and has to know what to hand back afterwards. */
+        this._leftButton = enabled ? THREE.MOUSE.ROTATE : null;
+        this.controls.mouseButtons.LEFT = this._leftButton;
         this.controls.touches.ONE = enabled ? THREE.TOUCH.ROTATE : null;
         this.canvas.classList.toggle('drawing', !enabled);
     }
@@ -1086,6 +1152,8 @@ export class Viewer {
     dispose() {
         cancelAnimationFrame(this._raf);
         this._resizeObserver.disconnect();
+        document.removeEventListener('pointerdown', this._onPointerDownCapture, true);
+        this.canvas.removeEventListener('auxclick', this._onAuxClick);
         this.controls.dispose();
         this._disposeMesh();
 

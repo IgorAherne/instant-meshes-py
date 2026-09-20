@@ -255,6 +255,29 @@ def test_config_survives_preprocess(
     assert config.scale == pytest.approx(mesh_session.scale)
 
 
+def test_extraction_options_change_the_output_without_a_rebuild(
+    solved_session: imb.Session,
+) -> None:
+    """The only two config fields extract() reads rather than preprocess().
+
+    Routing them through preprocess would work, and would also drop every brush
+    stroke and renumber the vertices they were projected onto, so the setter
+    exists to keep an interactive client from paying that price for a checkbox.
+    """
+    vertices = solved_session.vertices.copy()
+    mixed = solved_session.extract()
+
+    solved_session.set_extraction_options(smooth_iter=3, pure_quad=True)
+    pure = solved_session.extract()
+
+    assert solved_session.config.pure_quad is True
+    assert solved_session.config.smooth_iter == 3
+    # Subdividing away the triangles can only add faces.
+    assert pure.faces.shape[0] > mixed.faces.shape[0]
+    # The working mesh is the thing that must not have moved.
+    np.testing.assert_array_equal(solved_session.vertices, vertices)
+
+
 def test_session_rejects_use_before_preprocess() -> None:
     session = imb.Session()
 

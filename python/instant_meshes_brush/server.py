@@ -61,6 +61,12 @@ LOG = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 INDEX_HTML = STATIC_DIR / "index.html"
 
+#: Where the viewer's own assets are served from. Deliberately not "/static":
+#: Gradio serves its fonts and helper scripts from there, and because routes
+#: registered here are matched before the Gradio mount, taking that prefix
+#: would 404 them for every host application.  index.html hard-codes this.
+STATIC_URL = "/imb-assets"
+
 DEFAULT_FPS = 15
 MIN_FPS = 1
 MAX_FPS = 60
@@ -143,6 +149,20 @@ def _as_config(values: Any, what: str) -> Optional[Mapping[str, Any]]:
     raise SessionError(
         f"{what} expects a mapping of config values, got {type(values).__name__}"
     )
+
+
+def _extraction_options(
+    message: protocol.Message,
+) -> Tuple[Optional[int], Optional[bool]]:
+    """``(smooth_iter, pure_quad)`` from a frame, None where it said nothing.
+
+    These two ride with EXTRACT and EXPORT rather than with SET_CONFIG, because
+    they are the only settings that do not need the hierarchy rebuilt -- and a
+    rebuild would take every brush stroke with it.
+    """
+    smooth = message.get("smooth_iter")
+    pure = message.get("pure_quad")
+    return (None if smooth is None else int(smooth), None if pure is None else bool(pure))
 
 
 # ---------------------------------------------------------------------------
@@ -557,12 +577,19 @@ class _Connection:
         await self._send_status()
 
     async def _on_extract(self, message: protocol.Message) -> None:
-        extraction = await self.session.extract()
+        extraction = await self.session.extract(*_extraction_options(message))
         await self._send(_extracted_frame(extraction))
         await self._send_status()
 
     async def _on_export(self, message: protocol.Message) -> None:
         fmt = str(message.get("format", "obj"))
+        # Exporting is allowed without extracting first, so the options travel
+        # with this frame too; setting them drops an extraction built with the
+        # old ones. Whatever has to be extracted here is also sent, so the file
+        # the client downloads is the mesh it is looking at.
+        await self.session.set_extraction_options(*_extraction_options(message))
+        if not self.session.has_extraction:
+            await self._send(_extracted_frame(await self.session.extract()))
         path = await self.session.export_mesh(fmt)
         header = {
             "url": f"/api/session/{self.session.id}/export",
@@ -621,7 +648,7 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
 
     app = FastAPI(title="instant-meshes-brush", lifespan=lifespan)
     app.state.registry = sessions
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount(STATIC_URL, StaticFiles(directory=STATIC_DIR), name="imb-assets")
 
     @app.get("/viewer", include_in_schema=False)
     async def viewer() -> FileResponse:

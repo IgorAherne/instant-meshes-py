@@ -14,6 +14,7 @@ hanging the suite.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import List
 
@@ -22,7 +23,7 @@ import pytest
 
 from instant_meshes_brush import protocol
 from instant_meshes_brush.protocol import MessageType
-from instant_meshes_brush.server import build_app
+from instant_meshes_brush.server import STATIC_URL, build_app
 from instant_meshes_brush.session_manager import SessionRegistry
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
@@ -124,10 +125,28 @@ def test_viewer_route_and_static_assets_are_served(client) -> None:
     assert "<canvas" in page.text
 
     for asset in ("main.js", "protocol.js", "renderer.js", "field_material.js",
-                  "tools.js", "net.js", "style.css", "vendor/three.module.js"):
-        response = client.get(f"/static/{asset}")
+                  "tools.js", "net.js", "panel.js", "style.css",
+                  "vendor/three.module.js", "vendor/OrbitControls.js"):
+        response = client.get(f"{STATIC_URL}/{asset}")
         assert response.status_code == 200, asset
         assert response.content, asset
+
+    # index.html hard-codes the mount, so the two have to agree. Most assets
+    # are reached through ES imports rather than named here; these are the ones
+    # the document asks for itself, and a mismatch is a blank viewer.
+    for url in re.findall(r'(?:src|href)="(/[^"]+)"', page.text):
+        assert client.get(url).status_code == 200, url
+
+
+def test_the_asset_mount_leaves_gradios_alone(client) -> None:
+    """/static belongs to Gradio, which serves its fonts from there.
+
+    These routes are matched before the Gradio mount, so taking that prefix
+    would 404 the host application's own assets -- which is exactly what it did
+    until the viewer's moved to its own.
+    """
+    assert STATIC_URL != "/static"
+    assert client.get("/static/style.css").status_code == 404
 
 
 def test_unknown_session_is_refused(client) -> None:
@@ -328,6 +347,67 @@ def test_extract_and_export(client, torus) -> None:
     download = client.get(ready.get("url"))
     assert download.status_code == 200
     assert download.content.startswith(b"v ")
+
+
+def test_export_without_extract_shows_what_it_wrote(client, torus) -> None:
+    """Export extracts on demand, and must publish what it extracted.
+
+    Otherwise the panel keeps reading "not extracted yet" beside a download
+    link for a file the viewport is not showing.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.FIELD)
+
+        # Both replies to one frame, so they have to be collected together:
+        # expect() discards the rest of the round it found its match in.
+        socket.send(MessageType.EXPORT, {"format": "obj"})
+        seen = {}
+        for attempt in range(60):
+            for reply in socket.drain():
+                seen.setdefault(reply.type, reply)
+            if MessageType.EXPORT_READY in seen:
+                break
+            time.sleep(0.05)
+
+    assert MessageType.EXTRACTED in seen, "export wrote a mesh it never showed"
+    assert seen[MessageType.EXTRACTED].get("n_faces") > 0
+    assert seen[MessageType.EXPORT_READY].get("bytes") > 0
+
+
+def test_extraction_options_do_not_rebuild_the_mesh(client, registry, torus) -> None:
+    """Pure quad and smoothing ride with EXTRACT, not with SET_CONFIG.
+
+    The panel has no Apply button any more, so anything routed through
+    SET_CONFIG re-runs preprocess -- which drops every stroke. These two are
+    read at extraction time, so they must not go that way: the check is that
+    the geometry version, which preprocess bumps, does not move.
+    """
+    session_id = open_session(client)
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.FIELD)
+
+        session = registry.get(session_id)
+        assert session is not None
+        version = session.geometry_version
+
+        socket.send(MessageType.EXTRACT, {"pure_quad": False, "smooth_iter": 0})
+        mixed = socket.expect(MessageType.EXTRACTED)
+
+        socket.send(MessageType.EXTRACT, {"pure_quad": True, "smooth_iter": 3})
+        pure = socket.expect(MessageType.EXTRACTED)
+
+    assert session.geometry_version == version, "extraction options rebuilt the hierarchy"
+    assert session.config["pure_quad"] is True
+    assert session.config["smooth_iter"] == 3
+    # Subdividing away the triangles can only add faces, and on a quad-dominant
+    # result it multiplies them.
+    assert pure.get("n_faces") > mixed.get("n_faces")
 
 
 def test_a_bad_frame_does_not_drop_the_socket(client) -> None:

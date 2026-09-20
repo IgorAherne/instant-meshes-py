@@ -24,31 +24,26 @@ const HANDLE_HIT_PX = 14;
 /** Search radius handed to Session::eraseStrokeNear, in average edge lengths. */
 const ERASE_RADIUS_EDGES = 2;
 
-const NAVIGATION_HINT = 'Right-drag or shift-drag pans, wheel zooms.';
+/* The camera keys, spelled the way a Blender user expects them.  The left
+   button belongs to the brush at all times -- that is the whole point of the
+   viewport -- so navigation lives on the middle button and on Alt. */
+const NAVIGATION_HINT =
+    'Middle-drag or Alt-drag orbits, right-drag pans, wheel zooms, F frames the model.';
 
 /**
- * The five selectable tools.  `kind` is what goes into the STROKE header: the
- * two persistent brushes use the numeric StrokeKind the C++ enum defines, the
+ * The four brushes.  `kind` is what goes into the STROKE header: the two
+ * persistent brushes use the numeric StrokeKind the C++ enum defines, the
  * attractors name themselves instead because they leave no stroke behind.
+ *
+ * There is no "orbit" tool: a brush is always armed, and the camera is reached
+ * through the modifiers above rather than by putting the brush down.
  */
 export const TOOLS = [
-    {
-        id: 'orbit',
-        label: 'Orbit',
-        kind: null,
-        hint: `Left-drag orbits. ${NAVIGATION_HINT}`,
-    },
     {
         id: 'comb',
         label: 'Orientation Comb',
         kind: 0,
         hint: 'Drag across the surface to comb the orientation field.',
-    },
-    {
-        id: 'orient-attractor',
-        label: 'Orientation Singularity Attractor',
-        kind: 'attractor_orientation',
-        hint: 'Drag from an orientation singularity to move, create or cancel it.',
     },
     {
         id: 'edge',
@@ -57,12 +52,21 @@ export const TOOLS = [
         hint: 'Drag to pin an edge path of the output mesh onto the surface.',
     },
     {
+        id: 'orient-attractor',
+        label: 'Orientation Singularity Attractor',
+        kind: 'attractor_orientation',
+        hint: 'Drag from an orientation singularity to move, create or cancel it.',
+    },
+    {
         id: 'pos-attractor',
         label: 'Position Singularity Attractor',
         kind: 'attractor_position',
         hint: 'Drag from a position singularity to move, create or cancel it.',
     },
 ];
+
+/** The first tool, which is what left-drag does until another is picked. */
+export const DEFAULT_TOOL = TOOLS[0].id;
 
 const TOOLS_BY_ID = new Map(TOOLS.map((tool) => [tool.id, tool]));
 
@@ -79,7 +83,7 @@ export class ToolController {
         this._onToolChange = onToolChange;
         this._onNotice = onNotice;
 
-        this._tool = TOOLS_BY_ID.get('orbit');
+        this._tool = TOOLS_BY_ID.get(DEFAULT_TOOL);
         this._pointerId = null;
         this._drawing = false;
         this._samples = [];
@@ -100,14 +104,14 @@ export class ToolController {
             target.addEventListener(type, handler);
         }
 
-        this.setTool('orbit');
+        this.setTool(DEFAULT_TOOL);
     }
 
     get tool() {
         return this._tool;
     }
 
-    /** @param {'orbit'|'comb'|'orient-attractor'|'edge'|'pos-attractor'} id */
+    /** @param {'comb'|'edge'|'orient-attractor'|'pos-attractor'} id */
     setTool(id) {
         const tool = TOOLS_BY_ID.get(id);
         if (!tool) throw new Error(`unknown tool "${id}"`);
@@ -148,7 +152,9 @@ export class ToolController {
     /* -------------------------------------------------------------- */
 
     _onPointerDown(event) {
-        if (event.button !== 0 || this._pointerId !== null) return;
+        /* Alt hands the left button to the camera, so a brush must not also
+           claim it; the viewer arms OrbitControls for the same event. */
+        if (event.button !== 0 || event.altKey || this._pointerId !== null) return;
 
         this._pointerId = event.pointerId;
         this._rect = this.viewer.canvas.getBoundingClientRect();
@@ -204,9 +210,21 @@ export class ToolController {
     }
 
     _onKeyDown(event) {
-        if (event.key !== 'Escape' || this._pointerId === null) return;
-        this.cancelStroke();
-        this._notify('Stroke cancelled');
+        /* Never while a control has focus: F is a character in the vertex
+           count box, and Ctrl-F belongs to the browser. */
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        const focused = document.activeElement;
+        if (focused && focused.matches('input, select, textarea')) return;
+
+        if (event.key === 'Escape') {
+            if (this._pointerId === null) return;
+            this.cancelStroke();
+            this._notify('Stroke cancelled');
+        } else if (event.key === 'f' || event.key === 'F') {
+            if (!this.viewer.frameModel()) return;
+            event.preventDefault();
+            this._notify('Framed the model');
+        }
     }
 
     _sample(event) {

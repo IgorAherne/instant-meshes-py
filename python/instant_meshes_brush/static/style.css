@@ -275,6 +275,12 @@ input[type="range"] {
     background: #395a39;
 }
 
+/* The rule above out-specifies the `hidden` attribute's display:none, which
+   left a Download link offering a file that had never been written. */
+.download[hidden] {
+    display: none;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Tools                                                              */
 /* ------------------------------------------------------------------ */
@@ -341,65 +347,67 @@ input[type="range"] {
     pointer-events: none;
 }
 
-#status {
+/* Everything the user reads rather than presses, stacked into the corner the
+   model rarely occupies.  A full-width status bar used to sit along the bottom;
+   it cost a row of stage height to say what fits here beside the model. */
+#readout {
     position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    left: 12px;
+    right: 12px;
+    bottom: 9px;
     display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 5px 12px;
-    background: rgba(24, 24, 27, 0.82);
-    border-top: 1px solid var(--panel-edge);
-    font-size: 11px;
+    flex-direction: column;
+    gap: 1px;
+    /* A stroke drawn across this corner has to reach the canvas underneath. */
+    pointer-events: none;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75);
 }
 
-#status .sep {
-    width: 1px;
-    height: 12px;
-    background: var(--panel-edge);
-}
-
-#tool-name {
-    font-weight: 600;
-}
-
-#progress {
-    flex: 1;
-    height: 4px;
-    min-width: 40px;
-    border-radius: 2px;
-    background: #3a3a42;
-    overflow: hidden;
-}
-
-#progress-fill {
-    width: 0;
-    height: 100%;
-    background: var(--accent);
-    transition: width 120ms linear;
-}
-
-#status-text {
-    max-width: 55%;
+#readout p {
+    margin: 0;
+    max-width: 100%;
     color: var(--muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-#status-text.error {
-    color: var(--danger);
+#readout .strong {
+    color: var(--text);
+    font-weight: 600;
 }
 
-#hint {
-    position: absolute;
-    left: 12px;
-    bottom: 30px;
-    margin: 0;
-    color: var(--muted);
-    pointer-events: none;
+#status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 11px;
+}
+
+#tool-name {
+    flex: 0 0 auto;
+    font-weight: 600;
+    color: var(--text);
+}
+
+#tool-name::after {
+    content: "";
+    display: inline-block;
+    width: 1px;
+    height: 9px;
+    margin-left: 8px;
+    vertical-align: baseline;
+    background: var(--panel-edge);
+}
+
+#status-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#status-text.error {
+    color: var(--danger);
 }
 
 .dot {
@@ -449,6 +457,8 @@ input[type="range"] {
         font-size: 11px;
     }
 
+    /* The tool help is the first thing to go: it is the longest line and the
+       one a returning user needs least. */
     #hint {
         display: none;
     }

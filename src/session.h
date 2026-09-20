@@ -134,6 +134,17 @@ public:
     bool ready() const { return mReady; }
     const Config &config() const { return mConfig; }
 
+    /**
+     * Change the two options only extract() reads.
+     *
+     * Everything else in Config is baked into the hierarchy by preprocess(),
+     * so changing it means rebuilding and losing every stroke.  These two are
+     * consumed at extraction time, so a caller that wants to re-extract with,
+     * say, pure quads should not have to pay for -- or be punished by -- a
+     * rebuild it does not need.
+     */
+    void setExtractionOptions(int smoothIter, bool pureQuad);
+
     /* ------------------------------------------------------------------ */
     /*  Geometry of the working (post-subdivision) mesh                   */
     /* ------------------------------------------------------------------ */

@@ -322,6 +322,10 @@ PYBIND11_MODULE(_core, m) {
              py::arg("config") = Config(), py::arg("progress") = py::none(),
              "Build the hierarchy and acceleration structures. Drops strokes.")
 
+        .def("set_extraction_options", &Session::setExtractionOptions,
+             py::arg("smooth_iter"), py::arg("pure_quad"),
+             "Retarget the two options extract() reads, without a rebuild.")
+
         .def_property_readonly("ready", &Session::ready)
         .def_property_readonly("config", &Session::config)
         .def_property_readonly("scale", &Session::scale)

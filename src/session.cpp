@@ -623,6 +623,13 @@ std::map<uint32_t, Vector2i> Session::positionSingularities() const {
     return posSing;
 }
 
+void Session::setExtractionOptions(int smoothIter, bool pureQuad) {
+    /* Both are read by extract() on the calling thread and by nothing else, so
+       this needs no lock -- unlike everything that touches the hierarchy. */
+    mConfig.smoothIter = std::max(0, smoothIter);
+    mConfig.pureQuad = pureQuad;
+}
+
 ExtractedMesh Session::extract() {
     requireReady();
     std::lock_guard<ordered_lock> lock(mRes.mutex());

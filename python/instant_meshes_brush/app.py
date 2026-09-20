@@ -36,24 +36,41 @@ from .session_manager import SessionRegistry, default_registry
 DEFAULT_HEIGHT = "82vh"
 MIN_HEIGHT_PX = 520
 
+#: Narrower than the page it sits on, and centred.  A viewport as wide as a
+#: modern monitor puts the model a long way from the controls and leaves the
+#: 3D view an extreme letterbox; 70% keeps both in one glance.
+DEFAULT_WIDTH = "70%"
+MIN_WIDTH_PX = 640
 
-def _iframe(session_id: str, height: str) -> str:
+_FRAME_STYLE = (
+    "border:1px solid #3a3a40;border-radius:6px;"
+    "display:block;margin:0 auto;background:#2d2d30"
+)
+
+
+def _box_style(width: str, height: str) -> str:
+    return (
+        f"width:{html.escape(width, quote=True)};"
+        f"max-width:100%;min-width:min(100%,{MIN_WIDTH_PX}px);"
+        f"height:{html.escape(height, quote=True)};"
+        f"min-height:{MIN_HEIGHT_PX}px;{_FRAME_STYLE}"
+    )
+
+
+def _iframe(session_id: str, width: str, height: str) -> str:
     """Markup for one viewport bound to ``session_id``."""
     safe = html.escape(session_id, quote=True)
     return (
         f'<iframe src="/viewer?session={safe}" title="Instant Meshes viewport" '
-        f'allow="fullscreen" '
-        f'style="width:100%;height:{html.escape(height, quote=True)};'
-        f'min-height:{MIN_HEIGHT_PX}px;border:1px solid #3a3a40;'
-        f'border-radius:6px;display:block;background:#2d2d30"></iframe>'
+        f'allow="fullscreen" style="{_box_style(width, height)}"></iframe>'
     )
 
 
-def _placeholder(message: str) -> str:
+def _placeholder(message: str, width: str = DEFAULT_WIDTH, height: str = DEFAULT_HEIGHT) -> str:
     return (
-        f'<div style="display:flex;align-items:center;justify-content:center;'
-        f'height:{DEFAULT_HEIGHT};min-height:{MIN_HEIGHT_PX}px;border:1px solid #3a3a40;'
-        f'border-radius:6px;background:#2d2d30;color:#8b8b94;font:14px system-ui">'
+        f'<div style="{_box_style(width, height)};'
+        f'display:flex;align-items:center;justify-content:center;'
+        f'color:#8b8b94;font:14px system-ui">'
         f"{html.escape(message)}</div>"
     )
 
@@ -61,21 +78,22 @@ def _placeholder(message: str) -> str:
 def viewport(
     height: str = DEFAULT_HEIGHT,
     registry: Optional[SessionRegistry] = None,
+    width: str = DEFAULT_WIDTH,
 ) -> gr.HTML:
     """Embed a viewport in the Blocks context that is currently open.
 
     A session is created when the page loads rather than when the app is built,
     so every browser tab gets its own mesh, solver and stroke set.
     """
-    holder = gr.HTML(_placeholder("Starting a session..."))
+    holder = gr.HTML(_placeholder("Starting a session...", width, height))
 
     async def start() -> str:
         sessions = registry if registry is not None else default_registry()
         try:
             session = await sessions.create()
         except Exception as exc:  # a full registry must not blank the page
-            return _placeholder(f"Could not start a session: {exc}")
-        return _iframe(session.id, height)
+            return _placeholder(f"Could not start a session: {exc}", width, height)
+        return _iframe(session.id, width, height)
 
     # Gradio calls this per browser session, which is what mints one id per tab.
     holder.attach_load_event(start, None)

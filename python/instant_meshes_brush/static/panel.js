@@ -20,10 +20,26 @@ export const SYMMETRIES = {
 /** Crease angle used when "Sharp creases" is ticked; -1 disables detection. */
 const CREASE_ANGLE = 30.0;
 
+/**
+ * How long the remeshing settings must sit still before they are applied.
+ *
+ * There is no Apply button: a rebuild is cheap enough to simply follow the
+ * controls.  The delay is what keeps dragging the target slider from queuing
+ * one rebuild per pixel, and what lets a typed vertex count be finished.
+ */
+const CONFIG_SETTLE_MS = 500;
+
 function byId(id) {
     const element = document.getElementById(id);
     if (!element) throw new Error(`the viewer document is missing #${id}`);
     return element;
+}
+
+/** Field-by-field equality, so an unchanged config never forces a rebuild. */
+function sameConfig(a, b) {
+    if (!a || !b) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
 }
 
 /**
@@ -97,8 +113,6 @@ export class Panel {
             file: byId('file-input'),
             meshName: byId('mesh-name'),
             meshStats: byId('mesh-stats'),
-            statWorking: byId('stat-working'),
-            statTarget: byId('stat-target'),
 
             symmetry: byId('symmetry'),
             target: byId('target'),
@@ -106,21 +120,16 @@ export class Panel {
             extrinsic: byId('opt-extrinsic'),
             boundaries: byId('opt-boundaries'),
             creases: byId('opt-creases'),
-            apply: byId('btn-apply'),
 
             strokeCount: byId('stroke-count'),
             clear: byId('btn-clear'),
 
             solve: byId('btn-solve'),
-            solveOrient: byId('btn-solve-orient'),
-            solvePos: byId('btn-solve-pos'),
-            stop: byId('btn-stop'),
             statOrient: byId('stat-orient'),
             statPos: byId('stat-pos'),
 
             extract: byId('btn-extract'),
             outputStats: byId('output-stats'),
-            onlyOutput: byId('opt-only-output'),
             format: byId('format'),
             pureQuad: byId('opt-pure-quad'),
             smoothing: byId('smoothing'),
@@ -128,14 +137,20 @@ export class Panel {
             download: byId('download'),
 
             toolName: byId('tool-name'),
-            progress: byId('progress'),
-            progressFill: byId('progress-fill'),
             statusText: byId('status-text'),
             hint: byId('hint'),
         };
 
         this.el.file.setAttribute('accept', MESH_ACCEPT);
         this.hints = new Hints(byId('tip'));
+
+        this._solveLabel = this.el.solve.textContent.trim();
+        /* The config as the server last reported it, which is what an edit is
+           compared against.  Null until a mesh exists: there is nothing to
+           rebuild before then, so nothing to apply either. */
+        this._appliedConfig = null;
+        this._settleTimer = 0;
+
         this._bind();
         this.setSolving(false);
         this.setReady(false);
@@ -161,32 +176,28 @@ export class Panel {
             const value = Number(source.value);
             if (Number.isFinite(value)) other.value = String(value);
         };
-        on(this.el.targetRange, 'input', () =>
-            syncTarget(this.el.targetRange, this.el.target)
-        );
-        on(this.el.target, 'change', () => syncTarget(this.el.target, this.el.targetRange));
-        on(this.el.apply, 'click', () => call('onApplyConfig', this.readConfig()));
+        on(this.el.targetRange, 'input', () => {
+            syncTarget(this.el.targetRange, this.el.target);
+            this._settleConfig();
+        });
+        on(this.el.target, 'input', () => {
+            syncTarget(this.el.target, this.el.targetRange);
+            this._settleConfig();
+        });
+        for (const key of ['symmetry', 'extrinsic', 'boundaries', 'creases']) {
+            on(this.el[key], 'change', () => this._settleConfig());
+        }
 
         for (const button of document.querySelectorAll('button.tool')) {
             on(button, 'click', () => call('onSelectTool', button.dataset.tool));
         }
         on(this.el.clear, 'click', () => call('onClearStrokes'));
 
-        on(this.el.solve, 'click', () => call('onSolve', 'both'));
-        on(this.el.solveOrient, 'click', () => call('onSolve', 'orientations'));
-        on(this.el.solvePos, 'click', () => call('onSolve', 'positions'));
-        on(this.el.stop, 'click', () => call('onStop'));
+        on(this.el.solve, 'click', () => call('onSolve'));
 
-        on(this.el.extract, 'click', () => call('onExtract'));
+        on(this.el.extract, 'click', () => call('onExtract', this.extractOptions()));
         on(this.el.export, 'click', () =>
-            call('onExport', {
-                format: this.el.format.value,
-                pure_quad: this.el.pureQuad.checked,
-                smooth_iter: Number(this.el.smoothing.value) || 0,
-            })
-        );
-        on(this.el.onlyOutput, 'change', () =>
-            call('onShowOutputOnly', this.el.onlyOutput.checked)
+            call('onExport', { format: this.el.format.value, ...this.extractOptions() })
         );
 
         for (const input of document.querySelectorAll('input[data-layer]')) {
@@ -196,11 +207,33 @@ export class Panel {
         }
     }
 
+    /**
+     * Apply the remeshing settings once they stop changing.
+     *
+     * Applying means re-running preprocess on the server, which throws away
+     * every stroke, so a rebuild that would produce exactly the mesh already on
+     * screen is dropped rather than sent.
+     */
+    _settleConfig() {
+        clearTimeout(this._settleTimer);
+        this._settleTimer = setTimeout(() => {
+            const config = this.readConfig();
+            if (!this._appliedConfig || sameConfig(config, this._appliedConfig)) return;
+            this._appliedConfig = config;
+            if (this.handlers.onConfigChange) this.handlers.onConfigChange(config);
+        }, CONFIG_SETTLE_MS);
+    }
+
     /* -------------------------------------------------------------- */
     /*  Reading                                                        */
     /* -------------------------------------------------------------- */
 
-    /** The remeshing settings as the server's Config mapping. */
+    /** The remeshing settings, as the server's Config mapping.
+     *
+     * Only the keys preprocess() bakes into the hierarchy: the extraction
+     * options travel with EXTRACT instead, so ticking "Pure quad" costs a
+     * re-extraction rather than a rebuild.
+     */
     readConfig() {
         const symmetry = SYMMETRIES[this.el.symmetry.value] || SYMMETRIES['4,4'];
         return {
@@ -209,8 +242,14 @@ export class Panel {
             extrinsic: this.el.extrinsic.checked,
             align_to_boundaries: this.el.boundaries.checked,
             crease_angle: this.el.creases.checked ? CREASE_ANGLE : -1.0,
+        };
+    }
+
+    /** The two settings extract() reads, which need no rebuild. */
+    extractOptions() {
+        return {
             pure_quad: this.el.pureQuad.checked,
-            smooth_iter: Number(this.el.smoothing.value) || 0,
+            smooth_iter: Math.max(0, Number(this.el.smoothing.value) || 0),
         };
     }
 
@@ -230,28 +269,44 @@ export class Panel {
         return true;
     }
 
-    /** Reflect the server's config back into the controls after a rebuild. */
+    /** Reflect the server's config back into the controls after a rebuild.
+     *
+     * A control the user is currently in is left alone: status frames arrive
+     * while a vertex count is half typed, and overwriting it there would fight
+     * the person typing.
+     */
     showConfig(config) {
         if (!config) return;
+        const editing = document.activeElement;
+        const settable = (element) => element !== editing;
+
         const key = `${config.rosy},${config.posy}`;
-        if (key in SYMMETRIES) this.el.symmetry.value = key;
-        if (config.vertex_count > 0) {
+        if (key in SYMMETRIES && settable(this.el.symmetry)) this.el.symmetry.value = key;
+        if (config.vertex_count > 0 && settable(this.el.target)
+            && settable(this.el.targetRange)) {
             const value = String(config.vertex_count);
             this.el.target.value = value;
             this.el.targetRange.value = value;
         }
-        this.el.extrinsic.checked = Boolean(config.extrinsic);
-        this.el.boundaries.checked = Boolean(config.align_to_boundaries);
-        this.el.creases.checked = Number(config.crease_angle) >= 0;
+        if (settable(this.el.extrinsic)) this.el.extrinsic.checked = Boolean(config.extrinsic);
+        if (settable(this.el.boundaries)) {
+            this.el.boundaries.checked = Boolean(config.align_to_boundaries);
+        }
+        if (settable(this.el.creases)) {
+            this.el.creases.checked = Number(config.crease_angle) >= 0;
+        }
+
+        /* Whatever the controls now read is, by definition, what is built. */
+        this._appliedConfig = this.readConfig();
     }
 
     showMesh({ name, vertices, faces, scale, targetVertices }) {
         this.el.meshName.textContent = name || 'Untitled mesh';
         this.el.meshStats.hidden = false;
-        this.el.statWorking.textContent =
-            `${vertices.toLocaleString()} v / ${faces.toLocaleString()} tri`;
-        this.el.statTarget.textContent =
-            `${(targetVertices || 0).toLocaleString()} v, edge ${scale.toPrecision(3)}`;
+        this.el.meshStats.textContent =
+            `${vertices.toLocaleString()} v / ${faces.toLocaleString()} tri` +
+            `  →  ${(targetVertices || 0).toLocaleString()} v target,` +
+            ` edge ${scale.toPrecision(3)}`;
         /* The slider only makes sense once we know how big the model is. */
         this.el.targetRange.max = String(Math.max(50, vertices));
     }
@@ -288,10 +343,7 @@ export class Panel {
             button.setAttribute('aria-checked', String(button.dataset.tool === tool.id));
         }
         this.el.toolName.textContent = tool.label;
-        this.el.hint.textContent =
-            tool.kind === null
-                ? tool.hint
-                : `${tool.hint} Click a stroke handle to delete it, Esc cancels a stroke.`;
+        this.el.hint.textContent = tool.hint;
     }
 
     showLink(status) {
@@ -304,29 +356,24 @@ export class Panel {
                 : status.state;
     }
 
-    /** A solve in flight: only Stop stays usable, so no request can race it. */
+    /** A solve in flight. Every solve the viewport starts ends by itself, so
+     *  there is nothing to press here -- the buttons simply wait it out.
+     *  Opening a mesh stays available: it stops the solve on its way in, and
+     *  being unable to abandon a long solve by loading something else would be
+     *  the one place this UI could strand somebody. */
     setSolving(active) {
-        for (const key of ['solve', 'solveOrient', 'solvePos', 'extract', 'apply', 'open']) {
-            this.el[key].disabled = active || (key !== 'open' && !this._ready);
+        this._solving = active;
+        this.el.solve.textContent = active ? 'Solving…' : this._solveLabel;
+        for (const key of ['solve', 'extract', 'export']) {
+            this.el[key].disabled = active || !this._ready;
         }
-        this.el.stop.disabled = !active;
     }
 
     setReady(ready) {
         this._ready = ready;
-        for (const key of ['solve', 'solveOrient', 'solvePos', 'extract', 'apply']) {
-            this.el[key].disabled = !ready;
+        for (const key of ['solve', 'extract', 'export']) {
+            this.el[key].disabled = !ready || Boolean(this._solving);
         }
-        this.el.export.disabled = !ready;
-    }
-
-    setProgress(progress, active) {
-        const value = typeof progress === 'number' ? progress : 0;
-        /* A level-0 refinement reports 1 the whole time; a full bar reads
-           better there than a bar that never moves. */
-        const busy = active && value >= 1;
-        this.el.progressFill.style.width = busy ? '100%' : `${Math.round(value * 100)}%`;
-        this.el.progress.setAttribute('aria-valuenow', String(Math.round(value * 100)));
     }
 
     setStatus(message, isError) {

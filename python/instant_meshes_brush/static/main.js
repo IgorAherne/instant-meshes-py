@@ -221,32 +221,47 @@ class App {
         this.panel.handlers.onSelectTool = (id) => this.tools.setTool(id);
         this.panel.handlers.onClearStrokes = () => send(MessageType.CLEAR_STROKES);
 
-        /* Level -1 is the hierarchical schedule, which terminates on its own;
-           'both' runs orientations then positions, as Session.solve_all does. */
-        this.panel.handlers.onSolve = (field) => send(MessageType.SOLVE, { field, level: -1 });
-        this.panel.handlers.onStop = () => send(MessageType.STOP);
-        this.panel.handlers.onExtract = () => send(MessageType.EXTRACT);
+        this.panel.handlers.onSolve = () => this._solve();
+        this.panel.handlers.onExtract = (options) => send(MessageType.EXTRACT, options);
         this.panel.handlers.onExport = (options) => send(MessageType.EXPORT, options);
-        this.panel.handlers.onApplyConfig = (config) => send(MessageType.SET_CONFIG, { config });
+
+        /* There is no Apply button: the panel sends this once the remeshing
+           settings have stopped changing, and the GEOMETRY frame that comes
+           back re-solves itself, so a new target resolution simply appears. */
+        this.panel.handlers.onConfigChange = (config) => {
+            this.panel.setStatus('Rebuilding at the new resolution...', false);
+            send(MessageType.SET_CONFIG, { config });
+        };
 
         this.panel.handlers.onLayerToggle = (name, visible) =>
             this._apply(() => this.viewer.setLayerVisible(name, visible));
 
-        /* "Show output only" is a view preset rather than a layer of its own:
-           it hides the input surface and its grid so the result stands alone. */
-        this.panel.handlers.onShowOutputOnly = (only) => {
-            this._setLayer('output', true);
-            this._setLayer('mesh', !only);
-            this._setLayer('grid', !only);
-        };
-
         this.panel.handlers.onOpenFile = (file) => this._uploadMesh(file);
+    }
+
+    /** Level -1 is the hierarchical schedule, which terminates on its own;
+     *  'both' runs orientations then positions, as Session.solve_all does. */
+    _solve() {
+        this.connection.send(MessageType.SOLVE, { field: 'both', level: -1 });
+        this.panel.setSolving(true);
     }
 
     _setLayer(name, checked) {
         if (this.panel.setLayerChecked(name, checked)) {
             this._apply(() => this.viewer.setLayerVisible(name, checked));
         }
+    }
+
+    /**
+     * Which of the two surfaces the viewport is showing.
+     *
+     * Extracting hides the input so the result is unmistakably visible; laying
+     * a stroke brings it back, because a brush needs something to draw on.
+     */
+    _showOutputOnly(only) {
+        this._setLayer('output', only);
+        this._setLayer('mesh', !only);
+        this._setLayer('grid', !only);
     }
 
     /**
@@ -327,7 +342,11 @@ class App {
             this.panel.showFieldState({ orientation: 'not solved', position: 'not solved' });
             this.panel.showOutput('Not extracted yet');
             this.panel.setReady(true);
-            this.panel.setStatus('Mesh loaded -- press Solve both fields', false);
+            /* The grid is the point of loading a mesh, and solving it is the
+               only way to see one, so the step is not worth asking for. */
+            this._showOutputOnly(false);
+            this.panel.setStatus('Solving the field...', false);
+            this._solve();
         });
 
         conn.on(MessageType.FIELD, (header, arrays) => {
@@ -349,6 +368,10 @@ class App {
                 this.panel.setStatus(describeStroke(header), true);
                 return;
             }
+            /* A stroke is drawn on the input surface, so seeing where it landed
+               means being back on it -- even if Extract hid it a moment ago. */
+            this._showOutputOnly(false);
+
             const stroke = decodeStrokeResult(header, arrays);
             if (!stroke) return;
             this.strokes.set(stroke.id, stroke);
@@ -391,8 +414,9 @@ class App {
                 `${vertexCount.toLocaleString()} vertices / ${faceCount.toLocaleString()} faces`
             );
             this.panel.setStatus(`Extracted ${faceCount} faces`, false);
-            /* Showing the result is the whole point of pressing Extract. */
-            this._setLayer('output', true);
+            /* Showing the result is the whole point of pressing Extract, and
+               the input surface sits a hair in front of it in places. */
+            this._showOutputOnly(true);
         });
 
         conn.on(MessageType.EXPORT_READY, (header) => {
@@ -401,7 +425,6 @@ class App {
         });
 
         conn.on(MessageType.STATUS, (header) => this._showStatus(header));
-        conn.on(MessageType.PROGRESS, (header) => this.panel.setProgress(header.progress, true));
 
         conn.on(MessageType.ERROR, (header) => {
             const suffix = header.fatal ? ' -- reload the page' : '';
@@ -412,17 +435,25 @@ class App {
     }
 
     _showStatus(header) {
-        const active = Boolean(header.active);
+        /* `solving` spans both phases of a "both" solve, `active` only the one
+           the C++ optimizer is in; using the wider one keeps the buttons from
+           flickering back to life in the gap between orientations and
+           positions. */
+        const running = Boolean(header.solving ?? header.active);
         if (header.ready !== undefined) this.panel.setReady(Boolean(header.ready));
-        this.panel.setSolving(active);
-        this.panel.setProgress(header.progress, active);
+        this.panel.setSolving(running);
 
         if (header.config) this.panel.showConfig(header.config);
 
-        const level = header.level ?? 0;
         const versions = `Q ${header.iterations_q ?? 0} / O ${header.iterations_o ?? 0}`;
+        if (!running) {
+            this.panel.setStatus(`Idle -- ${versions}`, false);
+            return;
+        }
+        /* The progress bar is gone -- it cost a row of the stage to say this. */
+        const percent = Math.round(Math.min(1, Math.max(0, header.progress || 0)) * 100);
         this.panel.setStatus(
-            active ? `Solving level ${level} -- ${versions}` : `Idle -- ${versions}`,
+            `Solving level ${header.level ?? 0}, ${percent}% -- ${versions}`,
             false
         );
     }

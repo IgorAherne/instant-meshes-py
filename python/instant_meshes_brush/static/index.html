@@ -6,16 +6,18 @@
     <title>Instant Meshes - brush guidance</title>
     <!--
       This document is served from /viewer, not from the directory it lives in,
-      so every asset URL has to name the /static mount explicitly.  Relative
-      URLs would resolve against the site root and 404.
+      so every asset URL has to name the mount explicitly; a relative URL would
+      resolve against the site root and 404.  The mount is /imb-assets rather
+      than the obvious /static because Gradio serves its own fonts and scripts
+      from /static, and the first matching route wins.
     -->
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/imb-assets/style.css" />
     <!--
       OrbitControls imports the bare specifier 'three', so the vendored module
       has to be reachable under that name before any module script runs.
     -->
     <script type="importmap">
-      { "imports": { "three": "/static/vendor/three.module.js" } }
+      { "imports": { "three": "/imb-assets/vendor/three.module.js" } }
     </script>
   </head>
   <body>
@@ -24,6 +26,10 @@
       application behind one <iframe src="/viewer?session=...">.  A host page
       embeds it without reproducing any of the UI, and nothing here depends on
       Gradio being the host.
+
+      The panel carries only what the user acts on; everything the user merely
+      reads -- what is loaded, what the tool does, what the solver is doing --
+      sits in the stage's bottom-left corner, where it costs no panel height.
     -->
     <div id="app">
       <aside id="panel" aria-label="Controls">
@@ -37,57 +43,18 @@
           <section class="block">
             <h2>Mesh</h2>
             <button class="wide primary" id="btn-open"
-              data-hint="Load an OBJ, PLY, STL or OFF file. The model is re-meshed from scratch, so any strokes you have drawn are cleared.">
+              data-hint="Load an OBJ, PLY, STL or OFF file. The fields are solved for you as soon as it is in, so the grid preview appears without pressing anything else.">
               Open mesh
             </button>
             <input type="file" id="file-input" accept=".obj,.ply,.stl,.off" hidden />
-            <p id="mesh-name" class="muted">No mesh loaded</p>
-            <dl id="mesh-stats" class="stats" hidden>
-              <dt>Working mesh</dt><dd id="stat-working">&ndash;</dd>
-              <dt>Target</dt><dd id="stat-target">&ndash;</dd>
-            </dl>
-          </section>
-
-          <!-- Resolution ------------------------------------------------- -->
-          <section class="block">
-            <h2>Remesh as</h2>
-            <select id="symmetry"
-              data-hint="The symmetry of the output. Quads (4-RoSy, 4-PoSy) is the usual choice; triangles use 6-RoSy, 6-PoSy.">
-              <option value="4,4" selected>Quads (4-RoSy, 4-PoSy)</option>
-              <option value="6,3">Triangles (6-RoSy, 6-PoSy)</option>
-              <option value="2,4">Quads, 2-RoSy</option>
-            </select>
-
-            <label class="field" for="target">
-              <span>Target vertex count</span>
-              <input type="number" id="target" min="10" step="10" value="1000"
-                data-hint="Roughly how many vertices the output should have. Lower means bigger quads." />
-            </label>
-            <input type="range" id="target-range" min="10" max="20000" step="10" value="1000" />
-
-            <label class="check"><input type="checkbox" id="opt-extrinsic" checked
-              data-hint="Smooth the field in world space rather than along the surface. On is the default and is usually what you want." /><span>Extrinsic</span></label>
-            <label class="check"><input type="checkbox" id="opt-boundaries"
-              data-hint="Make edge loops run parallel to open boundaries of the model." /><span>Align to boundaries</span></label>
-            <label class="check"><input type="checkbox" id="opt-creases"
-              data-hint="Keep sharp edges sharp instead of smoothing across them." /><span>Sharp creases</span></label>
-            <button class="wide" id="btn-apply"
-              data-hint="Rebuild the multiresolution hierarchy with these settings. Strokes are cleared, because vertex numbering changes.">
-              Apply and rebuild
-            </button>
           </section>
 
           <!-- Tools ------------------------------------------------------ -->
           <section class="block">
             <h2>Brush tools</h2>
             <div class="tools" role="radiogroup" aria-label="Tools">
-              <button class="tool" data-tool="orbit" role="radio" aria-checked="true"
-                data-hint="Move the camera. Left-drag orbits, right-drag or shift-drag pans, the wheel zooms.">
-                <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.2" /><ellipse cx="8" cy="8" rx="7" ry="3" transform="rotate(-30 8 8)" /></svg>
-                <span class="label">Orbit</span>
-              </button>
-              <button class="tool" data-tool="comb" role="radio" aria-checked="false"
-                data-hint="Orientation comb. Drag across the surface to turn the edge flow so it follows your stroke.">
+              <button class="tool" data-tool="comb" role="radio" aria-checked="true"
+                data-hint="Orientation comb. Left-drag across the surface to turn the edge flow so it follows your stroke. This is the default: left-drag always combs unless you pick another brush.">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 5.5c2.3-2.6 4.6-2.6 7 0s4.7 2.6 7 0" /><path d="M3 8v4M6.5 8.6v4M10 8.6v4M13.5 8v4" /></svg>
                 <span class="label">Comb</span>
               </button>
@@ -120,41 +87,60 @@
           <section class="block">
             <h2>Fields</h2>
             <p class="explain">
-              Instant Meshes solves two fields. The grid you see on the model is
-              the result of both.
+              The grid drawn on the model is the solved field. It is re-solved
+              for you after every stroke.
             </p>
             <button class="wide primary" id="btn-solve"
-              data-hint="Run both fields, orientation then position. This is what you normally press: after loading a mesh, and again whenever you want your strokes taken into account.">
-              Solve both fields
+              data-hint="Re-solve the field from scratch. TWO fields are solved, one after the other: the ORIENTATION field decides which DIRECTION the edge loops run, and the POSITION field decides WHERE the grid lines fall along those directions. Your strokes constrain the orientation field, so this is what makes them take effect -- though loading a mesh and drawing a stroke both run it for you, so you rarely need to press it.">
+              Solve fields
             </button>
-            <div class="row split">
-              <button id="btn-solve-orient"
-                data-hint="ORIENTATION FIELD: decides which DIRECTION the edge loops run, everywhere on the surface. Comb and edge-brush strokes are constraints on this field, so they only take effect once it is re-solved.">
-                Orientation
-              </button>
-              <button id="btn-solve-pos"
-                data-hint="POSITION FIELD: decides WHERE the grid lines actually fall along the directions the orientation field chose. Run it after the orientation field; on its own it cannot change the flow.">
-                Position
-              </button>
-            </div>
-            <button class="wide" id="btn-stop" disabled
-              data-hint="Stop the running solve and keep the result so far.">Stop</button>
             <dl class="stats">
               <dt>Orientation</dt><dd id="stat-orient">not solved</dd>
               <dt>Position</dt><dd id="stat-pos">not solved</dd>
             </dl>
           </section>
 
+          <!-- Resolution ------------------------------------------------- -->
+          <section class="block">
+            <h2>Remesh as</h2>
+            <select id="symmetry"
+              data-hint="The symmetry of the output. Quads (4-RoSy, 4-PoSy) is the usual choice; triangles use 6-RoSy, 6-PoSy. Changing this rebuilds and re-solves straight away.">
+              <option value="4,4" selected>Quads (4-RoSy, 4-PoSy)</option>
+              <option value="6,3">Triangles (6-RoSy, 6-PoSy)</option>
+              <option value="2,4">Quads, 2-RoSy</option>
+            </select>
+
+            <label class="field" for="target">
+              <span>Target vertex count</span>
+              <input type="number" id="target" min="10" step="10" value="1000"
+                data-hint="Roughly how many vertices the output should have. Lower means bigger quads. The model is rebuilt and re-solved a moment after you stop changing it, which clears any strokes -- the vertices they were drawn on no longer exist." />
+            </label>
+            <input type="range" id="target-range" min="10" max="20000" step="10" value="1000" />
+
+            <label class="check"><input type="checkbox" id="opt-extrinsic" checked
+              data-hint="Smooth the field in world space rather than along the surface. On is the default and is usually what you want." /><span>Extrinsic</span></label>
+            <label class="check"><input type="checkbox" id="opt-boundaries"
+              data-hint="Make edge loops run parallel to open boundaries of the model." /><span>Align to boundaries</span></label>
+            <label class="check"><input type="checkbox" id="opt-creases"
+              data-hint="Keep sharp edges sharp instead of smoothing across them." /><span>Sharp creases</span></label>
+          </section>
+
           <!-- Output ----------------------------------------------------- -->
           <section class="block">
             <h2>Output mesh</h2>
             <button class="wide primary" id="btn-extract"
-              data-hint="Build the quad mesh from the solved fields and show it in the viewport. Needs both fields solved first.">
+              data-hint="Build the quad mesh from the solved fields and show it on its own in the viewport. Bring the original back with the Show checkboxes below.">
               Extract
             </button>
             <p id="output-stats" class="muted">Not extracted yet</p>
-            <label class="check"><input type="checkbox" id="opt-only-output"
-              data-hint="Hide the original surface so only the extracted mesh is visible." /><span>Show output only</span></label>
+
+            <label class="check"><input type="checkbox" id="opt-pure-quad"
+              data-hint="Subdivide so the result contains quads only, with no triangles. Quadruples the face count. Takes effect on the next Extract." /><span>Pure quad mesh</span></label>
+            <label class="field" for="smoothing">
+              <span>Smoothing</span>
+              <input type="number" id="smoothing" min="0" max="10" step="1" value="2"
+                data-hint="Reprojection passes applied to the extracted mesh. More means a smoother result that follows the original surface less tightly. Takes effect on the next Extract." />
+            </label>
 
             <label class="field" for="format">
               <span>Format</span>
@@ -163,15 +149,8 @@
                 <option value="ply">ply</option>
               </select>
             </label>
-            <label class="check"><input type="checkbox" id="opt-pure-quad"
-              data-hint="Subdivide so the result contains quads only, with no triangles. Quadruples the face count." /><span>Pure quad mesh</span></label>
-            <label class="field" for="smoothing">
-              <span>Smoothing</span>
-              <input type="number" id="smoothing" min="0" max="10" step="1" value="2"
-                data-hint="Reprojection passes applied to the extracted mesh. More means a smoother result that follows the original surface less tightly." />
-            </label>
             <button class="wide" id="btn-export"
-              data-hint="Write the extracted mesh and offer it as a download.">Export</button>
+              data-hint="Write the extracted mesh to a file and offer it as a download. Extracts first if you have not.">Export</button>
             <a id="download" class="download" hidden download>Download</a>
           </section>
 
@@ -193,16 +172,17 @@
              native viewer's NanoVG overlay, so it lives on its own 2D canvas. -->
         <canvas id="overlay"></canvas>
 
-        <div id="status">
-          <span id="tool-name">Orbit</span>
-          <span class="sep"></span>
-          <div id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-            <div id="progress-fill"></div>
-          </div>
-          <span id="status-text">Waiting for geometry</span>
+        <!-- Read-only corner. Never takes the pointer: a stroke drawn across
+             it has to reach the canvas underneath. -->
+        <div id="readout">
+          <p id="mesh-name" class="strong">No mesh loaded</p>
+          <p id="mesh-stats" hidden></p>
+          <p id="hint"></p>
+          <p id="status">
+            <span id="tool-name">Comb</span>
+            <span id="status-text">Waiting for geometry</span>
+          </p>
         </div>
-
-        <p id="hint">Left-drag orbits, right-drag or shift-drag pans, wheel zooms.</p>
       </div>
     </div>
 
@@ -211,7 +191,7 @@
     <div id="tip" role="tooltip" hidden></div>
 
     <!-- main.js and its siblings import each other relatively, which resolves
-         correctly once this entry point is loaded from /static. -->
-    <script type="module" src="/static/main.js"></script>
+         correctly once this entry point is loaded from the mount. -->
+    <script type="module" src="/imb-assets/main.js"></script>
   </body>
 </html>
