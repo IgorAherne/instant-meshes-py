@@ -41,8 +41,9 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import _core, protocol
+from . import _core, protocol, uv
 from .protocol import MessageType
+from .uv import UvLayout
 from .session_manager import (
     BrushSession,
     Extraction,
@@ -239,6 +240,34 @@ def _stroke_frame(result: StrokeResult) -> bytes:
         "faces": result.faces,
     }
     return protocol.encode(MessageType.STROKE_RESULT, header, arrays)
+
+
+def _uv_frame(layout: UvLayout) -> bytes:
+    """The flattened mesh, as the viewer draws it.
+
+    Sent as an index space of its own rather than as ready-made line segments:
+    the layout is the extracted mesh with its seams opened, so it is exactly as
+    compact as the mesh is, and the client already knows how to fan a
+    quad-dominant face array.
+    """
+    header = {
+        "n_charts": int(layout.chart_count),
+        "n_faces": int(layout.faces.shape[0]),
+        "posy": int(layout.faces.shape[1]),
+        "leniency": float(layout.leniency),
+        "unmapped": int(layout.unmapped),
+        "cut": layout.cut_count,
+    }
+    arrays = {
+        "uv": layout.uv,
+        # int32, not uint32: a face a chart boundary went through is -1 here
+        # and appears in "tris" instead, as the two triangles it became.
+        "faces": layout.faces.astype(np.int32, copy=False),
+        "chart": layout.chart.astype(np.int32, copy=False),
+        "tris": layout.cut.astype(np.int32, copy=False).reshape(-1, 3),
+        "tri_chart": layout.cut_chart.astype(np.int32, copy=False),
+    }
+    return protocol.encode(MessageType.UV_LAYOUT, header, arrays)
 
 
 def _extracted_frame(extraction: Extraction) -> bytes:
@@ -487,6 +516,11 @@ class _Connection:
             mesh=self.session.mesh_name,
             fps=self.fps,
             config=self.session.config,
+            # Whether xatlas is installed at all. The viewer hides its UV
+            # control when it is not, rather than offering one that can only
+            # answer with an error.
+            uv=uv.available(),
+            uv_leniency=self.session.uv_leniency,
         )
         # Record what actually went out, not what a caller intended to report:
         # a handler that answers SOLVE with active=True must leave the streamer
@@ -634,6 +668,14 @@ class _Connection:
         await self._send(_extracted_frame(extraction))
         await self._send_status()
 
+    async def _on_unwrap(self, message: protocol.Message) -> None:
+        leniency = message.get("leniency")
+        layout = await self.session.unwrap(
+            None if leniency is None else float(leniency)
+        )
+        await self._send(_uv_frame(layout))
+        await self._send_status()
+
     async def _on_export(self, message: protocol.Message) -> None:
         fmt = str(message.get("format", "obj"))
         # Exporting is allowed without extracting first, so the options travel
@@ -642,8 +684,29 @@ class _Connection:
         # the client downloads is the mesh it is looking at.
         await self.session.set_extraction_options(*_extraction_options(message))
         if not self.session.has_extraction:
-            await self._send(_extracted_frame(await self.session.extract()))
+            await self.session.extract()
+        # An OBJ carries its texture space, so the atlas is cut here if the
+        # user never looked at it. A failure costs the file its UVs and is
+        # reported, rather than costing them the export they asked for.
+        if fmt.lower().lstrip(".") == "obj" and uv.available():
+            leniency = message.get("leniency")
+            try:
+                # Sent back as well as written: the client is then holding the
+                # layout its file carries, so the count beside the slider is
+                # the one that left, and the next hover needs no round trip.
+                layout = await self.session.unwrap(
+                    None if leniency is None else float(leniency)
+                )
+                await self._send(_uv_frame(layout))
+            except SessionError as exc:
+                await self._send_error(f"exported without a UV layout: {exc}")
         path = await self.session.export_mesh(fmt)
+        # Sent unconditionally rather than only when this handler built it: an
+        # extraction can now appear as a side effect of unwrapping, and the
+        # size under the button has to be the size of the file that just left.
+        extraction = await self.session.extraction()
+        if extraction is not None:
+            await self._send(_extracted_frame(extraction))
         header = {
             "url": f"/api/session/{self.session.id}/export",
             "filename": path.name,
@@ -674,6 +737,7 @@ class _Connection:
         MessageType.CLEAR_STROKES: _on_clear_strokes,
         MessageType.SUBSCRIBE: _on_subscribe,
         MessageType.PING: _on_ping,
+        MessageType.UNWRAP: _on_unwrap,
     }
 
 

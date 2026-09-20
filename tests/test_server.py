@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import re
 import time
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import pytest
 
-from instant_meshes_brush import protocol
+from instant_meshes_brush import protocol, uv
 from instant_meshes_brush.protocol import MessageType
 from instant_meshes_brush.server import STATIC_URL, build_app
 from instant_meshes_brush import session_manager
@@ -85,6 +85,31 @@ class Socket:
                 time.sleep(pause)
         raise AssertionError(
             f"never saw type {wanted}" + (f"; errors: {errors}" if errors else "")
+        )
+
+    def expect_all(
+        self, *wanted: int, rounds: int = 60, pause: float = 0.05
+    ) -> List[protocol.Message]:
+        """Every listed frame type, collected across as many rounds as it takes.
+
+        ``expect`` returns the moment it matches and drops the rest of that
+        round with it, so two replies to one request can never both be caught
+        with it -- whichever is second is thrown away by the first call.
+        """
+        seen: Dict[int, protocol.Message] = {}
+        errors: List[str] = []
+        for attempt in range(rounds):
+            for message in self.drain():
+                seen.setdefault(message.type, message)
+                if message.type == MessageType.ERROR:
+                    errors.append(message.get("message"))
+            if all(kind in seen for kind in wanted):
+                return [seen[kind] for kind in wanted]
+            if attempt:
+                time.sleep(pause)
+        missing = [kind for kind in wanted if kind not in seen]
+        raise AssertionError(
+            f"never saw type(s) {missing}" + (f"; errors: {errors}" if errors else "")
         )
 
     def count(self, wanted: int) -> int:
@@ -625,6 +650,87 @@ def test_extraction_options_do_not_rebuild_the_mesh(client, registry, torus) -> 
     # Subdividing away the triangles can only add faces, and on a quad-dominant
     # result it multiplies them.
     assert pure.get("n_faces") > mixed.get("n_faces")
+
+
+def test_the_status_says_whether_unwrapping_is_possible(client, torus) -> None:
+    """The viewer hides its UV control rather than offering a dead one.
+
+    xatlas is optional, and a slider that can only answer "not installed" is
+    worse than no slider: it reads as a broken feature rather than an absent
+    one.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        # HELLO answers with a status of its own, which is how this asks for
+        # one rather than waiting for the streamer to notice a change.
+        socket.send(MessageType.HELLO, {})
+        status = socket.expect(MessageType.STATUS)
+
+    assert status.get("uv") is uv.available()
+    assert 0.0 <= status.get("uv_leniency") <= 1.0
+
+
+@pytest.mark.skipif(not uv.available(), reason="xatlas is not installed")
+def test_unwrapping_extracts_a_mesh_to_flatten(client, torus) -> None:
+    """Hovering the UV control is the only request the viewport makes.
+
+    There is no Extract button behind it, so UNWRAP has to reach a solved
+    field and an extracted mesh by itself -- exactly as asking to see the
+    output mesh does.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)  # deliberately no SOLVE and no EXTRACT
+
+        socket.send(MessageType.UNWRAP, {"leniency": 0.5})
+        layout = socket.expect(MessageType.UV_LAYOUT)
+        # Hovering is not a request to look at the output mesh, so the
+        # extraction it needed is not pushed at the viewport.
+        assert MessageType.EXTRACTED not in {m.type for m in socket.drain()}
+
+    assert layout.get("n_charts") >= 1
+    assert layout.get("n_faces") > 0
+    assert layout.get("unmapped") == 0
+    assert layout.arrays["faces"].shape == (layout.get("n_faces"), layout.get("posy"))
+    assert layout.arrays["chart"].shape == (layout.get("n_faces"),)
+    coordinates = layout.arrays["uv"]
+    assert coordinates.shape[1] == 2
+    assert 0.0 <= coordinates.min() <= coordinates.max() <= 1.0
+
+
+@pytest.mark.skipif(not uv.available(), reason="xatlas is not installed")
+def test_an_exported_obj_carries_its_uv_layout(client, torus, tmp_path) -> None:
+    """The atlas is only worth cutting if it leaves with the file.
+
+    Export never asks for one, so this is also the check that it cuts one on
+    its own rather than writing whatever the last hover happened to leave.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        # The chart size rides with the frame, so pressing Export after moving
+        # the slider writes what the slider says rather than what was last
+        # previewed -- which may be nothing at all.
+        # A hover already built an extraction behind the viewport's back, so
+        # this is also the check that Export still reports the size it wrote.
+        socket.send(MessageType.UNWRAP, {"leniency": 0.5})
+        socket.expect(MessageType.UV_LAYOUT)
+
+        socket.send(MessageType.EXPORT, {"format": "obj", "leniency": 0.0})
+        ready, layout, extracted = socket.expect_all(
+            MessageType.EXPORT_READY, MessageType.UV_LAYOUT, MessageType.EXTRACTED
+        )
+
+        written = client.get(ready.get("url"))
+
+    assert layout.get("leniency") == pytest.approx(0.0)
+    assert extracted.get("n_faces") > 0
+    assert written.status_code == 200, written.text
+    text = written.text
+    assert "\nvt " in text
+    faces = [line for line in text.splitlines() if line.startswith("f ")]
+    assert faces and all("/" in line for line in faces)
 
 
 def test_a_bad_frame_does_not_drop_the_socket(client) -> None:

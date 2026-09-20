@@ -136,11 +136,18 @@ class App {
             strokes: false,
             singularities: null,
             extracted: null,
+            uv: null,
         };
         this.strokes = new Map();
         this.posy = 4;
         /* Whether an extraction exists to switch to; a rebuild invalidates it. */
         this.hasOutput = false;
+        /* The atlas is cut from the extraction, so it goes stale with it. */
+        this.hasUv = false;
+        this._uvPreview = false;
+        /* Markers per field, and which field the selected brush can reach. */
+        this._singularityCounts = { orientation: 0, position: 0 };
+        this._singularityField = null;
 
         this.tools = new ToolController(viewer, connection, {
             onToolChange: (tool) => this._onToolChange(tool),
@@ -172,10 +179,18 @@ class App {
      */
     _onToolChange(tool) {
         this.panel.showTool(tool);
-        this._apply(() =>
-            this.viewer.setSingularityFilter(tool.singularities || null)
-        );
+        this._singularityField = tool.singularities || null;
+        this._apply(() => this.viewer.setSingularityFilter(this._singularityField));
+        this._showSingularityCount();
         if (tool.singularities) this._setLayer('singularities', true);
+    }
+
+    /** The count of what is actually drawn, which is what the filter decides. */
+    _showSingularityCount() {
+        const counts = this._singularityCounts;
+        const field = this._singularityField;
+        const total = field ? counts[field] : counts.orientation + counts.position;
+        this.panel.showSingularities(total > 0 ? total : null);
     }
 
     /**
@@ -238,6 +253,12 @@ class App {
                 this.viewer.setExtracted(extracted.wireframe, extracted.colors, extracted.surface)
             );
         }
+
+        const uv = pending.uv;
+        if (uv) {
+            pending.uv = null;
+            this._apply(() => this.viewer.setUvLayout(uv.layout));
+        }
     }
 
     _apply(update) {
@@ -294,6 +315,43 @@ class App {
             this._apply(() => this.viewer.setLayerVisible(name, visible));
 
         this.panel.handlers.onOpenFile = (file) => this._uploadMesh(file);
+
+        /* Hovering the UV control is the request to see the layout, and the
+           layout is cut from an extraction -- so this is also what builds one,
+           the same way asking to see the output mesh is. */
+        this.panel.handlers.onUvPreview = (on) => {
+            this._uvPreview = on;
+            this._apply(() => this.viewer.setUvVisible(on));
+            if (!on) {
+                this.panel.setStatus(null, false);
+            } else if (!this.hasUv) {
+                this._requestUv();
+            }
+        };
+
+        /* A different chart size is a different atlas; the one on screen is
+           only worth re-cutting while somebody is looking at it. */
+        this.panel.handlers.onUvChange = () => {
+            this.hasUv = false;
+            if (this._uvPreview) this._requestUv();
+        };
+    }
+
+    /**
+     * Ask for an atlas, once there is a field worth cutting one from.
+     *
+     * Unwrapping extracts, and extracting stops the solver -- so a pointer
+     * that merely crosses this control on its way somewhere else must not
+     * abandon the solve a brush stroke just started. The request waits for the
+     * field instead, and _showStatus picks it up when the solve ends.
+     */
+    _requestUv() {
+        if (this._solving) {
+            this.panel.setStatus('Unwrapping once the field has settled...', false);
+            return;
+        }
+        this.panel.setStatus('Unwrapping...', false);
+        this.connection.send(MessageType.UNWRAP, { leniency: this.panel.uvLeniency() });
     }
 
     /** Level -1 is the hierarchical schedule, which terminates on its own;
@@ -336,10 +394,27 @@ class App {
      * the result is dropped, so asking to see the output builds a new one.
      */
     _invalidateOutput() {
+        this._invalidateUv();
         if (!this.hasOutput) return;
         this.hasOutput = false;
         this.panel.showOutput(null);
         this.pending.extracted = { wireframe: null, colors: null, surface: null };
+    }
+
+    /**
+     * Forget an atlas whose mesh has moved under it.
+     *
+     * It is cut from the extracted faces, so anything that invalidates those
+     * invalidates this -- and if it is the thing on screen, a replacement is
+     * asked for straight away rather than leaving the old one up as though
+     * nothing had changed.
+     */
+    _invalidateUv() {
+        if (!this.hasUv) return;
+        this.hasUv = false;
+        this.panel.showUv(null);
+        this.pending.uv = { layout: null };
+        if (this._uvPreview) this._requestUv();
     }
 
     /**
@@ -419,6 +494,12 @@ class App {
             this.panel.showOutput(null);
             this.panel.setReady(true);
             this.hasOutput = false;
+            /* setGeometry drops the overlays themselves; these are the panel's
+               copies of what they said. */
+            this.hasUv = false;
+            this.panel.showUv(null);
+            this._singularityCounts = { orientation: 0, position: 0 };
+            this._showSingularityCount();
             /* The grid is the point of importing a mesh, and solving it is the
                only way to see one, so the step is not worth asking for. */
             this._setSurface('mesh');
@@ -456,7 +537,36 @@ class App {
         });
 
         conn.on(MessageType.SINGULARITIES, (header, arrays) => {
-            this.pending.singularities = decodeSingularities(arrays);
+            const sets = decodeSingularities(arrays);
+            this.pending.singularities = sets;
+            this._singularityCounts = {
+                orientation: sets.orientation.positions.length / 3,
+                position: sets.position.positions.length / 3,
+            };
+            this._showSingularityCount();
+        });
+
+        conn.on(MessageType.UV_LAYOUT, (header, arrays) => {
+            const uv = pickArray(arrays, 'uv');
+            const faces = pickArray(arrays, 'faces');
+            const chart = pickArray(arrays, 'chart');
+            if (!uv || !faces || !chart) {
+                this.panel.setStatus('UV frame is missing an array', true);
+                return;
+            }
+            this.pending.uv = {
+                layout: {
+                    uv,
+                    faces,
+                    chart,
+                    tris: pickArray(arrays, 'tris') || new Int32Array(0),
+                    triChart: pickArray(arrays, 'tri_chart') || new Int32Array(0),
+                    width: header.posy ?? 4,
+                },
+            };
+            this.hasUv = true;
+            this.panel.showUv({ charts: header.n_charts ?? 0, leniency: header.leniency });
+            this.panel.setStatus(null, false);
         });
 
         conn.on(MessageType.EXTRACTED, (header, arrays) => {
@@ -511,7 +621,9 @@ class App {
            flickering back to life in the gap between orientations and
            positions. */
         const running = Boolean(header.solving ?? header.active);
+        this._solving = running;
         if (header.ready !== undefined) this.panel.setReady(Boolean(header.ready));
+        if (header.uv !== undefined) this.panel.setUvAvailable(Boolean(header.uv));
         this.panel.setSolving(running);
         /* The field has moved, so whatever was extracted from the old one no
            longer describes it. Once per solve, not once per status frame. */
@@ -530,6 +642,10 @@ class App {
            iteration counters meant nothing to anyone reading it. Only the fact
            that it is working is worth the space, and only while it is. */
         this.panel.setStatus(running ? 'Solving the field...' : null, false);
+
+        /* A layout asked for mid-solve was deferred rather than dropped. Last,
+           so the request's own message is the one left on the line. */
+        if (!running && this._uvPreview && !this.hasUv) this._requestUv();
     }
 }
 

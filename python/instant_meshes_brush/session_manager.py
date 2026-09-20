@@ -44,7 +44,8 @@ from typing import (
 
 import numpy as np
 
-from . import _core
+from . import _core, uv
+from .uv import UnwrapError, UvLayout
 
 LOG = logging.getLogger(__name__)
 
@@ -374,6 +375,10 @@ class BrushSession:
         self._geometry: Optional[Geometry] = None
         self._geometry_version = 0
         self._extracted: Optional["_core.ExtractedMesh"] = None
+        #: The atlas of the extraction on hand, and the slider position it was
+        #: cut at. Both are dropped with the extraction they describe.
+        self._uv: Optional[UvLayout] = None
+        self._uv_leniency = uv.DEFAULT_LENIENCY
         self._export_dir: Optional[Path] = None
 
         self._executor = ThreadPoolExecutor(
@@ -397,7 +402,7 @@ class BrushSession:
             if self._closed:
                 return
             await self._stop_locked()
-            self._extracted = None
+            self._drop_extraction()
             # ~Session() joins the solver thread with the GIL held, so it is
             # only cheap because the solve above was stopped and waited for.
             # Clearing the attribute from the worker keeps that destructor on
@@ -603,10 +608,20 @@ class BrushSession:
         """
         self._geometry = geometry
         self._geometry_version += 1
-        self._extracted = None
+        self._drop_extraction()
 
     def _invalidate_locked(self) -> None:
         self._set_geometry_locked(None)
+
+    def _drop_extraction(self) -> None:
+        """Forget the extracted mesh and everything derived from it.
+
+        The atlas is cut from the extraction, so it cannot outlive it: keeping
+        one would texture a mesh whose faces are no longer the ones it was
+        flattened from.
+        """
+        self._extracted = None
+        self._uv = None
 
     # -- strokes -----------------------------------------------------------
 
@@ -735,7 +750,7 @@ class BrushSession:
             # change. There is no Extract button in the viewport any more, so
             # nothing else would notice; holding on to it means an export after
             # a brush stroke silently writes the mesh from before it.
-            self._extracted = None
+            self._drop_extraction()
             # Start the first phase here rather than in the driver, so that a
             # caller which reports its status right after solve() returns
             # already sees an active solver -- and so a refused start raises.
@@ -886,7 +901,7 @@ class BrushSession:
         self._config.smooth_iter = smooth
         self._config.pure_quad = pure
         await self._call(core.set_extraction_options, smooth, pure)
-        self._extracted = None
+        self._drop_extraction()
         return True
 
     async def extract(
@@ -905,8 +920,71 @@ class BrushSession:
             self._extracted = mesh
             return await self._call(_read_extraction, mesh)
 
+    # -- texture space -----------------------------------------------------
+
+    @property
+    def uv_layout(self) -> Optional[UvLayout]:
+        """The atlas of the extraction on hand, if one has been cut."""
+        return self._uv
+
+    @property
+    def uv_leniency(self) -> float:
+        """Where the chart-size control stands, in [0, 1]."""
+        return self._uv_leniency
+
+    async def unwrap(self, leniency: Optional[float] = None) -> UvLayout:
+        """Cut a UV atlas for the extracted mesh, extracting first if need be.
+
+        The layout is cached beside the extraction it describes and re-cut only
+        when the slider moves, so hovering the control costs nothing after the
+        first look.
+        """
+        if not uv.available():
+            raise SessionError(
+                "UV unwrapping needs the xatlas package: pip install xatlas"
+            )
+        target = uv.DEFAULT_LENIENCY if leniency is None else float(leniency)
+        target = min(1.0, max(0.0, target))
+
+        # Outside the lock: extract() takes it, and takes it again through
+        # ensure_solved if nothing has ever been solved.
+        if self._extracted is None:
+            await self.extract()
+
+        async with self._lock:
+            self._require_ready()
+            self._uv_leniency = target
+            cached = self._uv
+            if cached is not None and cached.leniency == target:
+                return cached
+            mesh = self._extracted
+            if mesh is None:
+                raise SessionError("nothing to unwrap")
+            try:
+                layout = await self._call(_unwrap_extraction, mesh, target)
+            except UnwrapError as exc:
+                raise SessionError(str(exc)) from exc
+            self._uv = layout
+            return layout
+
+    async def extraction(self) -> Optional[Extraction]:
+        """Read the extracted mesh on hand, without building a new one.
+
+        An extraction can now happen as a side effect -- unwrapping needs one
+        -- so a caller that wants to show the client what it is about to
+        export cannot tell from :meth:`extract` alone whether it has been sent.
+        """
+        if self._extracted is None:
+            return None
+        return await self._call(_read_extraction, self._extracted)
+
     async def export_mesh(self, fmt: str = "obj") -> Path:
-        """Write the last extraction to a session-private file and return it."""
+        """Write the last extraction to a session-private file and return it.
+
+        An OBJ carries the atlas when one has been cut, which is how the
+        texture space a caller chose with :meth:`unwrap` leaves the session;
+        PLY does not, having no per-corner form for it.
+        """
         suffix = fmt.lower().lstrip(".")
         if suffix not in EXPORT_FORMATS:
             raise SessionError(f"export format must be one of {list(EXPORT_FORMATS)}")
@@ -921,12 +999,16 @@ class BrushSession:
             directory = await self._ensure_export_dir()
             stem = Path(self.mesh_name or "mesh").stem or "mesh"
             target = directory / f"{stem}_remeshed.{suffix}"
-            # Per-face normals are written as `f v//n` with a different n for
-            # every face, so a loader that keys vertices on (position, normal)
-            # -- trimesh does -- splits the mesh into disconnected faces on
-            # re-import. The normals are recoverable from the geometry, the
-            # connectivity is not, so they are left out.
-            await self._call(core.write_mesh, str(target), mesh, False)
+            layout = self._uv if suffix == "obj" else None
+            if layout is not None:
+                await self._call(_write_textured_obj, str(target), mesh, layout)
+            else:
+                # Per-face normals are written as `f v//n` with a different n
+                # for every face, so a loader that keys vertices on (position,
+                # normal) -- trimesh does -- splits the mesh into disconnected
+                # faces on re-import. The normals are recoverable from the
+                # geometry, the connectivity is not, so they are left out.
+                await self._call(core.write_mesh, str(target), mesh, False)
             self.export_path = target
             return target
 
@@ -948,6 +1030,15 @@ def _stroke_result(stroke_id: int, kind: str, curve: "_core.Curve") -> StrokeRes
         normals=curve.normals,
         faces=curve.faces,
     )
+
+
+def _unwrap_extraction(mesh: "_core.ExtractedMesh", leniency: float) -> UvLayout:
+    """Read the extracted mesh and flatten it, both on the session's worker."""
+    return uv.unwrap(mesh.vertices, mesh.faces, leniency)
+
+
+def _write_textured_obj(path: str, mesh: "_core.ExtractedMesh", layout: UvLayout) -> None:
+    return uv.write_obj(path, mesh.vertices, mesh.faces, layout)
 
 
 def _clear_strokes(core: "_core.Session") -> int:

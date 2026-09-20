@@ -25,6 +25,10 @@ app = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "trimesh>=4.0",
+    # UV unwrapping of the extracted mesh. Optional at runtime -- the viewer
+    # hides its UV control where this is missing -- but a remesher that cannot
+    # hand back a texture space is half a retopology tool, so it ships with it.
+    "xatlas>=0.0.9",
 ]
 dev = ["pytest>=7.0"]
 

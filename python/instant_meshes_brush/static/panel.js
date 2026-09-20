@@ -60,6 +60,15 @@ function targetToSlider(value) {
  */
 const CONFIG_SETTLE_MS = 500;
 
+/**
+ * How long the UV slider must sit still before the atlas is re-cut.
+ *
+ * Shorter than CONFIG_SETTLE_MS because unwrapping is cheap next to a rebuild
+ * and the layout under the pointer is the whole feedback for this control:
+ * make it wait half a second and dragging the slider feels disconnected.
+ */
+const UV_SETTLE_MS = 250;
+
 /** How long an error holds the status line before the tool hint returns. */
 const ERROR_LINGER_MS = 6000;
 
@@ -158,6 +167,11 @@ export class Panel {
 
             strokeCount: byId('stroke-count'),
             clear: byId('btn-clear'),
+            singularityCount: byId('singularity-count'),
+
+            uvZone: byId('uv-zone'),
+            uvLeniency: byId('uv-leniency'),
+            uvCharts: byId('uv-charts'),
 
             outputStats: byId('output-stats'),
             format: byId('format'),
@@ -178,6 +192,9 @@ export class Panel {
            rebuild before then, so nothing to apply either. */
         this._appliedConfig = null;
         this._settleTimer = 0;
+        this._uvTimer = 0;
+        this._uvHovered = false;
+        this._uvDragging = false;
 
         /* The one status line shows the selected brush's help by default and
            borrows the space for a message, so both have to be remembered. */
@@ -246,8 +263,15 @@ export class Panel {
             );
         }
 
+        /* The chart size travels with the export as well as with a preview:
+           moving the slider and pressing Export without ever hovering would
+           otherwise write the layout from whatever was last looked at. */
         on(this.el.export, 'click', () =>
-            call('onExport', { format: this.el.format.value, ...this.extractOptions() })
+            call('onExport', {
+                format: this.el.format.value,
+                leniency: this.uvLeniency(),
+                ...this.extractOptions(),
+            })
         );
 
         for (const input of document.querySelectorAll('input[data-layer]')) {
@@ -255,6 +279,42 @@ export class Panel {
                 call('onLayerToggle', input.dataset.layer, input.checked)
             );
         }
+
+        this._bindUv(on, call);
+    }
+
+    /**
+     * The UV control, which is a slider and a hover in one.
+     *
+     * A flattened mesh cannot be judged from a number, so the control shows
+     * its own result: the pointer entering it puts the layout on the stage,
+     * and leaving puts the model back. Dragging the slider off the control's
+     * own bounds is still dragging the slider, so the preview survives it --
+     * otherwise the layout would vanish exactly while it was being changed.
+     */
+    _bindUv(on, call) {
+        on(this.el.uvLeniency, 'input', () => {
+            clearTimeout(this._uvTimer);
+            this._uvTimer = setTimeout(
+                () => call('onUvChange', this.uvLeniency()),
+                UV_SETTLE_MS
+            );
+        });
+
+        on(this.el.uvZone, 'pointerenter', () => {
+            this._uvHovered = true;
+            call('onUvPreview', true);
+        });
+        on(this.el.uvZone, 'pointerleave', () => {
+            this._uvHovered = false;
+            if (!this._uvDragging) call('onUvPreview', false);
+        });
+        on(this.el.uvZone, 'pointerdown', () => { this._uvDragging = true; });
+        on(document, 'pointerup', () => {
+            if (!this._uvDragging) return;
+            this._uvDragging = false;
+            if (!this._uvHovered) call('onUvPreview', false);
+        });
     }
 
     /**
@@ -312,6 +372,13 @@ export class Panel {
     layerState(name) {
         const input = document.querySelector(`input[data-layer="${name}"]`);
         return Boolean(input && input.checked);
+    }
+
+    /** Chart-size leniency in [0, 1], which is what the server's mapping takes. */
+    uvLeniency() {
+        const raw = Number(this.el.uvLeniency.value);
+        const span = Number(this.el.uvLeniency.max) || 100;
+        return Math.min(1, Math.max(0, (Number.isFinite(raw) ? raw : span / 2) / span));
     }
 
     /* -------------------------------------------------------------- */
@@ -384,6 +451,42 @@ export class Panel {
         this.el.strokeCount.textContent =
             count === 0 ? 'No strokes' : `${count} stroke${count === 1 ? '' : 's'}`;
         this.el.clear.disabled = count === 0;
+    }
+
+    /** How many markers are currently on the model, or null for none known. */
+    showSingularities(count) {
+        const line = this.el.singularityCount;
+        if (count === null || count === undefined) {
+            line.hidden = true;
+            return;
+        }
+        line.hidden = false;
+        line.textContent = `${count.toLocaleString()} singularities`;
+    }
+
+    /** Hide the UV control outright where xatlas is not installed. */
+    setUvAvailable(available) {
+        this.el.uvZone.hidden = !available;
+    }
+
+    /**
+     * Report a layout the server has cut.
+     *
+     * The chart count is the number the slider is really setting -- "fewer,
+     * larger chunks" is a count -- so it reads back beside it.
+     */
+    showUv(layout) {
+        if (!layout) {
+            this.el.uvCharts.textContent = '';
+            return;
+        }
+        const charts = Number(layout.charts) || 0;
+        this.el.uvCharts.textContent = `${charts.toLocaleString()}`;
+        if (layout.leniency !== undefined && this.el.uvLeniency !== document.activeElement
+            && !this._uvDragging) {
+            const span = Number(this.el.uvLeniency.max) || 100;
+            this.el.uvLeniency.value = String(Math.round(layout.leniency * span));
+        }
     }
 
     /** The extracted mesh's size, or null once it is stale. */

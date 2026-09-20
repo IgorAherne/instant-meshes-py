@@ -18,7 +18,7 @@
  */
 
 export const MAGIC = 0x53424d49;
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export const MessageType = Object.freeze({
   // client -> server
@@ -34,6 +34,7 @@ export const MessageType = Object.freeze({
   CLEAR_STROKES: 10,
   SUBSCRIBE: 11,
   PING: 12,
+  UNWRAP: 13,
 
   // server -> client
   GEOMETRY: 100,
@@ -47,6 +48,7 @@ export const MessageType = Object.freeze({
   EXPORT_READY: 108,
   STROKE_LIST: 109,
   PONG: 110,
+  UV_LAYOUT: 111,
 });
 
 const TYPED_ARRAYS = {

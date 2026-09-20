@@ -284,6 +284,99 @@ function buildOutputSurface(vertices, faces, faceNormals, posy) {
     return geometry;
 }
 
+/* ------------------------------------------------------------------ */
+/*  UV layout                                                          */
+/* ------------------------------------------------------------------ */
+
+/** Hue per chart, walked around the circle by the golden ratio.
+ *
+ * The point of the layout preview is to see how big the chunks are, so
+ * neighbouring charts have to be told apart at a glance; the golden step keeps
+ * consecutive ids as far from each other in hue as the circle allows. */
+function chartColor(index) {
+    const hue = (index * 0.61803398) % 1;
+    return hsvToRgb255(hue, 0.5, 0.92).map((c) => c / 255);
+}
+
+/** The corners a face actually uses: a triangle is stored as a degenerate quad. */
+function faceRing(faces, base, width) {
+    const ring = [];
+    const count = width > 3 && faces[base + width - 1] === faces[base + width - 2]
+        ? width - 1
+        : width;
+    for (let i = 0; i < count; ++i) ring.push(faces[base + i]);
+    return ring.every((c) => c >= 0) ? ring : null;
+}
+
+/**
+ * Flat-shaded chart islands plus the quad edges that run across them.
+ *
+ * This is the extracted mesh drawn in texture space: same faces, same
+ * quad-dominant fan, only with each corner at its (u, v) instead of its
+ * position.  A corner the unwrapper dropped takes its whole face out of the
+ * picture rather than collapsing it onto the origin.
+ */
+function buildUvGeometry({ uv, faces, chart, tris, triChart, width }) {
+    const fillPositions = [];
+    const fillColors = [];
+    const edgePositions = [];
+
+    const draw = (ring, chartIndex) => {
+        const rgb = chartColor(Math.max(0, chartIndex));
+        for (let i = 2; i < ring.length; ++i) {
+            for (const corner of [ring[0], ring[i - 1], ring[i]]) {
+                fillPositions.push(uv[corner * 2], uv[corner * 2 + 1], 0);
+                fillColors.push(rgb[0], rgb[1], rgb[2]);
+            }
+        }
+        for (let i = 0; i < ring.length; ++i) {
+            const a = ring[i];
+            const b = ring[(i + 1) % ring.length];
+            edgePositions.push(uv[a * 2], uv[a * 2 + 1], 0.001);
+            edgePositions.push(uv[b * 2], uv[b * 2 + 1], 0.001);
+        }
+    };
+
+    const faceCount = Math.floor(faces.length / width);
+    for (let f = 0; f < faceCount; ++f) {
+        const ring = faceRing(faces, f * width, width);
+        if (ring) draw(ring, chart[f]);
+    }
+
+    /* The quads a chart boundary went through, drawn as the two triangles
+       they were cut into -- one in each chunk, which is what the seam
+       running between them looks like from here. */
+    const cutCount = tris ? Math.floor(tris.length / 3) : 0;
+    for (let t = 0; t < cutCount; ++t) {
+        draw([tris[t * 3], tris[t * 3 + 1], tris[t * 3 + 2]], triChart[t]);
+    }
+
+    const fill = new THREE.BufferGeometry();
+    fill.setAttribute('position', new THREE.BufferAttribute(new Float32Array(fillPositions), 3));
+    fill.setAttribute('color', new THREE.BufferAttribute(new Float32Array(fillColors), 3));
+
+    const edges = new THREE.BufferGeometry();
+    edges.setAttribute(
+        'position',
+        new THREE.BufferAttribute(new Float32Array(edgePositions), 3)
+    );
+    return { fill, edges };
+}
+
+/** The unit square the atlas is packed into, as four line segments. */
+function unitSquareGeometry() {
+    const corners = [[0, 0], [1, 0], [1, 1], [0, 1]];
+    const points = [];
+    for (let i = 0; i < 4; ++i) {
+        const a = corners[i];
+        const b = corners[(i + 1) % 4];
+        points.push(a[0], a[1], -0.001, b[0], b[1], -0.001);
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(points), 3));
+    return geometry;
+}
+
 /** Both endpoints pure black: the phantom edge of a triangle stored as a quad. */
 function isBlackSegment(colors, offset) {
     for (let k = 0; k < 6; ++k) {
@@ -707,6 +800,49 @@ export class Viewer {
 
         this._strokeHandles = [];
         this._hasOutput = false;
+        this._buildUvScene();
+    }
+
+    /**
+     * The texture space, as a scene of its own.
+     *
+     * A flat layout has nothing to orbit and nothing to light, and putting it
+     * in the 3D scene would mean hiding every other object to see it.  A
+     * second scene with its own orthographic camera is the whole switch: one
+     * line in the frame loop decides which of the two is drawn.
+     */
+    _buildUvScene() {
+        this.uvScene = new THREE.Scene();
+        /* The frustum bounds are measured from the camera, not in world
+           space, so they stay centred on zero and the camera is what sits at
+           the middle of the unit square. */
+        this.uvCamera = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0.1, 10);
+        this.uvCamera.position.set(0.5, 0.5, 2);
+
+        this.uvFill = new THREE.Mesh(
+            emptyGeometry(),
+            new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
+        );
+        this.uvFill.frustumCulled = false;
+        this.uvScene.add(this.uvFill);
+
+        this.uvEdges = new THREE.LineSegments(
+            emptyGeometry(),
+            new THREE.LineBasicMaterial({ color: 0x1b1b20 })
+        );
+        this.uvEdges.frustumCulled = false;
+        this.uvScene.add(this.uvEdges);
+
+        this.uvBorder = new THREE.LineSegments(
+            unitSquareGeometry(),
+            new THREE.LineBasicMaterial({ color: 0x4a4a52 })
+        );
+        this.uvBorder.frustumCulled = false;
+        this.uvScene.add(this.uvBorder);
+
+        this._hasUv = false;
+        this._wantUv = false;
+        this._showUv = false;
     }
 
     /* -------------------------------------------------------------- */
@@ -730,6 +866,7 @@ export class Viewer {
         this.setStrokes([]);
         this.setSingularities(null);
         this.setExtracted(null, null);
+        this.setUvLayout(null);
 
         this._field = new FieldMaterial({ positions, normals, indices, scale, rosy, posy });
         this._field.setBaseColor(BASE_COLOR[0], BASE_COLOR[1], BASE_COLOR[2]);
@@ -956,6 +1093,58 @@ export class Viewer {
     }
 
     /* -------------------------------------------------------------- */
+    /*  Texture space                                                  */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * @param {{uv: Float32Array, faces: Int32Array, chart: Int32Array,
+     *          tris: Int32Array, triChart: Int32Array, width: number}|null}
+     *        layout  (u, v) pairs, faces indexing them `width` corners at a
+     *        time with the chart each landed in, plus the loose triangles of
+     *        the quads a chart boundary was cut through
+     */
+    setUvLayout(layout) {
+        const built = layout && (layout.faces.length || layout.tris.length)
+            ? buildUvGeometry(layout)
+            : { fill: emptyGeometry(), edges: emptyGeometry() };
+        replaceGeometry(this.uvFill, built.fill);
+        replaceGeometry(this.uvEdges, built.edges);
+        this._hasUv = hasVertices(this.uvFill);
+        this._applyUv();
+    }
+
+    /**
+     * Put the texture space on the stage instead of the model.
+     *
+     * Asking for it before there is one leaves the model up: a blank stage
+     * while the unwrapper runs says less than the mesh it is unwrapping.
+     */
+    setUvVisible(visible) {
+        this._wantUv = Boolean(visible);
+        this._applyUv();
+    }
+
+    _applyUv() {
+        this._showUv = this._wantUv && this._hasUv;
+    }
+
+    /** Fit the unit square into the viewport, whichever way round it is. */
+    _fitUvCamera() {
+        const aspect = this._size.width / Math.max(this._size.height, 1);
+        /* A little air around the square, so the border is not on the edge. */
+        let halfWidth = 0.54;
+        let halfHeight = 0.54;
+        if (aspect >= 1) halfWidth = halfHeight * aspect;
+        else halfHeight = halfWidth / aspect;
+
+        this.uvCamera.left = -halfWidth;
+        this.uvCamera.right = halfWidth;
+        this.uvCamera.top = halfHeight;
+        this.uvCamera.bottom = -halfHeight;
+        this.uvCamera.updateProjectionMatrix();
+    }
+
+    /* -------------------------------------------------------------- */
     /*  Layers and interaction state                                   */
     /* -------------------------------------------------------------- */
 
@@ -1120,17 +1309,21 @@ export class Viewer {
         if (this._needsResize) this._applyResize();
         if (this.onFrame) this.onFrame();
 
-        this.controls.update();
-        if (this._field) this._field.update(this.camera, this.mesh);
-        if (this.outputSurface.visible) {
-            /* The desktop app fixes its light in eye space; re-deriving the
-               world position each frame keeps the highlight on the output mesh
-               matching the one on the input surface as the camera orbits. */
-            this.outputSurface.material.uniforms.light_position.value
-                .set(0.0, 0.3, 0.0)
-                .applyMatrix4(this.camera.matrixWorld);
+        if (this._showUv) {
+            this.renderer.render(this.uvScene, this.uvCamera);
+        } else {
+            this.controls.update();
+            if (this._field) this._field.update(this.camera, this.mesh);
+            if (this.outputSurface.visible) {
+                /* The desktop app fixes its light in eye space; re-deriving the
+                   world position each frame keeps the highlight on the output
+                   mesh matching the one on the input surface as it orbits. */
+                this.outputSurface.material.uniforms.light_position.value
+                    .set(0.0, 0.3, 0.0)
+                    .applyMatrix4(this.camera.matrixWorld);
+            }
+            this.renderer.render(this.scene, this.camera);
         }
-        this.renderer.render(this.scene, this.camera);
 
         if (this._previewDirty) this._drawPreview();
     }
@@ -1147,6 +1340,7 @@ export class Viewer {
         this.renderer.setSize(width, height, false);
         this.camera.aspect = width / height;
         this.camera.updateProjectionMatrix();
+        this._fitUvCamera();
 
         this.overlay.width = Math.round(width * this._pixelRatio);
         this.overlay.height = Math.round(height * this._pixelRatio);
@@ -1207,6 +1401,9 @@ export class Viewer {
             this.singularityMarkers,
             this.outputWireframe,
             this.outputSurface,
+            this.uvFill,
+            this.uvEdges,
+            this.uvBorder,
         ]) {
             object.geometry.dispose();
             object.material.dispose();

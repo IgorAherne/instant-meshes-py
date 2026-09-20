@@ -78,36 +78,24 @@
                 <span class="label">Pos. attractor</span>
               </button>
             </div>
+            <!-- The two overlays a brush aims at, next to the brushes that aim
+                 at them: the grid is what combing turns, and the markers are
+                 what an attractor drags. -->
+            <div class="row">
+              <label class="check"><input type="checkbox" data-layer="grid" checked
+                data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
+              <label class="check push"><input type="checkbox" data-layer="singularities"
+                data-hint="The red and blue dots marking where the grid cannot stay regular -- where three or five edges meet instead of four. Picking either attractor brush turns them on, since those drag a marker you have to be able to see." /><span>Singularities</span></label>
+            </div>
             <div class="row">
               <span id="stroke-count" class="muted">No strokes</span>
               <button id="btn-clear" class="link-button" disabled
                 data-hint="Remove every stroke and re-solve without them. To delete one stroke, click the dot at its start; Ctrl+Z undoes the last one.">
                 Clear
               </button>
-            </div>
-          </section>
-
-          <!-- Layers ----------------------------------------------------- -->
-          <section class="block">
-            <h2>Show</h2>
-            <!-- One surface or the other, never both: they occupy the same
-                 space, and the input in front of the output is what made the
-                 extracted mesh look like it had never appeared. -->
-            <div class="segmented" role="radiogroup" aria-label="Surface">
-              <button class="seg" data-surface="mesh" role="radio" aria-checked="true"
-                data-hint="Show the model you imported, with the field grid on it. This is the surface you brush on, so drawing a stroke switches back here.">
-                Input surface
-              </button>
-              <button class="seg" data-surface="output" role="radio" aria-checked="false"
-                data-hint="Show the extracted quad mesh. It is built on demand, so choosing this after brushing rebuilds it from the field you have just changed.">
-                Output mesh
-              </button>
-            </div>
-            <div class="row">
-              <label class="check"><input type="checkbox" data-layer="grid" checked
-                data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
-              <label class="check push"><input type="checkbox" data-layer="singularities"
-                data-hint="The red and blue dots marking where the grid cannot stay regular -- where three or five edges meet instead of four. Picking either attractor brush turns them on, since those drag a marker you have to be able to see." /><span>Singularities</span></label>
+              <!-- How many markers are on screen right now, which is the one
+                   number the attractors are aimed at. -->
+              <span id="singularity-count" class="muted push" hidden></span>
             </div>
           </section>
 
@@ -150,9 +138,35 @@
               </select>
             </div>
 
-            <p id="output-stats" class="muted" hidden></p>
+            <!-- The UV atlas, as one control. Hovering anywhere in here puts
+                 the flattened layout on the stage in place of the model, which
+                 is the only way to judge what the slider just did. -->
+            <div id="uv-zone" hidden>
+              <div class="field">
+                <span>UV chunks</span>
+                <span id="uv-charts"></span>
+              </div>
+              <input type="range" id="uv-leniency" min="0" max="100" step="1" value="50"
+                data-hint="How far xatlas may stretch one UV chunk before it cuts a seam and starts another. Right means fewer, larger chunks with more distortion; left means more, smaller ones that each stay closer to their true shape.&#10;&#10;Hover anywhere on this control to see the layout." />
+            </div>
+
+            <!-- One surface or the other, never both: they occupy the same
+                 space, and the input in front of the output is what made the
+                 extracted mesh look like it had never appeared. -->
+            <div class="segmented" role="radiogroup" aria-label="Surface">
+              <button class="seg" data-surface="mesh" role="radio" aria-checked="true"
+                data-hint="Show the model you imported, with the field grid on it. This is the surface you brush on, so drawing a stroke switches back here.">
+                Input surface
+              </button>
+              <button class="seg" data-surface="output" role="radio" aria-checked="false"
+                data-hint="Show the extracted quad mesh. It is built on demand, so choosing this after brushing rebuilds it from the field you have just changed.">
+                Output mesh
+              </button>
+            </div>
+
             <button class="wide primary" id="btn-export"
-              data-hint="Build the quad mesh from the solved field, write it out and download it.">Export</button>
+              data-hint="Build the quad mesh from the solved field, write it out and download it. An OBJ carries the UV layout with it.">Export</button>
+            <p id="output-stats" class="muted" hidden></p>
             <!-- Clicked from script to start the download; never shown. -->
             <a id="download" hidden download></a>
           </section>

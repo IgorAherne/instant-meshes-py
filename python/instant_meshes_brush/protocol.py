@@ -38,7 +38,7 @@ from typing import Any, Dict, Mapping, Optional
 import numpy as np
 
 MAGIC = 0x53424D49
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 _HEADER_STRUCT = struct.Struct("<IHHI")
 
@@ -68,6 +68,7 @@ class MessageType:
     CLEAR_STROKES = 10
     SUBSCRIBE = 11
     PING = 12
+    UNWRAP = 13
 
     # --- server -> client ---------------------------------------------------
     GEOMETRY = 100
@@ -81,6 +82,7 @@ class MessageType:
     EXPORT_READY = 108
     STROKE_LIST = 109
     PONG = 110
+    UV_LAYOUT = 111
 
 
 class ProtocolError(ValueError):

@@ -247,6 +247,29 @@ button.wide:last-child {
     flex: 0 0 auto;
 }
 
+/* Sits at the far end of the stroke row, so the two counts that describe the
+   field -- what you drew, what came of it -- read as one line. */
+#singularity-count {
+    flex: 0 0 auto;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The UV chunk count is a value, not a label, so it keeps the panel's normal
+   text colour while the word beside it stays muted like every other caption. */
+#uv-charts {
+    flex: 0 0 auto;
+    color: var(--text);
+}
+
+/* Directly under the button that produced it. */
+#output-stats {
+    margin-top: 2px;
+    font-size: 11px;
+}
+
 .link-button {
     background: none;
     border: 0;
@@ -406,6 +429,13 @@ input[type="range"] {
     background: var(--accent);
     border-color: var(--accent);
     color: #fff;
+}
+
+/* A pressed button stays pressed under the pointer. Without this the generic
+   `button:hover` is the more specific rule and the selected brush turns grey
+   the moment you move back over it, which reads as having lost the selection. */
+.tool[aria-checked="true"]:hover {
+    background: var(--accent-hot);
 }
 
 /* ------------------------------------------------------------------ */

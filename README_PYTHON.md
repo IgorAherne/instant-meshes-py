@@ -6,7 +6,7 @@ command line has never exposed — into any Gradio app.
 
 You orbit the model in the browser, draw strokes on its surface to steer the
 topology, watch the red field grid update on the mesh as the solver runs, then
-extract and download a quad mesh.
+download a quad mesh with a UV atlas already on it.
 
 ---
 
@@ -23,6 +23,7 @@ screen-space input handled by the GUI. This fork separates the two:
 | Parallelism | Intel TBB submodule | header-only `std::thread` shim |
 | Distribution | build the app yourself | `pip install`, self-contained wheels |
 | Field preview | native OpenGL geometry shader | ported to WebGL2 in the browser |
+| Texture space | none | xatlas atlas on the quads, written into the OBJ |
 
 The algorithm itself is untouched: same hierarchy, same field optimiser, same
 extraction, same results.
@@ -131,10 +132,21 @@ a Blender user expects it:
 | `C` / `E` | Orientation comb / edge brush |
 | `Esc` | Cancel the stroke being drawn |
 
-**Show** picks one surface or the other — the input you brush on, or the
-extracted result — never both, since they occupy the same space. Choosing the
-output builds one; drawing a stroke switches back to the input, and marks the
-result stale so the next look at it is rebuilt from the field you just changed.
+The pair of buttons above **Export** picks one surface or the other — the input
+you brush on, or the extracted result — never both, since they occupy the same
+space. Choosing the output builds one; drawing a stroke switches back to the
+input, and marks the result stale so the next look at it is rebuilt from the
+field you just changed.
+
+**UV chunks** cuts the atlas, and is the only xatlas control there is. The
+slider is how far one chunk may stretch before xatlas gives up on it and starts
+another: the right-hand end is fewer, larger chunks with more distortion, the
+left-hand end more, smaller ones that each stay closer to their true shape, and
+the number beside the label is what came out. Hovering anywhere on that control
+puts the flattened layout on the stage in place of the model, each chunk in its
+own colour — which is the only form in which the setting means anything.
+Exporting an OBJ carries the layout with it whether or not you ever looked at
+it; a PLY does not, having no per-corner form for one.
 
 Every control lives **inside** the viewport, so embedding it in your own Gradio
 app is one call and you reproduce none of the UI:
@@ -255,6 +267,33 @@ session.set_extraction_options(smooth_iter=4, pure_quad=True)
 mesh = session.extract()
 ```
 
+### Texture coordinates
+
+`instant_meshes_brush.uv` wraps xatlas (`pip install xatlas`, or it comes with
+the `[app]` extra) and hands the result back **on the quads**:
+
+```python
+from instant_meshes_brush import uv
+
+layout = uv.unwrap(mesh.vertices, mesh.faces, leniency=0.5)   # 0..1
+uv.write_obj("out.obj", mesh.vertices, mesh.faces, layout)
+print(layout.chart_count, "chunks,", layout.unmapped, "faces without UVs")
+```
+
+`leniency` maps onto xatlas's `ChartOptions.max_cost`, geometrically, with 0.5
+landing on the library's own default of 2.0.
+
+`layout.faces` has the shape of the mesh's own face array but indexes
+`layout.uv`: a vertex on a seam is in the atlas twice, so the two index spaces
+cannot be the same one. xatlas charts *triangles*, so a chart boundary can run
+down a quad's diagonal — a face with half of itself in each chunk has no single
+place in the atlas, and is reported unmapped rather than given one of the two
+answers.
+
+`write_obj` exists because the C++ writer emits `vt` lines that none of its
+faces reference; this one writes `f v/vt` per corner, and leaves a face without
+texture indices rather than pointing it at the origin.
+
 ### Reproducible output
 
 `Config(deterministic=True)` makes a run bit-identical, **including across
@@ -272,6 +311,7 @@ ext/tbb_shim/               header-only std::thread stand-in for Intel TBB
 ext/pss_shim/               likewise for the pss parallel sort
 python/instant_meshes_brush/
     protocol.py             binary WebSocket framing (paired with protocol.js)
+    uv.py                   xatlas atlas, mapped back onto the quads
     session_manager.py      one C++ session per browser, with a TTL sweeper
     server.py               FastAPI: /viewer, /imb-assets, /ws/{id}, uploads
     app.py                  the Gradio wrapper -- an iframe and nothing else
