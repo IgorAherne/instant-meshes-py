@@ -133,12 +133,12 @@ a Blender user expects it:
 | `1` / `2` / `3` | Input / Result / Result UV |
 | `Esc` | Cancel the stroke being drawn |
 
-The three buttons above **Export** pick the view: **Input** is the surface you
-brush on, **Result** the extracted quad mesh, **Result UV** that mesh flattened
-into its texture space. Never two at once — the first two occupy the same
-space. Choosing either result builds one; drawing a stroke switches back to the
-input and marks both stale, so the next look at them is rebuilt from the field
-you just changed.
+The three buttons under the resolution pick the view: **Input** is the surface
+you brush on, **Result** the extracted quad mesh, **Result UV** that mesh
+flattened into its texture space. Never two at once — the first two occupy the
+same space. Choosing either result builds one; drawing a stroke switches back
+to the input and marks both stale, so the next look at them is rebuilt from the
+field you just changed.
 
 **UV chunks** cuts the atlas, and is the only xatlas control there is. The
 slider is how far one chunk may stretch before xatlas gives up on it and starts
@@ -150,7 +150,7 @@ anything; while the unwrapper runs, the label carries its progress. Exporting
 an OBJ carries the layout with it whether or not you ever looked at it; a PLY
 does not, having no per-corner form for one.
 
-The four toggles under the resolution — **Smooth Flow**, **Follow Borders**,
+The four toggles in **Output mesh** — **Smooth Flow**, **Follow Borders**,
 **Sharp Creases**, **Force Quads** — all change how the field is solved, so
 each one rebuilds and re-solves. Force Quads subdivides the result into quads
 only, which splits every quad into four; the field is aimed at a quarter of the

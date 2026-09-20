@@ -63,11 +63,12 @@ const CONFIG_SETTLE_MS = 500;
 /**
  * How long the UV slider must sit still before the atlas is re-cut.
  *
- * Shorter than CONFIG_SETTLE_MS because unwrapping is cheap next to a rebuild
- * and the layout under the pointer is the whole feedback for this control:
- * make it wait half a second and dragging the slider feels disconnected.
+ * Much shorter than CONFIG_SETTLE_MS because unwrapping is cheap next to a
+ * rebuild and the layout is the whole feedback for this control: every
+ * millisecond here is a millisecond of a slider that looks like it did
+ * nothing. Long enough only to keep a drag from queuing one cut per pixel.
  */
-const UV_SETTLE_MS = 250;
+const UV_SETTLE_MS = 120;
 
 /** How long an error holds the status line before the tool hint returns. */
 const ERROR_LINGER_MS = 6000;
@@ -280,6 +281,17 @@ export class Panel {
                 call('onLayerToggle', input.dataset.layer, input.checked)
             );
         }
+
+        /* A pointer press must not leave the keyboard behind on the control it
+           pressed. The view keys belong to the viewport, and a button or a
+           slider that keeps the focus both swallows them and holds a focus
+           ring nobody asked for. Tabbing is untouched: it is not a press, and
+           the text boxes are left alone so typing can continue. */
+        on(document, 'pointerup', (event) => {
+            const control =
+                event.target.closest && event.target.closest('button, input[type="range"]');
+            if (control && control === document.activeElement) control.blur();
+        });
 
         this._bindUv(on, call);
     }
@@ -512,7 +524,7 @@ export class Panel {
             return;
         }
         line.hidden = false;
-        line.textContent = `${counts.vertices.toLocaleString()} v`;
+        line.textContent = `${counts.vertices.toLocaleString()} vertexes`;
     }
 
     /**

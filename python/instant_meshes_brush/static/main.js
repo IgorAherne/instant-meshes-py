@@ -349,7 +349,11 @@ class App {
             this.panel.setStatus('Unwrapping once the field has settled...', false);
             return;
         }
-        this.panel.setStatus('Unwrapping...', false);
+        /* Said here rather than waiting for the server's first report: that
+           one cannot arrive until the request has crossed the socket and the
+           streamer has ticked, and a control that sits silent for a fifth of
+           a second reads as one that did not hear the click. */
+        this.panel.showUnwrapping(0);
         this.connection.send(MessageType.UNWRAP, { leniency: this.panel.uvLeniency() });
     }
 
@@ -617,6 +621,9 @@ class App {
         conn.on(MessageType.ERROR, (header) => {
             const suffix = header.fatal ? ' -- reload the page' : '';
             this.panel.setStatus(`${header.message}${suffix}`, true);
+            /* An unwrap that failed on its way in may never have been seen
+               running, so nothing else would take the label back down. */
+            this.panel.showUnwrapping(null);
         });
 
         conn.onStatus((status) => this.panel.showLink(status));

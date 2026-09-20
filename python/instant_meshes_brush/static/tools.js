@@ -77,6 +77,16 @@ export const TOOLS = [
 /** The first tool, which is what left-drag does until another is picked. */
 export const DEFAULT_TOOL = TOOLS[0].id;
 
+/**
+ * Controls a keystroke belongs to rather than to the viewport.
+ *
+ * A slider is not one of them, and neither is a checkbox: 1, 2, 3, C, E and F
+ * do nothing to either.  Counting every `input` as text entry is what made
+ * clicking the chart slider turn the whole keyboard off until you clicked
+ * somewhere else.
+ */
+const TEXT_ENTRY = 'textarea, select, input:not([type="range"]):not([type="checkbox"])';
+
 /** Number keys for the three views, in the order the panel lists them. */
 export const SURFACE_KEYS = Object.freeze({
     1: 'mesh',
@@ -286,7 +296,7 @@ export class ToolController {
         if (!document.hasFocus()) return;
 
         const focused = document.activeElement;
-        const typing = Boolean(focused && focused.matches('input, select, textarea'));
+        const typing = Boolean(focused && focused.matches(TEXT_ENTRY));
 
         if ((event.ctrlKey || event.metaKey) && !event.altKey &&
             event.key.toLowerCase() === 'z') {

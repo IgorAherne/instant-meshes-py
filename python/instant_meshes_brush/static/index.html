@@ -42,7 +42,7 @@
           <!-- Mesh ------------------------------------------------------- -->
           <section class="block">
             <h2>Mesh</h2>
-            <button class="wide primary" id="btn-open"
+            <button class="wide primary hero" id="btn-open"
               data-hint="Load an OBJ, PLY, STL or OFF file. The field is solved for you as soon as it is in, so the grid preview appears without pressing anything else.">
               Import mesh
             </button>
@@ -99,16 +99,11 @@
             </div>
           </section>
 
-          <!-- Output ----------------------------------------------------- -->
+          <!-- Resolution and views --------------------------------------- -->
+          <!-- No heading: these three are how much of the model you are
+               looking at and which form of it, which the controls say for
+               themselves. -->
           <section class="block">
-            <h2>Output mesh</h2>
-            <select id="symmetry"
-              data-hint="The symmetry of the output. Quads (4-RoSy, 4-PoSy) is the usual choice; triangles use 6-RoSy, 6-PoSy. Changing this rebuilds and re-solves straight away.">
-              <option value="4,4" selected>Quads (4-RoSy, 4-PoSy)</option>
-              <option value="6,3">Triangles (6-RoSy, 6-PoSy)</option>
-              <option value="2,4">Quads, 2-RoSy</option>
-            </select>
-
             <label class="field" for="target">
               <span>Target vertex count</span>
               <input type="number" id="target" min="500" max="60000" step="10" value="1000"
@@ -117,31 +112,6 @@
             <!-- Logarithmic; see panel.js. Its own units are slider steps, not
                  vertices, so the useful low end is not crushed into 5 pixels. -->
             <input type="range" id="target-range" min="0" max="1000" step="1" value="0" />
-
-            <!-- Four settings of the same kind -- each one changes how the
-                 field is solved, so each one rebuilds -- and four checkboxes
-                 down the panel cost four rows to say it. -->
-            <div class="toggles" role="group" aria-label="Field options">
-              <button class="toggle" data-opt="extrinsic" aria-pressed="true"
-                data-hint="Smooth the flow through space rather than across the surface -- 'extrinsic' smoothing. It gives a calmer, more even grid and is what you normally want; turning it off lets the flow follow the surface's own curvature more closely, at the cost of more swirl.">Smooth<br />Flow</button>
-              <button class="toggle" data-opt="boundaries" aria-pressed="false"
-                data-hint="Make edge loops run parallel to the open edges of the model, where it has any.">Follow<br />Borders</button>
-              <button class="toggle" data-opt="creases" aria-pressed="false"
-                data-hint="Keep sharp edges sharp instead of smoothing across them.">Sharp<br />Creases</button>
-              <button class="toggle" data-opt="pure-quad" aria-pressed="false"
-                data-hint="Subdivide so the result contains quads only, with no triangles. The subdivision splits every quad into four, so the field is aimed at a quarter of the target above and the count you asked for is still what comes out.&#10;&#10;An exported OBJ still writes the few per cent of quads a UV seam runs through as their two triangles -- the only way they can carry it.">Force<br />Quads</button>
-            </div>
-
-            <div class="field">
-              <label for="smoothing">Smoothing</label>
-              <input type="number" id="smoothing" min="0" max="10" step="1" value="2"
-                data-hint="Reprojection passes applied to the extracted mesh. More means a smoother result that follows the original surface less tightly." />
-              <select id="format" aria-label="File format"
-                data-hint="The file Export writes. OBJ is the safer choice: a quad-dominant result contains triangles too, and not every reader accepts a PLY with mixed face sizes. Pure quad mesh makes PLY safe.">
-                <option value="obj" selected>obj</option>
-                <option value="ply">ply</option>
-              </select>
-            </div>
 
             <!-- The UV atlas, as one control. Touching it selects the view
                  that shows what it does, since the setting means nothing
@@ -172,8 +142,44 @@
                 <span class="label">Result UV</span><kbd>3</kbd>
               </button>
             </div>
+          </section>
 
-            <button class="wide primary" id="btn-export"
+          <!-- Output ----------------------------------------------------- -->
+          <section class="block">
+            <h2>Output mesh</h2>
+            <select id="symmetry"
+              data-hint="The symmetry of the output. Quads (4-RoSy, 4-PoSy) is the usual choice; triangles use 6-RoSy, 6-PoSy. Changing this rebuilds and re-solves straight away.">
+              <option value="4,4" selected>Quads (4-RoSy, 4-PoSy)</option>
+              <option value="6,3">Triangles (6-RoSy, 6-PoSy)</option>
+              <option value="2,4">Quads, 2-RoSy</option>
+            </select>
+
+            <!-- Four settings of the same kind -- each one changes how the
+                 field is solved, so each one rebuilds -- and four checkboxes
+                 down the panel cost four rows to say it. -->
+            <div class="toggles" role="group" aria-label="Field options">
+              <button class="toggle" data-opt="extrinsic" aria-pressed="true"
+                data-hint="Smooth the flow through space rather than across the surface -- 'extrinsic' smoothing. It gives a calmer, more even grid and is what you normally want; turning it off lets the flow follow the surface's own curvature more closely, at the cost of more swirl.">Smooth<br />Flow</button>
+              <button class="toggle" data-opt="boundaries" aria-pressed="false"
+                data-hint="Make edge loops run parallel to the open edges of the model, where it has any.">Follow<br />Borders</button>
+              <button class="toggle" data-opt="creases" aria-pressed="false"
+                data-hint="Keep sharp edges sharp instead of smoothing across them.">Sharp<br />Creases</button>
+              <button class="toggle" data-opt="pure-quad" aria-pressed="false"
+                data-hint="Subdivide so the result contains quads only, with no triangles. The subdivision splits every quad into four, so the field is aimed at a quarter of the target above and the count you asked for is still what comes out.&#10;&#10;An exported OBJ still writes the few per cent of quads a UV seam runs through as their two triangles -- the only way they can carry it.">Force<br />Quads</button>
+            </div>
+
+            <div class="field">
+              <label for="smoothing">Smoothing</label>
+              <input type="number" id="smoothing" min="0" max="10" step="1" value="2"
+                data-hint="Reprojection passes applied to the extracted mesh. More means a smoother result that follows the original surface less tightly." />
+              <select id="format" aria-label="File format"
+                data-hint="The file Export writes. OBJ is the safer choice: a quad-dominant result contains triangles too, and not every reader accepts a PLY with mixed face sizes. Pure quad mesh makes PLY safe.">
+                <option value="obj" selected>obj</option>
+                <option value="ply">ply</option>
+              </select>
+            </div>
+
+            <button class="wide hero go" id="btn-export"
               data-hint="Build the quad mesh from the solved field, write it out and download it. An OBJ carries the UV layout with it.">Export</button>
             <p id="output-stats" class="muted" hidden></p>
             <!-- Clicked from script to start the download; never shown. -->

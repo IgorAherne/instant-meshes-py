@@ -17,6 +17,9 @@
     --muted: #8b8b94;
     --accent: #4a78d0;
     --accent-hot: #5a88e0;
+    /* The one button that produces a file rather than changing the model. */
+    --go: #3f8f5f;
+    --go-hot: #4aa26d;
     --danger: #d06a5a;
     --focus: #7aa3f0;
     /* Wide enough for three view buttons with their shortcut keys on them,
@@ -90,8 +93,11 @@ body {
     border-radius: 5px;
 }
 
+/* Generous: the sections are five different subjects, and reading which
+   control belongs to which is worth more panel height than the controls it
+   would otherwise buy. */
 .block {
-    padding: 11px 12px 13px;
+    padding: 17px 12px 19px;
     border-bottom: 1px solid var(--panel-edge);
 }
 
@@ -159,6 +165,26 @@ button.primary {
 
 button.primary:hover:not(:disabled) {
     background: var(--accent-hot);
+}
+
+/* Export writes a file; everything else changes the model on screen. A hue of
+   its own is the cheapest way to say that it is not one more setting. */
+button.go {
+    background: var(--go);
+    border-color: var(--go);
+    font-weight: 600;
+}
+
+button.go:hover:not(:disabled) {
+    background: var(--go-hot);
+}
+
+/* The two ends of the workflow: the way in and the way out. They carry the
+   section they head rather than sitting in a list of equals. */
+button.hero {
+    padding: 15px 10px;
+    font-size: 13px;
+    border-radius: 5px;
 }
 
 button.wide,
@@ -277,10 +303,12 @@ button.wide:last-child {
     color: var(--text);
 }
 
-/* Directly under the button that produced it. */
+/* Directly under the button that produced it, at the end of the row so it
+   lines up with every other value in the panel. */
 #output-stats {
-    margin-top: 2px;
+    margin-top: 6px;
     font-size: 11px;
+    text-align: right;
 }
 
 .link-button {
