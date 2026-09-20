@@ -224,17 +224,28 @@ class App {
         this.panel.handlers.onSelectTool = (id) => this.tools.setTool(id);
         this.panel.handlers.onClearStrokes = () => send(MessageType.CLEAR_STROKES);
 
-        this.panel.handlers.onExtract = (options) => send(MessageType.EXTRACT, options);
         this.panel.handlers.onExport = (options) => send(MessageType.EXPORT, options);
 
-        /* Choosing the output before anything has been extracted means "show
-           me the output", which is a request to build one. */
+        /* There is no Extract button: asking to see the output IS the request
+           to build one, and so is exporting.  Anything that changes the field
+           marks the result stale, so this rebuilds rather than showing the
+           mesh that was extracted before the last stroke. */
         this.panel.handlers.onSurfaceChange = (which) => {
             this._setSurface(which);
             if (which === 'output' && !this.hasOutput) {
                 this.panel.setStatus('Extracting...', false);
                 send(MessageType.EXTRACT, this.panel.extractOptions());
             }
+        };
+
+        /* Pure quad and smoothing are read at extraction time, so the result
+           on screen no longer matches them. Rebuild it now if it is what the
+           user is looking at, and otherwise the next time they ask for it. */
+        this.panel.handlers.onExtractOptionsChange = (options) => {
+            this._invalidateOutput();
+            if (this.panel.surface() !== 'output') return;
+            this.panel.setStatus('Extracting...', false);
+            send(MessageType.EXTRACT, options);
         };
 
         /* There is no Apply button: the panel sends this once the remeshing
@@ -284,6 +295,21 @@ class App {
     }
 
     /**
+     * Forget an extraction the field has moved on from.
+     *
+     * Solving is what makes it stale, and with no Extract button the only
+     * thing standing between a stroke and a mesh extracted before it is this:
+     * the result is dropped, so asking to see the output builds a new one.
+     */
+    _invalidateOutput() {
+        if (!this.hasOutput) return;
+        this.hasOutput = false;
+        this.panel.showOutput(null);
+        this.panel.showDownload(null);
+        this.pending.extracted = { wireframe: null, colors: null, surface: null };
+    }
+
+    /**
      * Upload through HTTP rather than the socket.
      *
      * The server parses the file with trimesh and loads it into the session;
@@ -307,7 +333,7 @@ class App {
             }
             /* The GEOMETRY frame that follows fills in the rest. */
             this.panel.showDownload(null);
-            this.panel.showOutput('Not extracted yet');
+            this.panel.showOutput(null);
         } catch (err) {
             this.panel.setStatus(err.message, true);
         }
@@ -358,8 +384,9 @@ class App {
                 scale: header.scale,
                 targetVertices: header.config ? header.config.vertex_count : 0,
             });
-            this.panel.showFieldState({ orientation: 'solving…', position: 'solving…' });
-            this.panel.showOutput('Not extracted yet');
+            this.panel.showFieldState({ orientation: null, position: null });
+            this.panel.showOutput(null);
+            this.panel.showDownload(null);
             this.panel.setReady(true);
             this.hasOutput = false;
             /* The grid is the point of importing a mesh, and solving it is the
@@ -402,11 +429,7 @@ class App {
             this.pending.singularities = decodeSingularities(arrays);
             const orientation = header.n_orientation;
             const position = header.n_position;
-            this.panel.showFieldState({
-                orientation:
-                    orientation === undefined ? undefined : `${orientation} singularities`,
-                position: position === undefined ? undefined : `${position} singularities`,
-            });
+            this.panel.showFieldState({ orientation, position });
         });
 
         conn.on(MessageType.EXTRACTED, (header, arrays) => {
@@ -430,9 +453,7 @@ class App {
 
             const faceCount = header.n_faces ?? header.face_count ?? 0;
             const vertexCount = header.n_vertices ?? 0;
-            this.panel.showOutput(
-                `${vertexCount.toLocaleString()} vertices / ${faceCount.toLocaleString()} faces`
-            );
+            this.panel.showOutput({ vertices: vertexCount, faces: faceCount });
             this.panel.setStatus(`Extracted ${faceCount} faces`, false);
             this.hasOutput = faceCount > 0;
             /* Showing the result is the whole point of pressing Extract, and
@@ -463,6 +484,10 @@ class App {
         const running = Boolean(header.solving ?? header.active);
         if (header.ready !== undefined) this.panel.setReady(Boolean(header.ready));
         this.panel.setSolving(running);
+        /* The field has moved, so whatever was extracted from the old one no
+           longer describes it. Once per solve, not once per status frame. */
+        if (running && !this._wasSolving) this._invalidateOutput();
+        this._wasSolving = running;
 
         if (header.config) this.panel.showConfig(header.config);
 

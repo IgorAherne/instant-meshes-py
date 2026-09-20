@@ -154,10 +154,8 @@ export class Panel {
 
             strokeCount: byId('stroke-count'),
             clear: byId('btn-clear'),
-            statOrient: byId('stat-orient'),
-            statPos: byId('stat-pos'),
+            singularities: byId('singularities'),
 
-            extract: byId('btn-extract'),
             outputStats: byId('output-stats'),
             format: byId('format'),
             pureQuad: byId('opt-pure-quad'),
@@ -180,6 +178,7 @@ export class Panel {
         this._settleTimer = 0;
 
         this.el.targetRange.value = targetToSlider(this.el.target.value);
+        this.showFieldState({ orientation: null, position: null });
         this._bind();
         this.setSolving(false);
         this.setReady(false);
@@ -230,7 +229,15 @@ export class Panel {
             on(button, 'click', () => call('onSurfaceChange', button.dataset.surface));
         }
 
-        on(this.el.extract, 'click', () => call('onExtract', this.extractOptions()));
+        /* These two are read at extraction time, so changing one makes the
+           result on screen stale. `change` rather than `input`, so a typed
+           smoothing count is not re-extracted once per keystroke. */
+        for (const key of ['pureQuad', 'smoothing']) {
+            on(this.el[key], 'change', () =>
+                call('onExtractOptionsChange', this.extractOptions())
+            );
+        }
+
         on(this.el.export, 'click', () =>
             call('onExport', { format: this.el.format.value, ...this.extractOptions() })
         );
@@ -362,8 +369,8 @@ export class Panel {
         this.el.meshName.textContent = name || 'Untitled mesh';
         this.el.meshStats.hidden = false;
         this.el.meshStats.textContent =
-            `${vertices.toLocaleString()} v / ${faces.toLocaleString()} tri` +
-            `  →  ${(targetVertices || 0).toLocaleString()} v target,` +
+            `Input  ${vertices.toLocaleString()} v / ${faces.toLocaleString()} tri` +
+            `   ·   target ${(targetVertices || 0).toLocaleString()} v,` +
             ` edge ${scale.toPrecision(3)}`;
     }
 
@@ -373,13 +380,50 @@ export class Panel {
         this.el.clear.disabled = count === 0;
     }
 
+    /**
+     * Singularity counts, as the hover text of the info marker.
+     *
+     * They are genuinely useful and genuinely meaningless to somebody meeting
+     * the tool for the first time, so they get one character of panel instead
+     * of two rows.  Either value may be omitted to leave it as it was.
+     */
     showFieldState({ orientation, position }) {
-        if (orientation !== undefined) this.el.statOrient.textContent = orientation;
-        if (position !== undefined) this.el.statPos.textContent = position;
+        if (orientation !== undefined) this._orientationCount = orientation;
+        if (position !== undefined) this._positionCount = position;
+
+        const show = (value) =>
+            typeof value === 'number' ? value.toLocaleString() : 'not solved yet';
+        this.el.singularities.dataset.hint =
+            'Singularities are the points where the grid cannot stay regular -- ' +
+            'where three or five edges meet instead of four. Every closed surface ' +
+            'needs some; they are the red and blue dots on the model, and the ' +
+            'attractor brushes drag them somewhere less conspicuous.\n\n' +
+            `Orientation field:  ${show(this._orientationCount)}\n` +
+            `Position field:  ${show(this._positionCount)}`;
+        this.el.singularities.setAttribute(
+            'aria-label',
+            `Singularities: ${show(this._orientationCount)} orientation, ` +
+            `${show(this._positionCount)} position`
+        );
     }
 
-    showOutput(text) {
-        this.el.outputStats.textContent = text;
+    /**
+     * The extracted mesh's size, or null once it is stale.
+     *
+     * It sits beside the input counts on the stage rather than in the panel:
+     * the two only mean anything next to each other, and with "Pure quad mesh"
+     * on, an output four times the target reads as a contradiction alone.
+     */
+    showOutput(counts) {
+        const line = this.el.outputStats;
+        if (!counts) {
+            line.hidden = true;
+            return;
+        }
+        line.hidden = false;
+        line.textContent =
+            `Output  ${counts.vertices.toLocaleString()} v /` +
+            ` ${counts.faces.toLocaleString()} faces`;
     }
 
     showDownload(url, filename, bytes) {
@@ -419,9 +463,7 @@ export class Panel {
      *  the one place this UI could strand somebody. */
     setSolving(active) {
         this._solving = active;
-        for (const key of ['extract', 'export']) {
-            this.el[key].disabled = active || !this._ready;
-        }
+        this.el.export.disabled = active || !this._ready;
     }
 
     setReady(ready) {

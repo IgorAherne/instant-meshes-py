@@ -301,6 +301,19 @@ void Session::copyPositionField(float *destination) const {
 //  Strokes
 // ---------------------------------------------------------------------------
 
+namespace {
+/**
+ * How squarely the surface has to face the camera for a stroke to *end* there.
+ *
+ * |cos| between the interpolated normal and the view ray: 1 head-on, 0 on the
+ * silhouette.  0.3 is about 17 degrees around the outline of a smooth shape,
+ * which on a screen is a few percent of its radius -- just inside the edge,
+ * which is what makes the endpoint land on surface the user could see rather
+ * than on a sliver pointing away from them.
+ */
+constexpr Float MIN_STROKE_FACING = (Float) 0.3;
+}  // namespace
+
 bool Session::projectStroke(const MatrixXf &rayOrigins, const MatrixXf &rayDirections,
                             bool attractor, std::vector<CurvePoint> &out) const {
     requireReady();
@@ -310,33 +323,86 @@ bool Session::projectStroke(const MatrixXf &rayOrigins, const MatrixXf &rayDirec
         throw std::runtime_error("Session::projectStroke: origin/direction count mismatch");
 
     out.clear();
-    if (rayOrigins.cols() == 0)
+    const uint32_t count = (uint32_t) rayOrigins.cols();
+    if (count == 0)
         return false;
 
     const MatrixXf &N = mRes.N();
     const MatrixXu &F = mRes.F();
 
-    out.reserve((size_t) rayOrigins.cols());
-    for (uint32_t i = 0; i < (uint32_t) rayOrigins.cols(); ++i) {
+    std::vector<CurvePoint> points((size_t) count);
+    std::vector<Float> facing((size_t) count, (Float) 0);
+    std::vector<uint8_t> hit((size_t) count, 0);
+
+    for (uint32_t i = 0; i < count; ++i) {
         Ray ray(rayOrigins.col(i), rayDirections.col(i).normalized());
         Vector2f uv;
         uint32_t f;
         Float t;
 
-        /* A single miss aborts the whole stroke, exactly as the GUI does: a
-           stroke that leaves the surface has no meaningful projection. */
-        if (!mBVH->rayIntersect(ray, f, t, &uv)) {
-            out.clear();
-            return false;
-        }
+        if (!mBVH->rayIntersect(ray, f, t, &uv))
+            continue;
 
-        CurvePoint pt;
+        CurvePoint &pt = points[i];
         pt.p = ray(t);
         pt.n = ((1 - uv.sum()) * N.col(F(0, f)) + uv.x() * N.col(F(1, f)) +
                 uv.y() * N.col(F(2, f))).normalized();
         pt.f = f;
-        out.push_back(pt);
+        /* 1 where the surface faces the camera squarely, 0 on the silhouette. */
+        facing[i] = std::abs(pt.n.dot(ray.d));
+        hit[i] = 1;
     }
+
+    /* The longest uninterrupted run of hits.
+       A drag that begins beside the model, or crosses a hole and comes back,
+       is still a perfectly clear instruction, so the rays that miss are
+       dropped rather than rejecting the whole stroke -- which is what the GUI
+       does, because there a stroke cannot start anywhere but on the surface.
+       Taking the longest run rather than every hit is what stops a stroke that
+       left the model and returned from being stitched together across the gap
+       with a straight line through empty space. */
+    uint32_t begin = 0, length = 0, runStart = 0, runLength = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!hit[i]) {
+            runLength = 0;
+            continue;
+        }
+        if (runLength++ == 0)
+            runStart = i;
+        if (runLength > length) {
+            begin = runStart;
+            length = runLength;
+        }
+    }
+    if (length < 2)
+        return false;
+
+    uint32_t first = begin, last = begin + length - 1;
+    if (!attractor) {
+        /* Step the ends inside the silhouette.
+           Whatever survived above now starts exactly where the surface turns
+           away from the camera, and there a comb stroke lands on whichever
+           side-facing sliver happens to be under the cursor -- combing a
+           direction the user cannot see, which shows up as a kink in the flow
+           along the outline.  Walking in past the grazing samples puts the
+           endpoints on surface they were actually looking at.
+
+           An attractor is exempt: its first point has to stay on the singular
+           face the user started the drag from. */
+        uint32_t f = first, l = last;
+        while (f < l && facing[f] < MIN_STROKE_FACING) ++f;
+        while (l > f && facing[l] < MIN_STROKE_FACING) --l;
+        /* A stroke drawn entirely across a grazing band is still what was
+           asked for; only take the eroded ends if something is left. */
+        if (l > f) {
+            first = f;
+            last = l;
+        }
+    }
+
+    out.reserve((size_t) (last - first + 1));
+    for (uint32_t i = first; i <= last; ++i)
+        out.push_back(points[i]);
 
     if (!smooth_curve(mBVH, mRes.E2E(), out, attractor)) {
         out.clear();

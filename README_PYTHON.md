@@ -84,12 +84,13 @@ Open the URL it prints. Everything is in the panel down the left of the
 viewport: import a mesh, pick a brush, extract and download. Hovering any
 control explains what it does.
 
-The whole workflow is **Import mesh -> brush -> Extract -> Export**. There is
-no Apply step and no Solve step, because there is nothing to decide about
-either: importing solves, retargeting the resolution rebuilds and re-solves,
-every stroke re-solves with the stroke in place, deleting one re-solves without
-it, and extracting solves first if somehow nothing has. The field is a
-consequence of what you did, not a thing to remember to run.
+The whole workflow is **Import mesh -> brush -> Export**. There is no Apply
+step, no Solve step and no Extract step, because there is nothing to decide
+about any of them: importing solves, retargeting the resolution rebuilds and
+re-solves, every stroke re-solves with the stroke in place, deleting one
+re-solves without it, and asking to see or export the output extracts it from
+whatever the field is by then. The result is a consequence of what you did,
+not a sequence to remember.
 
 | Tool | What the stroke does |
 |---|---|
@@ -99,7 +100,10 @@ consequence of what you did, not a thing to remember to run.
 | Position attractor | Drags a position singularity along the stroke |
 
 Attractor strokes must *start* on an existing singularity — that is the one
-being dragged. The other two tools work anywhere on the surface.
+being dragged. The other two tools work anywhere on the surface, and a stroke
+may begin and end off the model: the rays that miss are dropped, and the ends
+are walked a little way inside the silhouette so they land on surface you were
+actually looking at rather than on a sliver facing away from you.
 
 Clicking a stroke's handle deletes it and re-solves.
 
@@ -116,8 +120,9 @@ a Blender user expects it:
 | `Esc` | Cancel the stroke being drawn |
 
 **Show** picks one surface or the other — the input you brush on, or the
-extracted result — never both, since they occupy the same space. Extracting
-switches to the output; drawing a stroke switches back.
+extracted result — never both, since they occupy the same space. Choosing the
+output builds one; drawing a stroke switches back to the input, and marks the
+result stale so the next look at it is rebuilt from the field you just changed.
 
 Every control lives **inside** the viewport, so embedding it in your own Gradio
 app is one call and you reproduce none of the UI:
@@ -174,11 +179,20 @@ hit points are smoothed into a surface curve:
 
 ```python
 curve = session.project_stroke(ray_origins, ray_directions)   # (N, 3) each
-if curve is not None:                       # None means a ray missed
+if curve is not None:                       # None means no ray hit anything
     session.add_stroke(imb.StrokeKind.ORIENTATION, curve)
     session.solve_orientations(-1); session.wait_solve()
     session.solve_positions(-1);    session.wait_solve()
 ```
+
+Rays that miss are dropped, and of what is left the longest uninterrupted run
+is kept — a sweep that leaves the model and returns is two strokes, not one
+with a shortcut through the gap. The ends are then walked inside the
+silhouette, past the samples that struck the surface edge-on, so a stroke drawn
+across the outline is anchored on surface the camera can see. Give the rays at
+a spacing that suits the model, not the pointer: the browser resamples a drag
+every few pixels before sending it, because a ray every few hundred pixels can
+pass either side of a model without ever hitting it.
 
 For a singularity attractor, project with `attractor=True` so the curve is
 routed along edge-adjacent faces, and start it on a singular face:

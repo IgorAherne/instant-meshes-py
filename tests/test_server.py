@@ -24,6 +24,7 @@ import pytest
 from instant_meshes_brush import protocol
 from instant_meshes_brush.protocol import MessageType
 from instant_meshes_brush.server import STATIC_URL, build_app
+from instant_meshes_brush import session_manager
 from instant_meshes_brush.session_manager import SessionRegistry
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
@@ -386,6 +387,95 @@ def test_a_click_that_erases_nothing_does_not_re_solve(client, torus) -> None:
             message.type == MessageType.STATUS and message.get("active")
             for message in socket.drain()
         ), "erasing nothing restarted the solver"
+
+
+@pytest.fixture
+def wide_phase_gap(monkeypatch):
+    """Stretch the pause the solve driver leaves between its two phases.
+
+    It polls every 50 ms in production while the stream ticks every 16, so
+    whether a given seam is sampled is close to a coin toss. Widening it turns
+    a race that a test would catch half the time into one it catches always.
+    """
+    monkeypatch.setattr(session_manager, "_SOLVE_POLL_SECONDS", 0.4)
+
+
+def test_singularities_are_published_once_a_solve_has_finished(
+    client, torus, wide_phase_gap
+) -> None:
+    """The regression for a red flash of defects that do not exist.
+
+    A "both" solve goes idle in the gap between its two phases -- the driver
+    polls every 50 ms, so the window is real and repeatable. Publishing markers
+    there crosses a freshly solved orientation field with a position field that
+    has not caught up, which reports hundreds of singularities that vanish a
+    moment later: a patch of red flickering on the model after every stroke.
+
+    The stream is subscribed at its maximum rate so that window is sampled;
+    at the default 15 Hz the whole solve can pass between two ticks.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        socket.send(MessageType.SUBSCRIBE, {"fps": 60})
+        load_mesh(socket, torus, vertex_count=2000)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        # Markers are the "it has all stopped" signal, so waiting for one is
+        # waiting for the solve -- and needs no assumption about frame order.
+        socket.expect(MessageType.SINGULARITIES, rounds=400, pause=0.02)
+        socket.drain()
+
+        origins, directions = equator_rays(torus)
+        socket.send(
+            MessageType.STROKE,
+            {"kind": 0, "solve": True},
+            {"ray_origins": origins, "ray_directions": directions},
+        )
+
+        settled = False
+        marker_sets = []
+        for attempt in range(400):
+            for message in socket.drain():
+                if message.type == MessageType.SINGULARITIES:
+                    marker_sets.append(
+                        (message.get("n_orientation"), message.get("n_position"))
+                    )
+                elif message.type == MessageType.STATUS:
+                    if not message.get("solving") and not message.get("active"):
+                        settled = True
+            if settled and marker_sets:
+                break
+            time.sleep(0.02)
+
+    assert marker_sets, "the finished solve never published its singularities"
+    # Every set published for one solve has to be the settled one; a set from
+    # the seam differs, and wildly. That is the whole symptom.
+    assert len(set(marker_sets)) == 1, f"markers changed mid-solve: {marker_sets}"
+
+
+def test_a_solve_invalidates_the_extraction(client, registry, torus) -> None:
+    """Brushing moves the field, so the mesh extracted from it is stale.
+
+    Nothing in the viewport re-extracts on its own any more -- the Extract
+    button is gone -- so holding on to it would mean an export after a stroke
+    silently writing the mesh from before it.
+    """
+    session_id = open_session(client)
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.FIELD)
+
+        socket.send(MessageType.EXTRACT, {})
+        socket.expect(MessageType.EXTRACTED)
+
+        session = registry.get(session_id)
+        assert session is not None and session.has_extraction
+
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.STATUS)
+
+    assert not session.has_extraction, "the solve kept a result built from the old field"
 
 
 def test_extract_solves_a_field_that_never_was(client, torus) -> None:

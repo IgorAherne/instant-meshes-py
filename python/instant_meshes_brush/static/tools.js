@@ -15,6 +15,9 @@ import { MessageType } from './protocol.js';
 /** Minimum travel, in CSS pixels, between two samples of a stroke. */
 const MIN_SAMPLE_PX = 6;
 
+/** Ceiling on the rays one stroke sends, whatever distance it covers. */
+const MAX_STROKE_RAYS = 512;
+
 /** A press that never travels further than this is a click, not a stroke. */
 const CLICK_SLOP_PX = 4;
 
@@ -69,6 +72,49 @@ export const TOOLS = [
 
 /** The first tool, which is what left-drag does until another is picked. */
 export const DEFAULT_TOOL = TOOLS[0].id;
+
+/**
+ * Walk a drag at a fixed screen-space spacing.
+ *
+ * The raw samples sit wherever pointermove happened to fire, which depends on
+ * how fast the pointer moved and on how hard the browser coalesced events: a
+ * quick flick across a model can arrive as three points hundreds of pixels
+ * apart, and rays that far apart pass either side of it without ever hitting.
+ * Walking the polyline the user actually drew ties the ray density to the
+ * stroke rather than to the input device, which is what lets the server find
+ * where the stroke crossed the silhouette.
+ *
+ * @param {Array<{clientX: number, clientY: number}>} samples
+ * @returns {Array<{clientX: number, clientY: number}>}
+ */
+export function densifyStroke(samples) {
+    if (samples.length < 2) return samples.slice();
+
+    let length = 0;
+    for (let i = 1; i < samples.length; ++i) {
+        length += Math.hypot(
+            samples[i].clientX - samples[i - 1].clientX,
+            samples[i].clientY - samples[i - 1].clientY
+        );
+    }
+    /* A long sweep widens its own spacing rather than sending thousands of
+       rays; the server smooths the curve along the surface regardless. */
+    const spacing = Math.max(MIN_SAMPLE_PX, length / MAX_STROKE_RAYS);
+
+    const out = [samples[0]];
+    for (let i = 1; i < samples.length; ++i) {
+        const a = samples[i - 1];
+        const b = samples[i];
+        const dx = b.clientX - a.clientX;
+        const dy = b.clientY - a.clientY;
+        const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / spacing));
+        for (let s = 1; s <= steps; ++s) {
+            const t = s / steps;
+            out.push({ clientX: a.clientX + dx * t, clientY: a.clientY + dy * t });
+        }
+    }
+    return out;
+}
 
 const TOOLS_BY_ID = new Map(TOOLS.map((tool) => [tool.id, tool]));
 
@@ -264,11 +310,12 @@ export class ToolController {
             return;
         }
 
-        const count = samples.length;
+        const path = densifyStroke(samples);
+        const count = path.length;
         const origins = new Float32Array(count * 3);
         const directions = new Float32Array(count * 3);
         for (let i = 0; i < count; ++i) {
-            const ray = this.viewer.screenRay(samples[i].clientX, samples[i].clientY);
+            const ray = this.viewer.screenRay(path[i].clientX, path[i].clientY);
             origins.set(ray.origin, i * 3);
             directions.set(ray.direction, i * 3);
         }

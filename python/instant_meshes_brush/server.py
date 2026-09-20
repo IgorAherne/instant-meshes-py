@@ -355,6 +355,10 @@ class _Connection:
         """
         last_version: Optional[Tuple[int, int]] = None
         was_active = False
+        #: Set the moment anything starts solving, paid off once everything has
+        #: stopped. See the comment at the send below for why it is not simply
+        #: "whenever the optimizer is idle".
+        markers_owed = False
         try:
             while True:
                 await asyncio.sleep(1.0 / self.fps)
@@ -371,22 +375,36 @@ class _Connection:
                     if await self._send_geometry_if_new():
                         last_version = None
                         was_active = False
+                        markers_owed = False
 
                     state = await self.session.status()
+                    solving = self.session.solving
                     await self._flush_solver_error()
                     # A solve that ends without touching the counters again --
                     # its last sweep may not have published -- still owes the
                     # client a final, exact frame: hence the idle transition.
                     settled = was_active and not state.active
                     was_active = state.active
+                    markers_owed = markers_owed or state.active or solving
 
                     if state.has_field and (state.version != last_version or settled):
                         last_version = await self._send_field()
 
+                    # Singularities only once EVERYTHING has stopped, not merely
+                    # when the optimizer is idle. It goes idle in the gap between
+                    # the orientation and position phases of one solve, and the
+                    # markers computed there come from a freshly solved
+                    # orientation field crossed with a position field that has
+                    # not caught up with it -- hundreds of defects that do not
+                    # exist, which flash red across the model and then vanish.
+                    if markers_owed and state.has_field and not state.active and not solving:
+                        markers_owed = False
+                        await self._send(_singularity_frame(await self.session.singularities()))
+
                     # The solver can go idle without any counter moving, so the
                     # run state gets its own change detector; without it a
                     # client is left believing a finished solve still runs.
-                    if (state.active, self.session.solving) != self._last_summary:
+                    if (state.active, solving) != self._last_summary:
                         await self._send_status()
                 except SessionError:
                     # A mesh being swapped in, or a session reaped mid-frame:
@@ -434,7 +452,7 @@ class _Connection:
         return True
 
     async def _send_field(self) -> Optional[Tuple[int, int]]:
-        """Send one field update plus, once the solver is idle, its markers."""
+        """Send one field update. Markers are the streamer's business."""
         snapshot = await self.session.snapshot_field()
         if snapshot is None:
             return None
@@ -446,8 +464,6 @@ class _Connection:
                 self.session.solving,
             )
         )
-        if not snapshot.state.active:
-            await self._send(_singularity_frame(await self.session.singularities()))
         return snapshot.state.version
 
     # -- replies -----------------------------------------------------------
@@ -672,6 +688,22 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
     app = FastAPI(title="instant-meshes-brush", lifespan=lifespan)
     app.state.registry = sessions
     app.mount(STATIC_URL, StaticFiles(directory=STATIC_DIR), name="imb-assets")
+
+    @app.middleware("http")
+    async def revalidate_assets(request, call_next):
+        """Let the assets be cached, but never used without asking first.
+
+        The viewer is an ES module graph: main.js imports the rest by relative
+        URL, so versioning the page's own script tag would not reach them. A
+        browser holding one stale module while the server has a new one gives a
+        viewer that half works -- which is what an upgrade of this package
+        would do. `no-cache` keeps the cache and only requires the ETag to be
+        checked, so the usual answer is a 304 and no bytes move.
+        """
+        response = await call_next(request)
+        if request.url.path.startswith(STATIC_URL + "/"):
+            response.headers["cache-control"] = "no-cache"
+        return response
 
     @app.get("/viewer", include_in_schema=False)
     async def viewer() -> FileResponse:

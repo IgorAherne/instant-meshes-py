@@ -716,6 +716,11 @@ class BrushSession:
         async with self._lock:
             core = self._require_ready()
             await self._stop_locked()
+            # The extraction on hand was read out of the field this is about to
+            # change. There is no Extract button in the viewport any more, so
+            # nothing else would notice; holding on to it means an export after
+            # a brush stroke silently writes the mesh from before it.
+            self._extracted = None
             # Start the first phase here rather than in the driver, so that a
             # caller which reports its status right after solve() returns
             # already sees an active solver -- and so a refused start raises.

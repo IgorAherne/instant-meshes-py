@@ -227,6 +227,31 @@ button.wide:last-child {
     background: var(--accent-hot);
 }
 
+/* A circled "i" that carries its explanation in a hover hint, for readouts
+   worth having but not worth a permanent row of the panel. */
+.info {
+    flex: 0 0 auto;
+    margin-left: auto;
+    width: 14px;
+    height: 14px;
+    border: 1px solid var(--muted);
+    border-radius: 50%;
+    color: var(--muted);
+    font-size: 9px;
+    font-weight: 700;
+    font-style: italic;
+    line-height: 12px;
+    text-align: center;
+    cursor: help;
+    user-select: none;
+}
+
+.info:hover,
+.info:focus-visible {
+    border-color: var(--text);
+    color: var(--text);
+}
+
 .link-button {
     background: none;
     border: 0;
@@ -511,6 +536,8 @@ input[type="range"] {
     font-size: 11.5px;
     line-height: 1.5;
     pointer-events: none;
+    /* Hints are set as text, so a blank line in one has to survive as one. */
+    white-space: pre-line;
 }
 
 /* ------------------------------------------------------------------ */

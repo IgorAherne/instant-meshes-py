@@ -31,8 +31,12 @@ if TYPE_CHECKING:  # the fixtures supply these at run time
 # ---------------------------------------------------------------------------
 
 
+#: How far outside the surface the test rays start, in mesh units.
+_RAY_STANDOFF = 2.0
+
+
 def _rays_onto_surface(
-    mesh: TorusMesh, u: np.ndarray, v: np.ndarray, standoff: float = 2.0
+    mesh: TorusMesh, u: np.ndarray, v: np.ndarray, standoff: float = _RAY_STANDOFF
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Rays that strike the torus at the given (u, v) angles.
 
@@ -55,6 +59,25 @@ def _diagonal_stroke_rays(
     """
     t = np.linspace(0.0, 1.0, samples)
     return _rays_onto_surface(mesh, 0.2 + 1.1 * t, -0.9 + 1.8 * t)
+
+
+def _stroke_targets(origins: np.ndarray, directions: np.ndarray) -> np.ndarray:
+    """The surface points ``_rays_onto_surface`` aimed each ray at.
+
+    Its rays start one standoff along the outward normal and shoot straight
+    back down it, so the target is the origin advanced by that standoff.
+    """
+    return origins + _RAY_STANDOFF * directions
+
+
+def _covers(points: np.ndarray, targets: np.ndarray) -> float:
+    """How far the furthest of ``points`` strays from the ``targets`` path.
+
+    ``smooth_curve`` walks the mesh between the projected samples and inserts
+    its own, so a curve cannot be compared sample for sample with the rays that
+    produced it -- only asked whether it stayed where they pointed.
+    """
+    return float(np.linalg.norm(points[:, None] - targets[None], axis=2).min(1).max())
 
 
 def _polyline_tangents(points: np.ndarray) -> np.ndarray:
@@ -413,15 +436,80 @@ def test_project_stroke_returns_none_when_the_rays_miss(
     assert solved_session.project_stroke(origins, -directions) is None
 
 
-def test_project_stroke_returns_none_when_one_ray_misses(
+def test_project_stroke_keeps_going_when_a_ray_misses(
     solved_session: imb.Session, torus: TorusMesh
 ) -> None:
-    """A half-projected stroke is worse than none, so any miss fails the lot."""
-    origins, directions = _diagonal_stroke_rays(torus)
-    origins = origins.copy()
-    origins[len(origins) // 2] += np.float32(50.0)
+    """A drag that starts beside the model still says where the flow should go.
 
-    assert solved_session.project_stroke(origins, directions) is None
+    The rays that miss are dropped rather than rejecting the whole stroke,
+    because in a browser -- unlike the desktop GUI -- a sweep across the
+    silhouette is the natural way to comb an edge of the model.
+    """
+    origins, directions = _diagonal_stroke_rays(torus, samples=30)
+    targets = _stroke_targets(origins, directions)
+    spacing = np.linalg.norm(np.diff(targets, axis=0), axis=1).max()
+
+    # Aim the first third into empty space, as a drag begun off the model does.
+    lead = len(origins) // 3
+    aimed_away = directions.copy()
+    aimed_away[:lead] = -aimed_away[:lead]
+
+    curve = solved_session.project_stroke(origins, aimed_away)
+
+    assert curve is not None
+    assert curve.faces.max() < len(solved_session.faces)
+    # What survived is the part the rays actually hit, and only that part.
+    assert _covers(curve.positions, targets[lead:]) < spacing
+    missed = np.linalg.norm(curve.positions - targets[0], axis=1).min()
+    assert missed > spacing, "the stroke covered ground no ray reached"
+
+
+def test_project_stroke_takes_the_longer_side_of_a_gap(
+    solved_session: imb.Session, torus: TorusMesh
+) -> None:
+    """Two runs of hits are two sweeps, not one with a shortcut between them."""
+    origins, directions = _diagonal_stroke_rays(torus, samples=30)
+    targets = _stroke_targets(origins, directions)
+    spacing = np.linalg.norm(np.diff(targets, axis=0), axis=1).max()
+
+    # A short run, a gap, then a long one: joining the two would draw a path
+    # across ground the rays found nothing on.
+    gapped = directions.copy()
+    gapped[4:12] = -gapped[4:12]
+
+    curve = solved_session.project_stroke(origins, gapped)
+
+    assert curve is not None
+    assert _covers(curve.positions, targets[12:]) < spacing, "the curve jumped the gap"
+
+
+def test_project_stroke_steps_inside_the_silhouette(
+    solved_session: imb.Session, torus: TorusMesh
+) -> None:
+    """Endpoints land on surface facing the viewer, not on the outline itself.
+
+    A stroke that ends exactly on the silhouette combs whichever sliver of
+    side-facing surface happens to be under the cursor -- a direction the user
+    cannot see, which shows up as a kink in the flow along the outline.
+    """
+    # Straight down the z axis, sweeping inward from beyond the outer radius.
+    # The first rays miss; the next graze the outer equator, whose normal lies
+    # in the xy plane and so is perpendicular to the view; by the tube's crown
+    # the surface faces the camera squarely.
+    view = np.array([0.0, 0.0, -1.0], np.float32)
+    outside = torus.major_radius + torus.minor_radius
+    x = np.linspace(outside * 1.2, torus.major_radius, 40, dtype=np.float32)
+    origins = np.stack([x, np.zeros_like(x), np.full_like(x, 9.0)], 1)
+    directions = np.tile(view, (len(x), 1))
+
+    curve = solved_session.project_stroke(origins, directions)
+
+    assert curve is not None
+    assert 2 <= len(curve) < len(x), "the rays that found nothing must be dropped"
+
+    facing = np.abs(curve.normals @ view)
+    assert facing[0] > 0.15, f"the stroke still begins on the silhouette ({facing[0]:.3f})"
+    assert facing[-1] > 0.15
 
 
 def test_project_stroke_lands_on_the_faces_it_reports(
