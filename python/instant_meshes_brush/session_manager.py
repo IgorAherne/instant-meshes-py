@@ -574,7 +574,12 @@ class BrushSession:
             return await self._preprocess_locked()
 
     async def set_config(self, values: Mapping[str, Any]) -> Geometry:
-        """Re-target the resolution. Strokes are dropped: indices change."""
+        """Re-target the resolution, carrying the brush strokes across.
+
+        The fields do not come with them -- the hierarchy they were solved on
+        is gone -- so a caller has to solve again, which also means an
+        attractor's effect is lost where a stroke's is not.
+        """
         async with self._lock:
             self._require_ready()
             await self._stop_locked()
@@ -696,6 +701,16 @@ class BrushSession:
         """The persistent strokes, as ``{'id', 'kind', 'n_points'}`` records."""
         core = self._require_ready()
         return await self._call(_read_strokes, core)
+
+    async def stroke_curves(self) -> List[StrokeResult]:
+        """Every surviving stroke, curve included.
+
+        A rebuild re-projects the strokes onto the new mesh, so the curves a
+        client was drawing are no longer the curves the solver is using; this
+        is how it gets the replacements.
+        """
+        core = self._require_ready()
+        return await self._call(_read_stroke_curves, core)
 
     # -- solving -----------------------------------------------------------
 
@@ -939,6 +954,24 @@ def _clear_strokes(core: "_core.Session") -> int:
     count = len(core.strokes)
     core.clear_strokes()
     return count
+
+
+#: StrokeKind values as the wire names them.
+_STROKE_KIND_NAMES = {
+    int(_core.StrokeKind.ORIENTATION): "orientation",
+    int(_core.StrokeKind.EDGE): "edge",
+}
+
+
+def _read_stroke_curves(core: "_core.Session") -> List[StrokeResult]:
+    return [
+        _stroke_result(
+            int(stroke["id"]),
+            _STROKE_KIND_NAMES.get(int(stroke["kind"]), "orientation"),
+            stroke["curve"],
+        )
+        for stroke in core.strokes
+    ]
 
 
 def _read_strokes(core: "_core.Session") -> List[Dict[str, Any]]:

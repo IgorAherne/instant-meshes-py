@@ -60,6 +60,9 @@ function targetToSlider(value) {
  */
 const CONFIG_SETTLE_MS = 500;
 
+/** How long an error holds the status line before the tool hint returns. */
+const ERROR_LINGER_MS = 6000;
+
 function byId(id) {
     const element = document.getElementById(id);
     if (!element) throw new Error(`the viewer document is missing #${id}`);
@@ -142,6 +145,7 @@ export class Panel {
             link: byId('link'),
             open: byId('btn-open'),
             file: byId('file-input'),
+            meshLine: byId('mesh-line'),
             meshName: byId('mesh-name'),
             meshStats: byId('mesh-stats'),
 
@@ -154,7 +158,6 @@ export class Panel {
 
             strokeCount: byId('stroke-count'),
             clear: byId('btn-clear'),
-            singularities: byId('singularities'),
 
             outputStats: byId('output-stats'),
             format: byId('format'),
@@ -165,7 +168,6 @@ export class Panel {
 
             toolName: byId('tool-name'),
             statusText: byId('status-text'),
-            hint: byId('hint'),
         };
 
         this.el.file.setAttribute('accept', MESH_ACCEPT);
@@ -177,8 +179,14 @@ export class Panel {
         this._appliedConfig = null;
         this._settleTimer = 0;
 
+        /* The one status line shows the selected brush's help by default and
+           borrows the space for a message, so both have to be remembered. */
+        this._hint = this.el.statusText.textContent;
+        this._message = null;
+        this._isError = false;
+        this._statusTimer = 0;
+
         this.el.targetRange.value = targetToSlider(this.el.target.value);
-        this.showFieldState({ orientation: null, position: null });
         this._bind();
         this.setSolving(false);
         this.setReady(false);
@@ -365,13 +373,11 @@ export class Panel {
         this._appliedConfig = this.readConfig();
     }
 
-    showMesh({ name, vertices, faces, scale, targetVertices }) {
+    showMesh({ name, vertices }) {
+        this.el.meshLine.hidden = false;
         this.el.meshName.textContent = name || 'Untitled mesh';
-        this.el.meshStats.hidden = false;
-        this.el.meshStats.textContent =
-            `Input  ${vertices.toLocaleString()} v / ${faces.toLocaleString()} tri` +
-            `   ·   target ${(targetVertices || 0).toLocaleString()} v,` +
-            ` edge ${scale.toPrecision(3)}`;
+        this.el.meshName.title = name || '';
+        this.el.meshStats.textContent = `${vertices.toLocaleString()} v`;
     }
 
     showStrokes(count) {
@@ -380,40 +386,7 @@ export class Panel {
         this.el.clear.disabled = count === 0;
     }
 
-    /**
-     * Singularity counts, as the hover text of the info marker.
-     *
-     * They are genuinely useful and genuinely meaningless to somebody meeting
-     * the tool for the first time, so they get one character of panel instead
-     * of two rows.  Either value may be omitted to leave it as it was.
-     */
-    showFieldState({ orientation, position }) {
-        if (orientation !== undefined) this._orientationCount = orientation;
-        if (position !== undefined) this._positionCount = position;
-
-        const show = (value) =>
-            typeof value === 'number' ? value.toLocaleString() : 'not solved yet';
-        this.el.singularities.dataset.hint =
-            'Singularities are the points where the grid cannot stay regular -- ' +
-            'where three or five edges meet instead of four. Every closed surface ' +
-            'needs some; they are the red and blue dots on the model, and the ' +
-            'attractor brushes drag them somewhere less conspicuous.\n\n' +
-            `Orientation field:  ${show(this._orientationCount)}\n` +
-            `Position field:  ${show(this._positionCount)}`;
-        this.el.singularities.setAttribute(
-            'aria-label',
-            `Singularities: ${show(this._orientationCount)} orientation, ` +
-            `${show(this._positionCount)} position`
-        );
-    }
-
-    /**
-     * The extracted mesh's size, or null once it is stale.
-     *
-     * It sits beside the input counts on the stage rather than in the panel:
-     * the two only mean anything next to each other, and with "Pure quad mesh"
-     * on, an output four times the target reads as a contradiction alone.
-     */
+    /** The extracted mesh's size, or null once it is stale. */
     showOutput(counts) {
         const line = this.el.outputStats;
         if (!counts) {
@@ -422,20 +395,24 @@ export class Panel {
         }
         line.hidden = false;
         line.textContent =
-            `Output  ${counts.vertices.toLocaleString()} v /` +
+            `${counts.vertices.toLocaleString()} v /` +
             ` ${counts.faces.toLocaleString()} faces`;
     }
 
-    showDownload(url, filename, bytes) {
+    /**
+     * Start the download of an exported file.
+     *
+     * Pressing Export is the whole request; a green button that then has to be
+     * pressed a second time is a step, not a confirmation. The link exists
+     * only to be clicked from here, which is what carries the filename the
+     * server chose through to the browser's downloads.
+     */
+    startDownload(url, filename) {
+        if (!url) return;
         const link = this.el.download;
-        if (!url) {
-            link.hidden = true;
-            return;
-        }
         link.href = url;
         link.download = filename || 'mesh';
-        link.textContent = `Download ${filename}${bytes ? ` (${formatBytes(bytes)})` : ''}`;
-        link.hidden = false;
+        link.click();
     }
 
     showTool(tool) {
@@ -443,7 +420,10 @@ export class Panel {
             button.setAttribute('aria-checked', String(button.dataset.tool === tool.id));
         }
         this.el.toolName.textContent = tool.label;
-        this.el.hint.textContent = tool.hint;
+        this._hint = tool.hint;
+        /* A message from the previous tool is not about this one. */
+        this.setStatus(null);
+        this._renderStatus();
     }
 
     showLink(status) {
@@ -471,14 +451,32 @@ export class Panel {
         this.setSolving(Boolean(this._solving));
     }
 
+    /**
+     * Put a message on the status line, or pass null to go back to the hint.
+     *
+     * The line is shared: normally it explains what the selected brush does,
+     * which is what somebody staring at the viewport actually needs, and a
+     * message borrows it for as long as it is worth reading. An error is never
+     * silently cleared by a passing "it went idle" -- it times out instead, so
+     * it cannot be gone before it was seen.
+     */
     setStatus(message, isError) {
-        this.el.statusText.textContent = message;
-        this.el.statusText.classList.toggle('error', Boolean(isError));
-    }
-}
+        if (!message && this._isError) return;
 
-function formatBytes(bytes) {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        clearTimeout(this._statusTimer);
+        this._message = message || null;
+        this._isError = Boolean(message && isError);
+        if (this._isError) {
+            this._statusTimer = setTimeout(() => {
+                this._isError = false;
+                this.setStatus(null);
+            }, ERROR_LINGER_MS);
+        }
+        this._renderStatus();
+    }
+
+    _renderStatus() {
+        this.el.statusText.textContent = this._message || this._hint;
+        this.el.statusText.classList.toggle('error', this._isError);
+    }
 }

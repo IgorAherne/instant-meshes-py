@@ -126,8 +126,12 @@ public:
      * adjacency structures, normals, dual areas, the multiresolution hierarchy
      * and the BVH.  Mirrors Viewer::loadInput / batch_process.
      *
-     * Safe to call again with a different Config to re-target the resolution;
-     * strokes are dropped because vertex indices change.
+     * Safe to call again with a different Config to re-target the resolution.
+     * Brush strokes are carried over: they are paths in space, so rebuilding
+     * only invalidates the face indices inside them, which reprojectStrokes()
+     * restores.  The solved fields are not -- they are discarded and have to
+     * be solved again, which also means an attractor's effect does not
+     * survive: it moved a singularity in a field that no longer exists.
      */
     void preprocess(const Config &cfg, const ProgressCallback &progress = ProgressCallback());
 
@@ -290,6 +294,30 @@ public:
 private:
     /// Rebuild CQ/CO/CQw/COw from mStrokes. Mirrors Viewer::refreshStrokes.
     void applyConstraints();
+
+    /**
+     * Carry strokes across a rebuild.
+     *
+     * The curve is a path in space and preprocess() only refines the surface
+     * it was drawn on, so re-projecting it costs one short ray per point --
+     * far better than the alternative, which is losing the user's work every
+     * time they nudge the target resolution.  A point whose surface has gone
+     * is dropped, and a stroke left with fewer than two is.
+     */
+    void reprojectStrokes(const std::vector<Stroke> &strokes);
+
+    /**
+     * Re-root an attractor stroke on the singularity it was aimed at.
+     *
+     * A singularity occupies one triangle of the working mesh, while the
+     * marker drawn over it is many times that size, so a drag that starts on
+     * the dot usually does not start on the face -- and the move then does
+     * nothing.  Returns `curve` unchanged when it already starts on one, or
+     * when nothing is near enough to have been meant.
+     */
+    std::vector<CurvePoint> snapToSingularity(const std::vector<CurvePoint> &curve,
+                                              bool orientation) const;
+
     void requireReady() const;
 
     MatrixXf mV;                 ///< input vertices, consumed by preprocess()

@@ -91,27 +91,26 @@ function concatFloat32(chunks) {
 }
 
 /**
- * The server reports orientation and position singularities as two separate
- * marker sets; the viewer draws one point cloud, so they are concatenated.
+ * The two kinds of singularity, kept apart.
+ *
+ * They look identical on screen and each attractor moves only its own, so a
+ * viewer that merges them is showing the user dots their brush cannot touch.
  * Copying also releases the frame buffer the decoded views would otherwise pin.
  */
 function decodeSingularities(arrays) {
-    const positions = [];
-    const colors = [];
-
+    const sets = {};
     for (const field of ['orientation', 'position']) {
         const p = pickArray(arrays, `${field}_positions`);
         const c = pickArray(arrays, `${field}_colors`);
-        if (!p || !c) continue;
         /* Keep only whole markers, which need both a centre and a colour. */
-        const paired = Math.min(p.length, c.length);
+        const paired = p && c ? Math.min(p.length, c.length) : 0;
         const count = paired - (paired % 3);
-        if (count === 0) continue;
-        positions.push(p.subarray(0, count));
-        colors.push(c.subarray(0, count));
+        sets[field] = {
+            positions: concatFloat32(count ? [p.subarray(0, count)] : []),
+            colors: concatFloat32(count ? [c.subarray(0, count)] : []),
+        };
     }
-
-    return { positions: concatFloat32(positions), colors: concatFloat32(colors) };
+    return sets;
 }
 
 function describeStroke(header) {
@@ -144,8 +143,9 @@ class App {
         this.hasOutput = false;
 
         this.tools = new ToolController(viewer, connection, {
-            onToolChange: (tool) => this.panel.showTool(tool),
+            onToolChange: (tool) => this._onToolChange(tool),
             onNotice: (message) => this.panel.setStatus(message, false),
+            onUndo: () => this._undoStroke(),
         });
 
         viewer.onFrame = () => this._drain();
@@ -153,10 +153,46 @@ class App {
         this._bindPanel();
         this._bindConnection();
 
-        for (const name of ['grid', 'strokes', 'singularities']) {
+        for (const name of ['grid', 'singularities']) {
             this.viewer.setLayerVisible(name, this.panel.layerState(name));
         }
+        /* Strokes have no switch: they are the user's own marks, and hiding
+           them can only make the viewport lie about what is constraining the
+           field. Deleting one is a click on its handle. */
+        this.viewer.setLayerVisible('strokes', true);
         this._applySurface(this.panel.surface());
+    }
+
+    /**
+     * An attractor drags a singularity, so it needs them on screen.
+     *
+     * They are off by default -- a hundred coloured dots mean nothing until
+     * you know what they are -- but picking the brush that moves one is as
+     * clear a statement of intent as ticking the box would be.
+     */
+    _onToolChange(tool) {
+        this.panel.showTool(tool);
+        this._apply(() =>
+            this.viewer.setSingularityFilter(tool.singularities || null)
+        );
+        if (tool.singularities) this._setLayer('singularities', true);
+    }
+
+    /**
+     * Undo the most recent stroke.
+     *
+     * Only strokes: they are the destructive thing here, and everything else
+     * the viewport does is either reversible by doing it again or is simply a
+     * view. Erasing re-solves, exactly as drawing did.
+     */
+    _undoStroke() {
+        const ids = [...this.strokes.keys()];
+        if (ids.length === 0) {
+            this.panel.setStatus('Nothing to undo', false);
+            return;
+        }
+        this.connection.send(MessageType.ERASE_STROKE, { stroke_id: ids[ids.length - 1] });
+        this.panel.setStatus('Undid the last stroke', false);
     }
 
     /* -------------------------------------------------------------- */
@@ -192,9 +228,7 @@ class App {
         const singularities = pending.singularities;
         if (singularities) {
             pending.singularities = null;
-            this._apply(() =>
-                this.viewer.setSingularities(singularities.positions, singularities.colors)
-            );
+            this._apply(() => this.viewer.setSingularities(singularities));
         }
 
         const extracted = pending.extracted;
@@ -305,7 +339,6 @@ class App {
         if (!this.hasOutput) return;
         this.hasOutput = false;
         this.panel.showOutput(null);
-        this.panel.showDownload(null);
         this.pending.extracted = { wireframe: null, colors: null, surface: null };
     }
 
@@ -332,7 +365,6 @@ class App {
                 throw new Error(detail.detail || `upload failed (${response.status})`);
             }
             /* The GEOMETRY frame that follows fills in the rest. */
-            this.panel.showDownload(null);
             this.panel.showOutput(null);
         } catch (err) {
             this.panel.setStatus(err.message, true);
@@ -368,10 +400,10 @@ class App {
                 rosy: header.rosy ?? 4,
                 posy: this.posy,
             };
-            /* Session::preprocess drops every stroke, because the vertex indices
-               they were projected onto no longer exist.  Forget them here too,
-               so ribbons built for the previous mesh cannot survive it; the
-               STROKE_LIST that follows repopulates whatever really remains. */
+            /* A rebuild re-projects the strokes onto the new mesh, so these
+               ribbons describe a surface that no longer exists even where the
+               stroke itself survived. Drop them; the STROKE_RESULT frames that
+               follow a rebuild carry the replacements. */
             this.strokes.clear();
             this.pending.strokes = true;
             this.pending.extracted = { wireframe: null, colors: null, surface: null };
@@ -384,9 +416,7 @@ class App {
                 scale: header.scale,
                 targetVertices: header.config ? header.config.vertex_count : 0,
             });
-            this.panel.showFieldState({ orientation: null, position: null });
             this.panel.showOutput(null);
-            this.panel.showDownload(null);
             this.panel.setReady(true);
             this.hasOutput = false;
             /* The grid is the point of importing a mesh, and solving it is the
@@ -427,9 +457,6 @@ class App {
 
         conn.on(MessageType.SINGULARITIES, (header, arrays) => {
             this.pending.singularities = decodeSingularities(arrays);
-            const orientation = header.n_orientation;
-            const position = header.n_position;
-            this.panel.showFieldState({ orientation, position });
         });
 
         conn.on(MessageType.EXTRACTED, (header, arrays) => {
@@ -462,7 +489,9 @@ class App {
         });
 
         conn.on(MessageType.EXPORT_READY, (header) => {
-            this.panel.showDownload(header.url, header.filename, header.bytes);
+            /* Pressing Export is the whole request, so the file starts
+               arriving rather than waiting behind a second button. */
+            this.panel.startDownload(header.url, header.filename);
             this.panel.setStatus(`Exported ${header.filename}`, false);
         });
 
@@ -486,22 +515,21 @@ class App {
         this.panel.setSolving(running);
         /* The field has moved, so whatever was extracted from the old one no
            longer describes it. Once per solve, not once per status frame. */
-        if (running && !this._wasSolving) this._invalidateOutput();
+        if (running && !this._wasSolving) {
+            this._invalidateOutput();
+            /* Dropping the output while it is the surface on screen would
+               leave an empty stage -- which is what erasing a stroke while
+               looking at the result used to do. */
+            if (this.panel.surface() === 'output') this._setSurface('mesh');
+        }
         this._wasSolving = running;
 
         if (header.config) this.panel.showConfig(header.config);
 
-        const versions = `Q ${header.iterations_q ?? 0} / O ${header.iterations_o ?? 0}`;
-        if (!running) {
-            this.panel.setStatus(`Idle -- ${versions}`, false);
-            return;
-        }
-        /* The progress bar is gone -- it cost a row of the stage to say this. */
-        const percent = Math.round(Math.min(1, Math.max(0, header.progress || 0)) * 100);
-        this.panel.setStatus(
-            `Solving level ${header.level ?? 0}, ${percent}% -- ${versions}`,
-            false
-        );
+        /* The status line is the brush's help by default, and the solver's
+           iteration counters meant nothing to anyone reading it. Only the fact
+           that it is working is worth the space, and only while it is. */
+        this.panel.setStatus(running ? 'Solving the field...' : null, false);
     }
 }
 

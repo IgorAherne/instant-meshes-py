@@ -154,6 +154,18 @@ function boundingSphere(positions) {
     return { center, radius: Math.max(Math.sqrt(radiusSq), 1e-6) };
 }
 
+function concat(chunks) {
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const out = new Float32Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
+}
+
 /** A placeholder an overlay object can carry until its first real update. */
 function emptyGeometry() {
     const geometry = new THREE.BufferGeometry();
@@ -578,6 +590,9 @@ export class Viewer {
 
         this._field = null;
         this.mesh = null;
+        /* Marker sets per field, plus which of them to draw. */
+        this._singularities = null;
+        this._singularityFilter = null;
         this._scale = 1;
         this._avgEdge = 1;
         /* The working mesh's bounding sphere, kept so the F key can reframe. */
@@ -713,7 +728,7 @@ export class Viewer {
            describes a different surface.  Drop them rather than leave them
            floating until the solver happens to publish replacements. */
         this.setStrokes([]);
-        this.setSingularities(null, null);
+        this.setSingularities(null);
         this.setExtracted(null, null);
 
         this._field = new FieldMaterial({ positions, normals, indices, scale, rosy, posy });
@@ -830,22 +845,51 @@ export class Viewer {
     /* -------------------------------------------------------------- */
 
     /**
-     * @param {Float32Array} positions  (n, 3) marker centres in mesh space
-     * @param {Float32Array} colors     (n, 3) linear RGB in [0, 1]
+     * @param {{orientation: {positions: Float32Array, colors: Float32Array},
+     *          position: {positions: Float32Array, colors: Float32Array}}|null} sets
+     *        marker centres in mesh space and linear RGB in [0, 1], per field
      */
-    setSingularities(positions, colors) {
+    setSingularities(sets) {
+        this._singularities = sets;
+        this._rebuildSingularities();
+    }
+
+    /**
+     * Which field's singularities to draw: 'orientation', 'position', or null
+     * for both.
+     *
+     * The two look identical and each attractor moves only its own, so while
+     * one of those brushes is in hand the other field's markers are dots the
+     * user can aim at and nothing will happen.
+     */
+    setSingularityFilter(field) {
+        if (this._singularityFilter === field) return;
+        this._singularityFilter = field;
+        this._rebuildSingularities();
+    }
+
+    _rebuildSingularities() {
+        const sets = this._singularities;
+        const wanted = this._singularityFilter
+            ? [this._singularityFilter]
+            : ['orientation', 'position'];
+
+        const positions = [];
+        const colors = [];
+        for (const field of wanted) {
+            const set = sets && sets[field];
+            if (set && set.positions.length) {
+                positions.push(set.positions);
+                colors.push(set.colors);
+            }
+        }
+
         const geometry = new THREE.BufferGeometry();
-        const count = positions ? Math.floor(positions.length / 3) : 0;
-        geometry.setAttribute(
-            'position',
-            new THREE.BufferAttribute(count ? positions : new Float32Array(0), 3)
-        );
-        geometry.setAttribute(
-            'color',
-            new THREE.BufferAttribute(count ? colors : new Float32Array(0), 3)
-        );
+        geometry.setAttribute('position', new THREE.BufferAttribute(concat(positions), 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(concat(colors), 3));
         replaceGeometry(this.singularityMarkers, geometry);
-        this.singularityMarkers.visible = count > 0 && this._layers.singularities;
+        this.singularityMarkers.visible =
+            hasVertices(this.singularityMarkers) && this._layers.singularities;
     }
 
     /**

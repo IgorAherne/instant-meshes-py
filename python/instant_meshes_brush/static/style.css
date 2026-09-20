@@ -227,29 +227,24 @@ button.wide:last-child {
     background: var(--accent-hot);
 }
 
-/* A circled "i" that carries its explanation in a hover hint, for readouts
-   worth having but not worth a permanent row of the panel. */
-.info {
-    flex: 0 0 auto;
-    margin-left: auto;
-    width: 14px;
-    height: 14px;
-    border: 1px solid var(--muted);
-    border-radius: 50%;
-    color: var(--muted);
-    font-size: 9px;
-    font-weight: 700;
-    font-style: italic;
-    line-height: 12px;
-    text-align: center;
-    cursor: help;
-    user-select: none;
+/* Filename and size under the Import button: the name takes what is left. */
+#mesh-line {
+    gap: 8px;
+    margin-top: 7px;
+    font-size: 11px;
 }
 
-.info:hover,
-.info:focus-visible {
-    border-color: var(--text);
+#mesh-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--text);
+}
+
+#mesh-stats {
+    flex: 0 0 auto;
 }
 
 .link-button {
@@ -273,7 +268,10 @@ button.wide:last-child {
     margin: 7px 0 5px;
 }
 
-.field > span {
+.field > span,
+.field > label {
+    flex: 1 1 auto;
+    min-width: 0;
     color: var(--muted);
 }
 
@@ -281,6 +279,22 @@ button.wide:last-child {
 .field select {
     width: 78px;
     flex: 0 0 auto;
+}
+
+/* Two controls sharing a row leave the label less, so both give some back. */
+.field > input[type="number"]:has(+ select) {
+    width: 56px;
+}
+
+.field > input[type="number"] + select {
+    width: 62px;
+    padding-right: 2px;
+}
+
+/* Pushes a control to the far end of its row. Written to out-specify the
+   shorthand margins the controls themselves set, whatever order they load in. */
+.row > .push {
+    margin-left: auto;
 }
 
 .check {
@@ -328,28 +342,6 @@ input[type="range"] {
 .stats dd {
     margin: 0;
     text-align: right;
-}
-
-.download {
-    display: block;
-    margin-top: 6px;
-    padding: 5px 8px;
-    border-radius: 4px;
-    background: #2f4a2f;
-    border: 1px solid #3f6a3f;
-    color: #cfe8cf;
-    text-align: center;
-    text-decoration: none;
-}
-
-.download:hover {
-    background: #395a39;
-}
-
-/* The rule above out-specifies the `hidden` attribute's display:none, which
-   left a Download link offering a file that had never been written. */
-.download[hidden] {
-    display: none;
 }
 
 /* ------------------------------------------------------------------ */
@@ -466,11 +458,6 @@ input[type="range"] {
     white-space: nowrap;
 }
 
-#readout .strong {
-    color: var(--text);
-    font-weight: 600;
-}
-
 #status {
     display: flex;
     align-items: baseline;
@@ -553,9 +540,9 @@ input[type="range"] {
         font-size: 11px;
     }
 
-    /* The tool help is the first thing to go: it is the longest line and the
-       one a returning user needs least. */
-    #hint {
+    /* The tool help is the first thing to go: it is the longest thing on
+       the status line and the one a returning user needs least. */
+    #status-text {
         display: none;
     }
 }

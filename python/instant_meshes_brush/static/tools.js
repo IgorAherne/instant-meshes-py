@@ -58,15 +58,19 @@ export const TOOLS = [
     },
     {
         id: 'orient-attractor',
-        label: 'Orientation Singularity Attractor',
+        label: 'Orientation Attractor',
         kind: 'attractor_orientation',
-        hint: 'Drag from an orientation singularity to move, create or cancel it.',
+        /* Only this field's markers are draggable by this brush, so only this
+           field's markers are shown while it is selected. */
+        singularities: 'orientation',
+        hint: 'Drag from one of the dots to pull that singularity along the stroke.',
     },
     {
         id: 'pos-attractor',
-        label: 'Position Singularity Attractor',
+        label: 'Position Attractor',
         kind: 'attractor_position',
-        hint: 'Drag from a position singularity to move, create or cancel it.',
+        singularities: 'position',
+        hint: 'Drag from one of the dots to pull that singularity along the stroke.',
     },
 ];
 
@@ -130,11 +134,16 @@ export class ToolController {
      * @param {{onToolChange?: (tool: object) => void,
      *          onNotice?: (message: string) => void}} callbacks
      */
-    constructor(viewer, connection, { onToolChange = null, onNotice = null } = {}) {
+    constructor(
+        viewer,
+        connection,
+        { onToolChange = null, onNotice = null, onUndo = null } = {}
+    ) {
         this.viewer = viewer;
         this.connection = connection;
         this._onToolChange = onToolChange;
         this._onNotice = onNotice;
+        this._onUndo = onUndo;
 
         this._tool = TOOLS_BY_ID.get(DEFAULT_TOOL);
         this._pointerId = null;
@@ -263,11 +272,26 @@ export class ToolController {
     }
 
     _onKeyDown(event) {
+        /* This viewer is an iframe inside somebody else's page, which may well
+           have its own undo. Keys are only ours while the focus is in here --
+           click away and Ctrl+Z goes back to the host, click in and it returns. */
+        if (!document.hasFocus()) return;
+
+        const focused = document.activeElement;
+        const typing = Boolean(focused && focused.matches('input, select, textarea'));
+
+        if ((event.ctrlKey || event.metaKey) && !event.altKey &&
+            event.key.toLowerCase() === 'z') {
+            /* Let the text box have its own undo while it is being typed in. */
+            if (typing) return;
+            event.preventDefault();
+            if (this._onUndo) this._onUndo();
+            return;
+        }
+
         /* Never while a control has focus: F is a character in the vertex
            count box, and Ctrl-F belongs to the browser. */
-        if (event.ctrlKey || event.metaKey || event.altKey) return;
-        const focused = document.activeElement;
-        if (focused && focused.matches('input, select, textarea')) return;
+        if (event.ctrlKey || event.metaKey || event.altKey || typing) return;
 
         if (event.key === 'Escape') {
             if (this._pointerId === null) return;

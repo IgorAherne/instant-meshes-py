@@ -99,13 +99,25 @@ not a sequence to remember.
 | Orientation attractor | Drags an orientation singularity along the stroke |
 | Position attractor | Drags a position singularity along the stroke |
 
-Attractor strokes must *start* on an existing singularity — that is the one
-being dragged. The other two tools work anywhere on the surface, and a stroke
-may begin and end off the model: the rays that miss are dropped, and the ends
-are walked a little way inside the silhouette so they land on surface you were
+An attractor stroke starts on the singularity it drags. Selecting one of those
+brushes turns the markers on and shows **only** the field it can move — the two
+kinds look identical, and half of them would otherwise be dots your brush
+cannot touch. Aim is forgiving: a singularity is one triangle under a marker
+many times its size, so a start near one is treated as a start on it.
+
+The comb and the edge brush work anywhere on the surface, and a stroke may
+begin and end off the model: the rays that miss are dropped, and the ends are
+walked a little way inside the silhouette so they land on surface you were
 actually looking at rather than on a sliver facing away from you.
 
-Clicking a stroke's handle deletes it and re-solves.
+Clicking a stroke's handle deletes it and re-solves, as does `Ctrl+Z` — which
+only listens while the focus is inside the viewport, so a host page keeps its
+own undo.
+
+Re-targeting the resolution keeps the strokes: they are paths in space, and the
+rebuild only refines the surface they were drawn on. It does throw away the
+solved field, so an attractor's effect does not survive a re-target the way a
+brush stroke does.
 
 The left button always belongs to the selected brush, so navigation lives where
 a Blender user expects it:
@@ -195,13 +207,18 @@ every few pixels before sending it, because a ray every few hundred pixels can
 pass either side of a model without ever hitting it.
 
 For a singularity attractor, project with `attractor=True` so the curve is
-routed along edge-adjacent faces, and start it on a singular face:
+routed along edge-adjacent faces, and start it at the singularity you want to
+drag — near it is enough, since `apply_attractor` re-roots the stroke on the
+nearest one within a couple of edge lengths:
 
 ```python
-face = next(iter(session.orientation_singularities))
 curve = session.project_stroke(origins, directions, True)
 session.apply_attractor(curve, orientation=True)
+session.wait_solve()
 ```
+
+The move is a local edit of a solved field, so re-solving from scratch — which
+is what re-targeting the resolution does — undoes it.
 
 ### Solving live
 

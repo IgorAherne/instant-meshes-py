@@ -47,6 +47,10 @@
               Import mesh
             </button>
             <input type="file" id="file-input" accept=".obj,.ply,.stl,.off" hidden />
+            <p class="row muted" id="mesh-line" hidden>
+              <span id="mesh-name"></span>
+              <span id="mesh-stats"></span>
+            </p>
           </section>
 
           <!-- Tools ------------------------------------------------------ -->
@@ -77,12 +81,9 @@
             <div class="row">
               <span id="stroke-count" class="muted">No strokes</span>
               <button id="btn-clear" class="link-button" disabled
-                data-hint="Remove every stroke and re-solve without them. To delete one stroke, click the dot at its start.">
+                data-hint="Remove every stroke and re-solve without them. To delete one stroke, click the dot at its start; Ctrl+Z undoes the last one.">
                 Clear
               </button>
-              <!-- The counts are worth having and worth nothing to a first-time
-                   user, so they live one hover away instead of two panel rows. -->
-              <span id="singularities" class="info" tabindex="0" role="note">i</span>
             </div>
           </section>
 
@@ -102,10 +103,12 @@
                 Output mesh
               </button>
             </div>
-            <label class="check"><input type="checkbox" data-layer="grid" checked
-              data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
-            <label class="check"><input type="checkbox" data-layer="strokes" checked /><span>Brush strokes</span></label>
-            <label class="check"><input type="checkbox" data-layer="singularities" checked /><span>Singularities</span></label>
+            <div class="row">
+              <label class="check"><input type="checkbox" data-layer="grid" checked
+                data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
+              <label class="check push"><input type="checkbox" data-layer="singularities"
+                data-hint="The red and blue dots marking where the grid cannot stay regular -- where three or five edges meet instead of four. Picking either attractor brush turns them on, since those drag a marker you have to be able to see." /><span>Singularities</span></label>
+            </div>
           </section>
 
           <!-- Output ----------------------------------------------------- -->
@@ -121,36 +124,37 @@
             <label class="field" for="target">
               <span>Target vertex count</span>
               <input type="number" id="target" min="500" max="60000" step="10" value="1000"
-                data-hint="Roughly how many vertices the output should have, between 500 and 60,000. Lower means bigger quads. The model is rebuilt and re-solved a moment after you stop changing it, which clears any strokes -- the vertices they were drawn on no longer exist." />
+                data-hint="Roughly how many vertices the output should have, between 500 and 60,000. Lower means bigger quads. The model is rebuilt and re-solved a moment after you stop changing it; your strokes are carried across, so it is safe to keep adjusting." />
             </label>
             <!-- Logarithmic; see panel.js. Its own units are slider steps, not
                  vertices, so the useful low end is not crushed into 5 pixels. -->
             <input type="range" id="target-range" min="0" max="1000" step="1" value="0" />
 
             <label class="check"><input type="checkbox" id="opt-extrinsic" checked
-              data-hint="Smooth the field in world space rather than along the surface. On is the default and is usually what you want." /><span>Extrinsic</span></label>
+              data-hint="Smooth the flow through space rather than across the surface -- 'extrinsic' smoothing. It gives a calmer, more even grid and is what you normally want; turning it off lets the flow follow the surface's own curvature more closely, at the cost of more swirl." /><span>Smoother flow</span></label>
             <label class="check"><input type="checkbox" id="opt-boundaries"
-              data-hint="Make edge loops run parallel to open boundaries of the model." /><span>Align to boundaries</span></label>
+              data-hint="Make edge loops run parallel to the open edges of the model, where it has any." /><span>Follow the boundaries</span></label>
             <label class="check"><input type="checkbox" id="opt-creases"
               data-hint="Keep sharp edges sharp instead of smoothing across them." /><span>Sharp creases</span></label>
             <label class="check"><input type="checkbox" id="opt-pure-quad"
-              data-hint="Subdivide so the result contains quads only, with no triangles. Roughly quadruples the vertex and face count, which is why the output can be much larger than the target above." /><span>Pure quad mesh</span></label>
-            <label class="field" for="smoothing">
-              <span>Smoothing</span>
+              data-hint="Subdivide so the result contains quads only, with no triangles. Roughly quadruples the vertex and face count, which is why the output can come out much larger than the target above." /><span>Pure quad mesh</span></label>
+
+            <div class="field">
+              <label for="smoothing">Smoothing</label>
               <input type="number" id="smoothing" min="0" max="10" step="1" value="2"
                 data-hint="Reprojection passes applied to the extracted mesh. More means a smoother result that follows the original surface less tightly." />
-            </label>
-
-            <label class="field" for="format">
-              <span>Format</span>
-              <select id="format">
+              <select id="format" aria-label="File format"
+                data-hint="The file Export writes. OBJ is the safer choice: a quad-dominant result contains triangles too, and not every reader accepts a PLY with mixed face sizes. Pure quad mesh makes PLY safe.">
                 <option value="obj" selected>obj</option>
                 <option value="ply">ply</option>
               </select>
-            </label>
+            </div>
+
+            <p id="output-stats" class="muted" hidden></p>
             <button class="wide primary" id="btn-export"
-              data-hint="Build the quad mesh from the solved field, write it to a file and offer it as a download.">Export</button>
-            <a id="download" class="download" hidden download>Download</a>
+              data-hint="Build the quad mesh from the solved field, write it out and download it.">Export</button>
+            <!-- Clicked from script to start the download; never shown. -->
+            <a id="download" hidden download></a>
           </section>
         </div>
       </aside>
@@ -161,19 +165,14 @@
              native viewer's NanoVG overlay, so it lives on its own 2D canvas. -->
         <canvas id="overlay"></canvas>
 
-        <!-- Read-only corner. Never takes the pointer: a stroke drawn across
-             it has to reach the canvas underneath. -->
+        <!-- One line: what the brush in your hand is, and what it does. Never
+             takes the pointer, so a stroke drawn across it reaches the canvas
+             underneath. Anything the user has to act on is in the panel; this
+             corner only ever answers "what happens if I drag now?". -->
         <div id="readout">
-          <p id="mesh-name" class="strong">No mesh loaded</p>
-          <p id="mesh-stats" hidden></p>
-          <!-- Beside the input counts, not in the panel: the two numbers only
-               mean anything next to each other, and "83,793 vertices" under a
-               target of 21,030 reads as a contradiction on its own. -->
-          <p id="output-stats" hidden></p>
-          <p id="hint"></p>
           <p id="status">
-            <span id="tool-name">Comb</span>
-            <span id="status-text">Waiting for geometry</span>
+            <span id="tool-name">Orientation Comb</span>
+            <span id="status-text">Import a mesh to begin.</span>
           </p>
         </div>
       </div>

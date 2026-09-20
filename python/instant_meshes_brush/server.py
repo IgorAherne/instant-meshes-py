@@ -389,6 +389,13 @@ class _Connection:
 
                     if state.has_field and (state.version != last_version or settled):
                         last_version = await self._send_field()
+                        # A field that moved may have moved its defects with
+                        # it, and catching the solver mid-flight is not
+                        # something to rely on: an attractor's single sweep
+                        # can begin and end between two ticks, which used to
+                        # leave the markers on screen describing the field as
+                        # it was before the drag.
+                        markers_owed = True
 
                     # Singularities only once EVERYTHING has stopped, not merely
                     # when the optimizer is idle. It goes idle in the gap between
@@ -544,6 +551,13 @@ class _Connection:
             values = message.header
         geometry = await self.session.set_config(values)
         await self._send_geometry(geometry)
+        # The rebuild re-projected the strokes, so the curves the client is
+        # drawing are not the ones now constraining the field. Send the
+        # replacements, or the viewport shows a mesh with no visible reason
+        # for the shape its flow has taken.
+        for stroke in await self.session.stroke_curves():
+            await self._send(_stroke_frame(stroke))
+        await self._send_stroke_list()
 
     async def _on_stroke(self, message: protocol.Message) -> None:
         raw_kind = message.get("kind", int(_core.StrokeKind.ORIENTATION))

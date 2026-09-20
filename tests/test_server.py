@@ -496,6 +496,53 @@ def test_extract_solves_a_field_that_never_was(client, torus) -> None:
     assert field.get("iterations_q") >= 0, "the field was never solved"
 
 
+def test_retargeting_keeps_the_strokes_and_resends_their_curves(client, torus) -> None:
+    """A rebuild carries the strokes, and the viewport has to be told.
+
+    The curves are re-projected onto the new mesh, so the ones the client is
+    drawing describe a surface that no longer exists. Without the replacements
+    the strokes would vanish from the viewport while still steering the field
+    -- a flow with no visible reason for its shape.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.FIELD)
+
+        origins, directions = equator_rays(torus)
+        socket.send(
+            MessageType.STROKE,
+            {"kind": 0, "solve": False},
+            {"ray_origins": origins, "ray_directions": directions},
+        )
+        drawn = socket.expect(MessageType.STROKE_RESULT)
+
+        # One frame provokes all three replies, so they are collected together:
+        # expect() discards the rest of the round it found its match in.
+        socket.send(MessageType.SET_CONFIG, {"config": {"vertex_count": 600}})
+        seen = {}
+        for attempt in range(60):
+            for reply in socket.drain():
+                seen.setdefault(reply.type, reply)
+            if MessageType.STROKE_LIST in seen:
+                break
+            time.sleep(0.05)
+
+    assert MessageType.GEOMETRY in seen, "the rebuild never answered with a mesh"
+    carried = seen.get(MessageType.STROKE_RESULT)
+    listed = seen[MessageType.STROKE_LIST]
+    assert listed.get("count") == 1, "the rebuild dropped the stroke"
+    assert carried is not None, "the carried stroke's new curve was never sent"
+    assert carried.get("stroke_id") == drawn.get("stroke_id")
+    assert carried.arrays["positions"].shape[1] == 3
+    # Same path, re-projected: every carried point sits on the drawn curve.
+    before = drawn.arrays["positions"].astype(np.float64)
+    after = carried.arrays["positions"].astype(np.float64)
+    strayed = np.linalg.norm(after[:, None] - before[None], axis=2).min(1).max()
+    assert strayed < 0.05, f"the carried stroke moved by {strayed:.4f}"
+
+
 def test_extract_and_export(client, torus) -> None:
     with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
         socket = Socket(ws)

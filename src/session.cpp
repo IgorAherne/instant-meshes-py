@@ -112,6 +112,10 @@ void Session::setMesh(const MatrixXf &V, const MatrixXu &F) {
     mV = V;
     mF = F;
     mReady = false;
+    /* A different input mesh is a different subject: preprocess() now carries
+       strokes across a rebuild, and without this they would be re-projected
+       onto whatever happened to occupy the same space. */
+    mStrokes.clear();
 }
 
 void Session::loadFile(const std::string &path) {
@@ -123,6 +127,10 @@ void Session::loadFile(const std::string &path) {
     mV = std::move(V);
     mF = std::move(F);
     mReady = false;
+    /* A different input mesh is a different subject: preprocess() now carries
+       strokes across a rebuild, and without this they would be re-projected
+       onto whatever happened to occupy the same space. */
+    mStrokes.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +156,12 @@ void Session::preprocess(const Config &cfg, const ProgressCallback &progress) {
     }
     delete mBVH;
     mBVH = nullptr;
-    mStrokes.clear();
+    /* Strokes survive: they are re-projected onto the rebuilt mesh at the end
+       of this function. Only the face indices inside them go stale -- the
+       curve itself is a path in space, and subdivision refines the surface it
+       was drawn on rather than moving it. */
+    std::vector<Stroke> carried;
+    carried.swap(mStrokes);
     mCreaseMap.clear();
     mCreaseSet.clear();
     mReady = false;
@@ -252,9 +265,67 @@ void Session::preprocess(const Config &cfg, const ProgressCallback &progress) {
 
     mReady = true;
 
+    reprojectStrokes(carried);
+
     /* Boundary alignment is expressed as constraints, so it goes through the
        same path as brush strokes. */
     applyConstraints();
+}
+
+void Session::reprojectStrokes(const std::vector<Stroke> &strokes) {
+    mStrokes.clear();
+    if (strokes.empty())
+        return;
+
+    /* Far enough above the surface to clear the floating-point noise of the
+       point that was projected onto it, near enough not to reach the other
+       side of a thin wall. */
+    const Float lift = mStats.mAverageEdgeLength;
+
+    std::vector<CurvePoint> curve;
+    for (const Stroke &stroke : strokes) {
+        curve.clear();
+        curve.reserve(stroke.curve.size());
+
+        for (const CurvePoint &old : stroke.curve) {
+            /* Straight down the stored normal, from just above and then, if
+               that found nothing, from just below: a normal can flip when the
+               crease setting changes, and the point is on the surface either
+               way. */
+            Vector2f uv;
+            uint32_t f;
+            Float t;
+            bool hit = mBVH->rayIntersect(
+                Ray(old.p + old.n * lift, -old.n, 0, 2 * lift), f, t, &uv);
+            if (!hit) {
+                hit = mBVH->rayIntersect(
+                    Ray(old.p - old.n * lift, old.n, 0, 2 * lift), f, t, &uv);
+                if (!hit)
+                    continue;
+            }
+
+            CurvePoint pt;
+            pt.p = old.p;  /* the curve itself, not the point the ray landed on */
+            pt.n = ((1 - uv.sum()) * mRes.N().col(mRes.F()(0, f)) +
+                    uv.x() * mRes.N().col(mRes.F()(1, f)) +
+                    uv.y() * mRes.N().col(mRes.F()(2, f))).normalized();
+            pt.f = f;
+            curve.push_back(pt);
+        }
+
+        /* Re-smoothing walks the new mesh between the points, which is what
+           makes the face sequence contiguous again -- the constraint builder
+           needs that, and a curve carried over from a coarser mesh will have
+           gaps in it. */
+        if (curve.size() < 2 || !smooth_curve(mBVH, mRes.E2E(), curve, false))
+            continue;
+
+        Stroke moved;
+        moved.id = stroke.id;
+        moved.kind = stroke.kind;
+        moved.curve = curve;
+        mStrokes.push_back(std::move(moved));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,10 +543,74 @@ void Session::clearStrokes() {
     applyConstraints();
 }
 
-void Session::applyAttractor(const std::vector<CurvePoint> &curve, bool orientation) {
+std::vector<CurvePoint> Session::snapToSingularity(const std::vector<CurvePoint> &curve,
+                                                   bool orientation) const {
+    if (curve.empty())
+        return curve;
+
+    /* Collect the singular faces of the field this attractor edits. */
+    std::set<uint32_t> singular;
+    if (orientation) {
+        for (auto const &kv : orientationSingularities())
+            singular.insert(kv.first);
+    } else {
+        for (auto const &kv : positionSingularities())
+            singular.insert(kv.first);
+    }
+    if (singular.empty() || singular.count(curve.front().f))
+        return curve;
+
+    /* The nearest one the user could plausibly have been aiming at. The marker
+       is drawn at mRes.scale() * 0.4 across, so a couple of edge lengths is
+       several times its own width -- wide enough to forgive the aim, narrow
+       enough that it cannot reach a different singularity. */
+    const Float reach = mRes.scale() * 2;
+    const MatrixXu &F = mRes.F();
+    const MatrixXf &V = mRes.V();
+    const MatrixXf &N = mRes.N();
+
+    uint32_t best = (uint32_t) -1;
+    Float bestDistance = reach;
+    for (uint32_t f : singular) {
+        Vector3f centre =
+            (V.col(F(0, f)) + V.col(F(1, f)) + V.col(F(2, f))) / 3.f;
+        Float distance = (centre - curve.front().p).norm();
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = f;
+        }
+    }
+    if (best == (uint32_t) -1)
+        return curve;
+
+    CurvePoint start;
+    start.p = (V.col(F(0, best)) + V.col(F(1, best)) + V.col(F(2, best))) / 3.f;
+    start.n = (N.col(F(0, best)) + N.col(F(1, best)) + N.col(F(2, best))).normalized();
+    start.f = best;
+
+    std::vector<CurvePoint> snapped;
+    snapped.reserve(curve.size() + 1);
+    snapped.push_back(start);
+    snapped.insert(snapped.end(), curve.begin(), curve.end());
+
+    /* Re-routing is what fills in the faces between the marker and where the
+       drag actually began; without it the two would not share an edge. */
+    if (!smooth_curve(mBVH, mRes.E2E(), snapped, true))
+        return curve;
+    return snapped;
+}
+
+void Session::applyAttractor(const std::vector<CurvePoint> &drawn, bool orientation) {
     requireReady();
-    if (curve.size() < 2)
+    if (drawn.size() < 2)
         return;
+
+    /* A singularity is one triangle of the working mesh under a marker drawn
+       many times its size, so a drag that starts on the dot usually does not
+       start on the face. Forgiving that is the difference between the tool
+       working and appearing to do nothing at all. */
+    const std::vector<CurvePoint> curve = snapToSingularity(drawn, orientation);
+
     /* Optimizer::run walks the path from the back, so hand it the faces in
        reverse: the singularity is dragged from the stroke's end to its start. */
     std::vector<uint32_t> faces;

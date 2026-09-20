@@ -628,15 +628,51 @@ def test_erase_stroke_near_picks_the_visible_handle(
     assert solved_session.erase_stroke_near(handle, eye, radius) == 0
 
 
-def test_preprocess_drops_strokes(
+def test_preprocess_carries_strokes_onto_the_rebuilt_mesh(
     mesh_session: imb.Session, torus: TorusMesh
 ) -> None:
-    """Vertex indices move under the preprocessor, so old constraints cannot stay."""
+    """Re-targeting the resolution must not throw away the user's brushwork.
+
+    Only the face indices inside a stroke go stale: the curve is a path in
+    space, and the preprocessor refines the surface it was drawn on rather than
+    moving it. The re-projected curve therefore has to land on the same path,
+    on faces of the mesh that now exists.
+    """
+    curve = mesh_session.project_stroke(*_diagonal_stroke_rays(torus))
+    assert curve is not None
+    stroke_id = mesh_session.add_stroke(imb.StrokeKind.ORIENTATION, curve)
+    before = np.asarray(curve.positions, dtype=np.float64)
+
+    mesh_session.preprocess(imb.Config(vertex_count=4000))
+
+    carried = mesh_session.strokes
+    assert [s["id"] for s in carried] == [stroke_id]
+    assert carried[0]["kind"] == int(imb.StrokeKind.ORIENTATION)
+
+    after = np.asarray(carried[0]["curve"].positions, dtype=np.float64)
+    assert len(after) >= 2
+    assert carried[0]["curve"].faces.max() < len(mesh_session.faces)
+    # Every point of the carried curve lies on the path that was drawn.
+    strayed = np.linalg.norm(after[:, None] - before[None], axis=2).min(1).max()
+    assert strayed < mesh_session.scale, f"the stroke moved by {strayed:.4f}"
+
+
+def test_a_new_mesh_does_not_inherit_the_previous_strokes(
+    mesh_session: imb.Session, torus: TorusMesh, make_torus
+) -> None:
+    """Carrying strokes across a rebuild must not carry them across a model.
+
+    They would be re-projected onto whatever occupied the same space, which for
+    two meshes of similar size means silently keeping constraints drawn on a
+    different object.
+    """
     curve = mesh_session.project_stroke(*_diagonal_stroke_rays(torus))
     assert curve is not None
     mesh_session.add_stroke(imb.StrokeKind.ORIENTATION, curve)
 
-    mesh_session.preprocess(imb.Config(vertex_count=mesh_session.config.vertex_count))
+    other = make_torus(major_radius=1.0, minor_radius=0.34)
+    mesh_session.set_mesh(other.vertices, other.faces)
+    mesh_session.preprocess(imb.Config(vertex_count=150, deterministic=True))
 
     assert mesh_session.strokes == []
 

@@ -184,6 +184,42 @@ def test_attractor_moves_a_singularity(
     assert read() != before, "the singularity did not move"
 
 
+def test_attractor_snaps_to_the_singularity_it_was_aimed_at(
+    make_session, torus
+) -> None:
+    """A drag that starts beside the marker still moves that singularity.
+
+    A singularity occupies one triangle of the working mesh, and the dot drawn
+    over it is many times that size, so aiming by eye lands next to the face
+    rather than on it. Requiring the exact face makes the tool look broken:
+    nothing happens and nothing says why.
+    """
+    session = make_session(vertex_count=ATTRACTOR_VERTEX_COUNT)
+    session.solve_all()
+
+    before = set(session.orientation_singularities)
+    if not before:
+        pytest.skip("this field has no singularities to drag")
+
+    start_face = sorted(before)[0]
+    centre = session.vertices[session.faces[start_face]].mean(axis=0)
+    u0, v0 = _torus_uv(centre, torus.major_radius)
+
+    # Start most of an edge length around the tube from the marker's own face.
+    origins, directions = _arc_on_torus(torus, u0, v0 + session.scale)
+    curve = session.project_stroke(origins, directions, True)
+    assert curve is not None
+    assert curve.faces[0] != start_face, "this test needs a stroke that misses"
+
+    session.apply_attractor(curve, orientation=True)
+    session.wait_solve()
+
+    assert session.status.error == ""
+    assert start_face not in set(session.orientation_singularities), (
+        "the singularity under the marker was not the one that moved"
+    )
+
+
 def test_attractor_rejects_a_path_that_is_not_edge_adjacent(
     solved_session: imb.Session,
 ) -> None:
