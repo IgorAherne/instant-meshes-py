@@ -188,6 +188,45 @@ button.wide:last-child {
     min-width: 0;
 }
 
+/* Two buttons that behave as one control: exactly one is always chosen. */
+.segmented {
+    display: flex;
+    margin-bottom: 8px;
+}
+
+.segmented > button {
+    flex: 1 1 0;
+    min-width: 0;
+    border-radius: 0;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.segmented > button:first-child {
+    border-radius: 4px 0 0 4px;
+}
+
+.segmented > button:last-child {
+    /* Pulled over its neighbour's border so the pair shares one divider. */
+    margin-left: -1px;
+    border-radius: 0 4px 4px 0;
+}
+
+.segmented > button[aria-checked="true"] {
+    position: relative;
+    z-index: 1;
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+}
+
+.segmented > button[aria-checked="true"]:hover {
+    background: var(--accent-hot);
+}
+
 .link-button {
     background: none;
     border: 0;
@@ -230,6 +269,13 @@ button.wide:last-child {
 .check input {
     accent-color: var(--accent);
     margin: 0;
+}
+
+/* A checkbox that cannot affect anything right now -- the field grid while the
+   output mesh is showing -- reads as unavailable rather than as broken. */
+.check:has(input:disabled) {
+    opacity: 0.45;
+    cursor: default;
 }
 
 input[type="range"] {
@@ -298,6 +344,29 @@ input[type="range"] {
     gap: 8px;
     padding: 6px 8px;
     text-align: left;
+}
+
+.tool .label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool kbd {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border: 1px solid var(--panel-edge);
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.25);
+    font: inherit;
+    font-size: 10px;
+    color: var(--muted);
+}
+
+.tool[aria-checked="true"] kbd {
+    border-color: rgba(255, 255, 255, 0.35);
+    color: #fff;
 }
 
 .tool svg {

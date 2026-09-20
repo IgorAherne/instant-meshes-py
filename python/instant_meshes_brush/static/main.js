@@ -140,6 +140,8 @@ class App {
         };
         this.strokes = new Map();
         this.posy = 4;
+        /* Whether an extraction exists to switch to; a rebuild invalidates it. */
+        this.hasOutput = false;
 
         this.tools = new ToolController(viewer, connection, {
             onToolChange: (tool) => this.panel.showTool(tool),
@@ -151,9 +153,10 @@ class App {
         this._bindPanel();
         this._bindConnection();
 
-        for (const name of ['mesh', 'grid', 'strokes', 'singularities', 'output']) {
+        for (const name of ['grid', 'strokes', 'singularities']) {
             this.viewer.setLayerVisible(name, this.panel.layerState(name));
         }
+        this._applySurface(this.panel.surface());
     }
 
     /* -------------------------------------------------------------- */
@@ -221,9 +224,18 @@ class App {
         this.panel.handlers.onSelectTool = (id) => this.tools.setTool(id);
         this.panel.handlers.onClearStrokes = () => send(MessageType.CLEAR_STROKES);
 
-        this.panel.handlers.onSolve = () => this._solve();
         this.panel.handlers.onExtract = (options) => send(MessageType.EXTRACT, options);
         this.panel.handlers.onExport = (options) => send(MessageType.EXPORT, options);
+
+        /* Choosing the output before anything has been extracted means "show
+           me the output", which is a request to build one. */
+        this.panel.handlers.onSurfaceChange = (which) => {
+            this._setSurface(which);
+            if (which === 'output' && !this.hasOutput) {
+                this.panel.setStatus('Extracting...', false);
+                send(MessageType.EXTRACT, this.panel.extractOptions());
+            }
+        };
 
         /* There is no Apply button: the panel sends this once the remeshing
            settings have stopped changing, and the GEOMETRY frame that comes
@@ -255,13 +267,20 @@ class App {
     /**
      * Which of the two surfaces the viewport is showing.
      *
-     * Extracting hides the input so the result is unmistakably visible; laying
-     * a stroke brings it back, because a brush needs something to draw on.
+     * Never both: they occupy the same space, and the input in front of the
+     * output is what made an extracted mesh look like it had never appeared.
+     * Extracting selects the output; laying a stroke selects the input, because
+     * a brush needs something to draw on.
      */
-    _showOutputOnly(only) {
-        this._setLayer('output', only);
-        this._setLayer('mesh', !only);
-        this._setLayer('grid', !only);
+    _setSurface(which) {
+        if (this.panel.setSurface(which)) this._applySurface(which);
+    }
+
+    _applySurface(which) {
+        this._apply(() => {
+            this.viewer.setLayerVisible('mesh', which === 'mesh');
+            this.viewer.setLayerVisible('output', which === 'output');
+        });
     }
 
     /**
@@ -339,12 +358,13 @@ class App {
                 scale: header.scale,
                 targetVertices: header.config ? header.config.vertex_count : 0,
             });
-            this.panel.showFieldState({ orientation: 'not solved', position: 'not solved' });
+            this.panel.showFieldState({ orientation: 'solving…', position: 'solving…' });
             this.panel.showOutput('Not extracted yet');
             this.panel.setReady(true);
-            /* The grid is the point of loading a mesh, and solving it is the
+            this.hasOutput = false;
+            /* The grid is the point of importing a mesh, and solving it is the
                only way to see one, so the step is not worth asking for. */
-            this._showOutputOnly(false);
+            this._setSurface('mesh');
             this.panel.setStatus('Solving the field...', false);
             this._solve();
         });
@@ -370,7 +390,7 @@ class App {
             }
             /* A stroke is drawn on the input surface, so seeing where it landed
                means being back on it -- even if Extract hid it a moment ago. */
-            this._showOutputOnly(false);
+            this._setSurface('mesh');
 
             const stroke = decodeStrokeResult(header, arrays);
             if (!stroke) return;
@@ -414,9 +434,10 @@ class App {
                 `${vertexCount.toLocaleString()} vertices / ${faceCount.toLocaleString()} faces`
             );
             this.panel.setStatus(`Extracted ${faceCount} faces`, false);
+            this.hasOutput = faceCount > 0;
             /* Showing the result is the whole point of pressing Extract, and
                the input surface sits a hair in front of it in places. */
-            this._showOutputOnly(true);
+            this._setSurface('output');
         });
 
         conn.on(MessageType.EXPORT_READY, (header) => {

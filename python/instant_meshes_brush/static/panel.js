@@ -20,6 +20,37 @@ export const SYMMETRIES = {
 /** Crease angle used when "Sharp creases" is ticked; -1 disables detection. */
 const CREASE_ANGLE = 30.0;
 
+/** Output resolutions the panel offers, in vertices. */
+const TARGET_MIN = 500;
+const TARGET_MAX = 60000;
+
+/** Positions on the target slider's own track. */
+const SLIDER_STEPS = 1000;
+
+function clampTarget(value) {
+    const rounded = Math.round(Number(value));
+    if (!Number.isFinite(rounded)) return TARGET_MIN;
+    return Math.min(TARGET_MAX, Math.max(TARGET_MIN, rounded));
+}
+
+/**
+ * The target slider is logarithmic.
+ *
+ * Its range spans two orders of magnitude, and the settings people actually
+ * reach for sit in the bottom tenth of it; on a linear track the difference
+ * between 800 and 3,000 vertices would be three pixels.
+ */
+function sliderToTarget(position) {
+    const t = Math.min(1, Math.max(0, Number(position) / SLIDER_STEPS));
+    const value = TARGET_MIN * Math.pow(TARGET_MAX / TARGET_MIN, t);
+    return clampTarget(Math.round(value / 10) * 10);
+}
+
+function targetToSlider(value) {
+    const t = Math.log(clampTarget(value) / TARGET_MIN) / Math.log(TARGET_MAX / TARGET_MIN);
+    return String(Math.round(t * SLIDER_STEPS));
+}
+
 /**
  * How long the remeshing settings must sit still before they are applied.
  *
@@ -123,8 +154,6 @@ export class Panel {
 
             strokeCount: byId('stroke-count'),
             clear: byId('btn-clear'),
-
-            solve: byId('btn-solve'),
             statOrient: byId('stat-orient'),
             statPos: byId('stat-pos'),
 
@@ -144,13 +173,13 @@ export class Panel {
         this.el.file.setAttribute('accept', MESH_ACCEPT);
         this.hints = new Hints(byId('tip'));
 
-        this._solveLabel = this.el.solve.textContent.trim();
         /* The config as the server last reported it, which is what an edit is
            compared against.  Null until a mesh exists: there is nothing to
            rebuild before then, so nothing to apply either. */
         this._appliedConfig = null;
         this._settleTimer = 0;
 
+        this.el.targetRange.value = targetToSlider(this.el.target.value);
         this._bind();
         this.setSolving(false);
         this.setReady(false);
@@ -171,18 +200,22 @@ export class Panel {
             if (file) call('onOpenFile', file);
         });
 
-        /* The slider and the number box are two views of one value. */
-        const syncTarget = (source, other) => {
-            const value = Number(source.value);
-            if (Number.isFinite(value)) other.value = String(value);
-        };
+        /* The slider and the number box are two views of one value, but not of
+           one scale: only the box is in vertices.  Neither writes back into the
+           control being used, so a half-typed number is never rewritten. */
         on(this.el.targetRange, 'input', () => {
-            syncTarget(this.el.targetRange, this.el.target);
+            this.el.target.value = String(sliderToTarget(this.el.targetRange.value));
             this._settleConfig();
         });
         on(this.el.target, 'input', () => {
-            syncTarget(this.el.target, this.el.targetRange);
+            this.el.targetRange.value = targetToSlider(this.el.target.value);
             this._settleConfig();
+        });
+        on(this.el.target, 'blur', () => {
+            /* Show what was actually applied. Clamping here rather than on every
+               keystroke means a number is never rewritten under the cursor, but
+               a rejected one must not be left on screen looking accepted. */
+            this.el.target.value = String(clampTarget(this.el.target.value));
         });
         for (const key of ['symmetry', 'extrinsic', 'boundaries', 'creases']) {
             on(this.el[key], 'change', () => this._settleConfig());
@@ -193,7 +226,9 @@ export class Panel {
         }
         on(this.el.clear, 'click', () => call('onClearStrokes'));
 
-        on(this.el.solve, 'click', () => call('onSolve'));
+        for (const button of document.querySelectorAll('button.seg[data-surface]')) {
+            on(button, 'click', () => call('onSurfaceChange', button.dataset.surface));
+        }
 
         on(this.el.extract, 'click', () => call('onExtract', this.extractOptions()));
         on(this.el.export, 'click', () =>
@@ -238,11 +273,17 @@ export class Panel {
         const symmetry = SYMMETRIES[this.el.symmetry.value] || SYMMETRIES['4,4'];
         return {
             ...symmetry,
-            vertex_count: Math.max(10, Number(this.el.target.value) || 1000),
+            vertex_count: clampTarget(this.el.target.value),
             extrinsic: this.el.extrinsic.checked,
             align_to_boundaries: this.el.boundaries.checked,
             crease_angle: this.el.creases.checked ? CREASE_ANGLE : -1.0,
         };
+    }
+
+    /** Which surface the Show toggle currently has selected. */
+    surface() {
+        const chosen = document.querySelector('button.seg[aria-checked="true"]');
+        return chosen ? chosen.dataset.surface : 'mesh';
     }
 
     /** The two settings extract() reads, which need no rebuild. */
@@ -269,6 +310,24 @@ export class Panel {
         return true;
     }
 
+    /**
+     * Select one of the two surfaces.
+     *
+     * @returns {boolean} true if this was a change, so a caller can skip the
+     *          GPU work of re-applying what is already on screen.
+     */
+    setSurface(which) {
+        if (this.surface() === which) return false;
+        for (const button of document.querySelectorAll('button.seg[data-surface]')) {
+            button.setAttribute('aria-checked', String(button.dataset.surface === which));
+        }
+        /* The grid is painted by the input surface's own material, so while the
+           output is showing its checkbox could only lie about what it does. */
+        const grid = document.querySelector('input[data-layer="grid"]');
+        if (grid) grid.disabled = which !== 'mesh';
+        return true;
+    }
+
     /** Reflect the server's config back into the controls after a rebuild.
      *
      * A control the user is currently in is left alone: status frames arrive
@@ -284,9 +343,8 @@ export class Panel {
         if (key in SYMMETRIES && settable(this.el.symmetry)) this.el.symmetry.value = key;
         if (config.vertex_count > 0 && settable(this.el.target)
             && settable(this.el.targetRange)) {
-            const value = String(config.vertex_count);
-            this.el.target.value = value;
-            this.el.targetRange.value = value;
+            this.el.target.value = String(clampTarget(config.vertex_count));
+            this.el.targetRange.value = targetToSlider(config.vertex_count);
         }
         if (settable(this.el.extrinsic)) this.el.extrinsic.checked = Boolean(config.extrinsic);
         if (settable(this.el.boundaries)) {
@@ -307,8 +365,6 @@ export class Panel {
             `${vertices.toLocaleString()} v / ${faces.toLocaleString()} tri` +
             `  →  ${(targetVertices || 0).toLocaleString()} v target,` +
             ` edge ${scale.toPrecision(3)}`;
-        /* The slider only makes sense once we know how big the model is. */
-        this.el.targetRange.max = String(Math.max(50, vertices));
     }
 
     showStrokes(count) {
@@ -358,22 +414,19 @@ export class Panel {
 
     /** A solve in flight. Every solve the viewport starts ends by itself, so
      *  there is nothing to press here -- the buttons simply wait it out.
-     *  Opening a mesh stays available: it stops the solve on its way in, and
+     *  Importing a mesh stays available: it stops the solve on its way in, and
      *  being unable to abandon a long solve by loading something else would be
      *  the one place this UI could strand somebody. */
     setSolving(active) {
         this._solving = active;
-        this.el.solve.textContent = active ? 'Solving…' : this._solveLabel;
-        for (const key of ['solve', 'extract', 'export']) {
+        for (const key of ['extract', 'export']) {
             this.el[key].disabled = active || !this._ready;
         }
     }
 
     setReady(ready) {
         this._ready = ready;
-        for (const key of ['solve', 'extract', 'export']) {
-            this.el[key].disabled = !ready || Boolean(this._solving);
-        }
+        this.setSolving(Boolean(this._solving));
     }
 
     setStatus(message, isError) {

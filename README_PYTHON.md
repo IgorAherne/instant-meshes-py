@@ -81,18 +81,20 @@ instant-meshes-brush
 ```
 
 Open the URL it prints. Everything is in the panel down the left of the
-viewport: open a mesh, pick a brush, extract and download. Hovering any control
-explains what it does.
+viewport: import a mesh, pick a brush, extract and download. Hovering any
+control explains what it does.
 
-The whole workflow is **Open mesh -> brush -> Extract -> Export**. There is no
-Apply step and no Solve step to remember: loading a mesh solves it, changing the
-target resolution rebuilds and re-solves it, and every stroke re-solves with the
-stroke in place. The Solve button is there to redo it, not to make it happen.
+The whole workflow is **Import mesh -> brush -> Extract -> Export**. There is
+no Apply step and no Solve step, because there is nothing to decide about
+either: importing solves, retargeting the resolution rebuilds and re-solves,
+every stroke re-solves with the stroke in place, deleting one re-solves without
+it, and extracting solves first if somehow nothing has. The field is a
+consequence of what you did, not a thing to remember to run.
 
 | Tool | What the stroke does |
 |---|---|
-| Orientation comb | Turns the cross field to follow the stroke |
-| Edge brush | Puts an output mesh edge along the stroke |
+| Orientation comb (`C`) | Turns the cross field to follow the stroke |
+| Edge brush (`E`) | Puts an output mesh edge along the stroke |
 | Orientation attractor | Drags an orientation singularity along the stroke |
 | Position attractor | Drags a position singularity along the stroke |
 
@@ -110,7 +112,12 @@ a Blender user expects it:
 | Right-drag | Pan |
 | Wheel | Zoom |
 | `F` | Frame the model, keeping the angle |
+| `C` / `E` | Orientation comb / edge brush |
 | `Esc` | Cancel the stroke being drawn |
+
+**Show** picks one surface or the other — the input you brush on, or the
+extracted result — never both, since they occupy the same space. Extracting
+switches to the output; drawing a stroke switches back.
 
 Every control lives **inside** the viewport, so embedding it in your own Gradio
 app is one call and you reproduce none of the UI:

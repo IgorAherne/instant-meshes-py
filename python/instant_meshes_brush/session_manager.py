@@ -681,11 +681,16 @@ class BrushSession:
             await self._stop_locked()
             return int(await self._call(core.erase_stroke_near, p, e, float(radius)))
 
-    async def clear_strokes(self) -> None:
+    async def clear_strokes(self) -> int:
+        """Remove every stroke, returning how many there were.
+
+        The count is what lets a caller decide whether a re-solve is owed; both
+        halves happen in one worker call so the answer cannot be stale.
+        """
         async with self._lock:
             core = self._require_ready()
             await self._stop_locked()
-            await self._call(core.clear_strokes)
+            return int(await self._call(_clear_strokes, core))
 
     async def strokes(self) -> List[Dict[str, Any]]:
         """The persistent strokes, as ``{'id', 'kind', 'n_points'}`` records."""
@@ -758,6 +763,29 @@ class BrushSession:
             if not state.active:
                 return True
             await asyncio.sleep(_SOLVE_POLL_SECONDS)
+
+    async def wait_solve(self) -> None:
+        """Wait out the running solve, if there is one."""
+        task = self._solve_task
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def ensure_solved(self) -> bool:
+        """Solve both fields if nothing ever has. True if that had to happen.
+
+        Solving is a consequence of importing, retargeting or brushing rather
+        than something a user asks for, so there is no longer a button to press
+        when it has not happened.  Extraction reads the fields directly, and on
+        an unsolved hierarchy that means extracting the solver's random initial
+        state, so it holds the guarantee up itself.
+        """
+        if self._closed or self._core is None or self._geometry is None:
+            return False
+        if (await self.status()).has_field:
+            return False
+        await self.solve("both", -1)
+        await self.wait_solve()
+        return True
 
     async def stop(self) -> None:
         """Ask the solver to finish its sweep and wait until it has."""
@@ -847,6 +875,8 @@ class BrushSession:
         pure_quad: Optional[bool] = None,
     ) -> Extraction:
         """Extract the output mesh, stopping the solve so it is self-consistent."""
+        # Before the lock: ensure_solved starts a solve, which takes it too.
+        await self.ensure_solved()
         async with self._lock:
             core = self._require_ready()
             await self._set_extraction_options_locked(smooth_iter, pure_quad)
@@ -898,6 +928,12 @@ def _stroke_result(stroke_id: int, kind: str, curve: "_core.Curve") -> StrokeRes
         normals=curve.normals,
         faces=curve.faces,
     )
+
+
+def _clear_strokes(core: "_core.Session") -> int:
+    count = len(core.strokes)
+    core.clear_strokes()
+    return count
 
 
 def _read_strokes(core: "_core.Session") -> List[Dict[str, Any]]:

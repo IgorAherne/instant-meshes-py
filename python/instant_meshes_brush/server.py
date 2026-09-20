@@ -89,16 +89,25 @@ _STROKE_KINDS: Dict[Any, str] = {
     "attractor_position": "attractor_position",
 }
 
-#: What a brush stroke re-solves, following Viewer::mouseButtonEvent.
+#: What any change to the stroke set re-solves.
 #:
 #: Every stroke constrains the orientation field (session.cpp fills CQ/CQw for
 #: both kinds), so both brushes have to re-solve it; the edge brush also pins
 #: CO and therefore continues into the positions, which is what the viewer's
-#: mContinueWithPositions does.  Attractors are absent on purpose: the core
-#: starts the frozen level-0 solve their move needs, and the session follows it.
+#: mContinueWithPositions does.  Level -1 is the hierarchical schedule, which
+#: terminates on its own -- the viewport has no Stop button.
+#:
+#: Erasing takes the same plan as adding: a field that keeps the shape a stroke
+#: gave it after the stroke is deleted is simply wrong, and there is no longer a
+#: Solve button with which to notice and correct it.
+_STROKE_SOLVE: Tuple[str, int] = ("both", -1)
+
+#: Stroke kinds that re-solve when drawn.  Attractors are absent on purpose:
+#: the core starts the frozen level-0 solve their move needs, and the session
+#: follows it.
 _SOLVE_PLANS: Dict[str, Tuple[str, int]] = {
-    "orientation": ("both", -1),
-    "edge": ("both", -1),
+    "orientation": _STROKE_SOLVE,
+    "edge": _STROKE_SOLVE,
 }
 
 
@@ -554,18 +563,32 @@ class _Connection:
     async def _on_erase_stroke(self, message: protocol.Message) -> None:
         stroke_id = message.get("stroke_id")
         if stroke_id is not None:
-            await self.session.erase_stroke(int(stroke_id))
+            erased = await self.session.erase_stroke(int(stroke_id))
         elif message.get("point") is not None and message.get("eye") is not None:
-            await self.session.erase_stroke_near(
+            erased = await self.session.erase_stroke_near(
                 message.get("point"), message.get("eye"), float(message.get("radius", 0.0))
             )
         else:
             raise SessionError("ERASE_STROKE needs a 'stroke_id', or a 'point' plus an 'eye'")
         await self._send_stroke_list()
+        await self._resolve_after_stroke_change(bool(erased))
 
     async def _on_clear_strokes(self, message: protocol.Message) -> None:
-        await self.session.clear_strokes()
+        cleared = await self.session.clear_strokes()
         await self._send_stroke_list()
+        await self._resolve_after_stroke_change(cleared > 0)
+
+    async def _resolve_after_stroke_change(self, changed: bool) -> None:
+        """Re-solve after a stroke was removed, exactly as adding one does.
+
+        Skipped when nothing was actually removed -- a click that lands on no
+        handle still arrives here, and restarting a solve for it would throw
+        away the field the user is looking at.
+        """
+        if not changed:
+            return
+        await self.session.solve(*_STROKE_SOLVE)
+        await self._send_status()
 
     async def _on_solve(self, message: protocol.Message) -> None:
         field = str(message.get("field", "both"))

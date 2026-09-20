@@ -42,12 +42,14 @@ export const TOOLS = [
     {
         id: 'comb',
         label: 'Orientation Comb',
+        key: 'c',
         kind: 0,
         hint: 'Drag across the surface to comb the orientation field.',
     },
     {
         id: 'edge',
         label: 'Edge Brush',
+        key: 'e',
         kind: 1,
         hint: 'Drag to pin an edge path of the output mesh onto the surface.',
     },
@@ -69,6 +71,11 @@ export const TOOLS = [
 export const DEFAULT_TOOL = TOOLS[0].id;
 
 const TOOLS_BY_ID = new Map(TOOLS.map((tool) => [tool.id, tool]));
+
+/** Single-key shortcuts, for the tools that declare one. */
+const TOOLS_BY_KEY = new Map(
+    TOOLS.filter((tool) => tool.key).map((tool) => [tool.key, tool])
+);
 
 export class ToolController {
     /**
@@ -220,10 +227,17 @@ export class ToolController {
             if (this._pointerId === null) return;
             this.cancelStroke();
             this._notify('Stroke cancelled');
-        } else if (event.key === 'f' || event.key === 'F') {
+            return;
+        }
+
+        const key = event.key.toLowerCase();
+        if (key === 'f') {
             if (!this.viewer.frameModel()) return;
             event.preventDefault();
             this._notify('Framed the model');
+        } else if (TOOLS_BY_KEY.has(key)) {
+            event.preventDefault();
+            this.setTool(TOOLS_BY_KEY.get(key).id);
         }
     }
 

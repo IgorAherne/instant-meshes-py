@@ -43,8 +43,8 @@
           <section class="block">
             <h2>Mesh</h2>
             <button class="wide primary" id="btn-open"
-              data-hint="Load an OBJ, PLY, STL or OFF file. The fields are solved for you as soon as it is in, so the grid preview appears without pressing anything else.">
-              Open mesh
+              data-hint="Load an OBJ, PLY, STL or OFF file. The field is solved for you as soon as it is in, so the grid preview appears without pressing anything else.">
+              Import mesh
             </button>
             <input type="file" id="file-input" accept=".obj,.ply,.stl,.off" hidden />
           </section>
@@ -54,14 +54,14 @@
             <h2>Brush tools</h2>
             <div class="tools" role="radiogroup" aria-label="Tools">
               <button class="tool" data-tool="comb" role="radio" aria-checked="true"
-                data-hint="Orientation comb. Left-drag across the surface to turn the edge flow so it follows your stroke. This is the default: left-drag always combs unless you pick another brush.">
+                data-hint="Orientation comb (C). Left-drag across the surface to turn the edge flow so it follows your stroke. This is the default: left-drag always combs unless you pick another brush.">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 5.5c2.3-2.6 4.6-2.6 7 0s4.7 2.6 7 0" /><path d="M3 8v4M6.5 8.6v4M10 8.6v4M13.5 8v4" /></svg>
-                <span class="label">Comb</span>
+                <span class="label">Comb</span><kbd>C</kbd>
               </button>
               <button class="tool" data-tool="edge" role="radio" aria-checked="false"
-                data-hint="Edge brush. Pins an actual edge of the output mesh onto your stroke, instead of only steering the flow near it.">
+                data-hint="Edge brush (E). Pins an actual edge of the output mesh onto your stroke, instead of only steering the flow near it.">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 13L14 3" /><rect x="0.8" y="11.8" width="2.6" height="2.6" /><rect x="12.6" y="1.6" width="2.6" height="2.6" /></svg>
-                <span class="label">Edge brush</span>
+                <span class="label">Edge brush</span><kbd>E</kbd>
               </button>
               <button class="tool" data-tool="orient-attractor" role="radio" aria-checked="false"
                 data-hint="Drag an orientation singularity. Start the stroke ON a red or blue marker and pull it where you want it.">
@@ -81,28 +81,16 @@
                 Clear
               </button>
             </div>
-          </section>
-
-          <!-- Fields ----------------------------------------------------- -->
-          <section class="block">
-            <h2>Fields</h2>
-            <p class="explain">
-              The grid drawn on the model is the solved field. It is re-solved
-              for you after every stroke.
-            </p>
-            <button class="wide primary" id="btn-solve"
-              data-hint="Re-solve the field from scratch. TWO fields are solved, one after the other: the ORIENTATION field decides which DIRECTION the edge loops run, and the POSITION field decides WHERE the grid lines fall along those directions. Your strokes constrain the orientation field, so this is what makes them take effect -- though loading a mesh and drawing a stroke both run it for you, so you rarely need to press it.">
-              Solve fields
-            </button>
-            <dl class="stats">
-              <dt>Orientation</dt><dd id="stat-orient">not solved</dd>
-              <dt>Position</dt><dd id="stat-pos">not solved</dd>
+            <dl class="stats"
+              data-hint="Singularities are the points where the grid cannot stay regular -- where five or three edges meet instead of four. Every closed surface needs some; they are drawn as the red and blue dots on the model, and the attractor brushes drag them somewhere less conspicuous.">
+              <dt>Orientation</dt><dd id="stat-orient">&ndash;</dd>
+              <dt>Position</dt><dd id="stat-pos">&ndash;</dd>
             </dl>
           </section>
 
-          <!-- Resolution ------------------------------------------------- -->
+          <!-- Output ----------------------------------------------------- -->
           <section class="block">
-            <h2>Remesh as</h2>
+            <h2>Output mesh</h2>
             <select id="symmetry"
               data-hint="The symmetry of the output. Quads (4-RoSy, 4-PoSy) is the usual choice; triangles use 6-RoSy, 6-PoSy. Changing this rebuilds and re-solves straight away.">
               <option value="4,4" selected>Quads (4-RoSy, 4-PoSy)</option>
@@ -112,10 +100,12 @@
 
             <label class="field" for="target">
               <span>Target vertex count</span>
-              <input type="number" id="target" min="10" step="10" value="1000"
-                data-hint="Roughly how many vertices the output should have. Lower means bigger quads. The model is rebuilt and re-solved a moment after you stop changing it, which clears any strokes -- the vertices they were drawn on no longer exist." />
+              <input type="number" id="target" min="500" max="60000" step="10" value="1000"
+                data-hint="Roughly how many vertices the output should have, between 500 and 60,000. Lower means bigger quads. The model is rebuilt and re-solved a moment after you stop changing it, which clears any strokes -- the vertices they were drawn on no longer exist." />
             </label>
-            <input type="range" id="target-range" min="10" max="20000" step="10" value="1000" />
+            <!-- Logarithmic; see panel.js. Its own units are slider steps, not
+                 vertices, so the useful low end is not crushed into 5 pixels. -->
+            <input type="range" id="target-range" min="0" max="1000" step="1" value="0" />
 
             <label class="check"><input type="checkbox" id="opt-extrinsic" checked
               data-hint="Smooth the field in world space rather than along the surface. On is the default and is usually what you want." /><span>Extrinsic</span></label>
@@ -123,13 +113,9 @@
               data-hint="Make edge loops run parallel to open boundaries of the model." /><span>Align to boundaries</span></label>
             <label class="check"><input type="checkbox" id="opt-creases"
               data-hint="Keep sharp edges sharp instead of smoothing across them." /><span>Sharp creases</span></label>
-          </section>
 
-          <!-- Output ----------------------------------------------------- -->
-          <section class="block">
-            <h2>Output mesh</h2>
             <button class="wide primary" id="btn-extract"
-              data-hint="Build the quad mesh from the solved fields and show it on its own in the viewport. Bring the original back with the Show checkboxes below.">
+              data-hint="Build the quad mesh from the solved field and show it on its own in the viewport. Switch back with Input surface under Show.">
               Extract
             </button>
             <p id="output-stats" class="muted">Not extracted yet</p>
@@ -157,11 +143,23 @@
           <!-- Layers ----------------------------------------------------- -->
           <section class="block">
             <h2>Show</h2>
-            <label class="check"><input type="checkbox" data-layer="mesh" checked /><span>Input surface</span></label>
-            <label class="check"><input type="checkbox" data-layer="grid" checked /><span>Field grid</span></label>
+            <!-- One surface or the other, never both: they occupy the same
+                 space, and the input in front of the output is what made the
+                 extracted mesh look like it had never appeared. -->
+            <div class="segmented" role="radiogroup" aria-label="Surface">
+              <button class="seg" data-surface="mesh" role="radio" aria-checked="true"
+                data-hint="Show the model you imported, with the field grid on it. This is the surface you brush on, so drawing a stroke switches back here.">
+                Input surface
+              </button>
+              <button class="seg" data-surface="output" role="radio" aria-checked="false"
+                data-hint="Show the extracted quad mesh on its own. Extracting switches here by itself; pressing this before you have extracted will extract first.">
+                Output mesh
+              </button>
+            </div>
+            <label class="check"><input type="checkbox" data-layer="grid" checked
+              data-hint="The red grid showing where the edge loops will run. It is drawn on the input surface, so it is only visible while that is." /><span>Field grid</span></label>
             <label class="check"><input type="checkbox" data-layer="strokes" checked /><span>Brush strokes</span></label>
             <label class="check"><input type="checkbox" data-layer="singularities" checked /><span>Singularities</span></label>
-            <label class="check"><input type="checkbox" data-layer="output" /><span>Output mesh</span></label>
           </section>
         </div>
       </aside>

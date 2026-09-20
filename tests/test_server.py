@@ -326,6 +326,86 @@ def test_a_stroke_that_misses_is_reported_and_the_socket_survives(client, torus)
         assert socket.drain() == []
 
 
+def test_clearing_strokes_re_solves_without_them(client, torus) -> None:
+    """The regression for a field that kept the shape a deleted stroke gave it.
+
+    There is no Solve button left, so nothing can correct this afterwards: if
+    removing a constraint does not re-solve, the stroke's influence is simply
+    permanent.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.FIELD)
+
+        origins, directions = equator_rays(torus)
+        socket.send(
+            MessageType.STROKE,
+            {"kind": 0, "solve": True},
+            {"ray_origins": origins, "ray_directions": directions},
+        )
+        socket.expect(MessageType.STROKE_RESULT)
+        while (combed := socket.expect(MessageType.STATUS)).get("active"):
+            time.sleep(0.05)
+        version = (combed.get("iterations_q"), combed.get("iterations_o"))
+
+        socket.send(MessageType.CLEAR_STROKES, {})
+        strokes = socket.expect(MessageType.STROKE_LIST)
+        assert strokes.get("count") == 0
+
+        # The solve started by the clear has to move the counters; the field
+        # sent afterwards is the one computed without the stroke.
+        for attempt in range(80):
+            state = socket.expect(MessageType.STATUS)
+            if (state.get("iterations_q"), state.get("iterations_o")) != version:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("clearing the strokes did not re-solve the field")
+
+
+def test_a_click_that_erases_nothing_does_not_re_solve(client, torus) -> None:
+    """A miss must not restart the solve the user is watching."""
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+        socket.send(MessageType.SOLVE, {"field": "both"})
+        socket.expect(MessageType.FIELD)
+        while socket.expect(MessageType.STATUS).get("active"):
+            time.sleep(0.05)
+
+        socket.send(
+            MessageType.ERASE_STROKE,
+            {"point": [50.0, 50.0, 50.0], "eye": [0.0, 0.0, 9.0], "radius": 0.01},
+        )
+        socket.expect(MessageType.STROKE_LIST)
+        time.sleep(0.3)
+
+        assert not any(
+            message.type == MessageType.STATUS and message.get("active")
+            for message in socket.drain()
+        ), "erasing nothing restarted the solver"
+
+
+def test_extract_solves_a_field_that_never_was(client, torus) -> None:
+    """Without a Solve button, extraction has to guarantee its own input.
+
+    Extracting an unsolved hierarchy reads the solver's random initial state,
+    which produces a mesh that looks plausible and means nothing.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)  # deliberately no SOLVE
+
+        socket.send(MessageType.EXTRACT, {})
+        extracted = socket.expect(MessageType.EXTRACTED)
+        field = socket.expect(MessageType.FIELD)
+
+    assert extracted.get("n_faces") > 0
+    assert field.get("iterations_q") >= 0, "the field was never solved"
+
+
 def test_extract_and_export(client, torus) -> None:
     with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
         socket = Socket(ws)
