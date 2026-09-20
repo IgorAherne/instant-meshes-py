@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
-import trimesh
 import uvicorn
 from fastapi import (
     FastAPI,
@@ -38,10 +37,11 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import _core, protocol, uv
+from . import _core, assets, protocol, uv
+from .assets import AssetError, SourceMesh
 from .protocol import MessageType
 from .uv import UvLayout
 from .session_manager import (
@@ -78,7 +78,7 @@ WS_MAX_SIZE = 256 * 1024 * 1024
 
 #: Formats load_mesh_file can read. Kept here so the upload route can reject an
 #: unusable file before it reaches a parser.
-MESH_SUFFIXES = frozenset({".obj", ".ply", ".stl", ".off"})
+MESH_SUFFIXES = assets.SUFFIXES
 
 #: Stroke flavours a client may name, mapped to the session call they select.
 _STROKE_KINDS: Dict[Any, str] = {
@@ -133,24 +133,30 @@ def _rows(array: Any, width: int, what: str) -> np.ndarray:
     return values
 
 
-def load_mesh_file(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Read any trimesh-supported file down to triangles and merged vertices."""
-    if not path.is_file():
-        raise SessionError(f"no such mesh file: {path}")
+def read_source(path: Path) -> SourceMesh:
+    """Read a model file with its materials and maps, as SessionError on failure."""
     try:
-        loaded = trimesh.load(path, force="mesh", process=True)
-    except Exception as exc:
-        raise SessionError(f"could not read {path.name}: {exc}") from exc
+        return assets.load_source(path)
+    except AssetError as exc:
+        raise SessionError(str(exc)) from exc
 
-    if not isinstance(loaded, trimesh.Trimesh):
-        raise SessionError(
-            f"{path.name} is a {type(loaded).__name__}, not a triangle mesh; "
-            "point clouds and curves are not supported"
-        )
-    faces = np.asarray(loaded.faces)
-    if faces.ndim != 2 or faces.shape[1] != 3 or faces.shape[0] == 0:
-        raise SessionError(f"{path.name} does not contain any triangles")
-    return np.asarray(loaded.vertices, dtype=np.float32), faces.astype(np.uint32, copy=False)
+
+def load_mesh_file(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Read any supported file down to the triangles the remesher takes."""
+    try:
+        return assets.solver_mesh(read_source(path))
+    except AssetError as exc:
+        raise SessionError(str(exc)) from exc
+
+
+def _require_source(sessions: SessionRegistry, session_id: str) -> SourceMesh:
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    source = session.source
+    if source is None:
+        raise HTTPException(status_code=404, detail="this session has no imported model")
+    return source
 
 
 def _as_config(values: Any, what: str) -> Optional[Mapping[str, Any]]:
@@ -180,10 +186,11 @@ def _extraction_options(
 # ---------------------------------------------------------------------------
 
 
-def _geometry_frame(geometry: Geometry) -> bytes:
+def _geometry_frame(geometry: Geometry, version: int = 0) -> bytes:
     lo = geometry.vertices.min(axis=0)
     hi = geometry.vertices.max(axis=0)
     header = {
+        "version": int(version),
         "name": geometry.name,
         "n_vertices": int(geometry.vertices.shape[0]),
         "n_faces": int(geometry.faces.shape[0]),
@@ -228,11 +235,17 @@ def _singularity_frame(singularities: Singularities) -> bytes:
     return protocol.encode(MessageType.SINGULARITIES, header, arrays)
 
 
-def _stroke_frame(result: StrokeResult) -> bytes:
+def _stroke_frame(result: StrokeResult, resent: bool = False) -> bytes:
     header = {
         "stroke_id": int(result.stroke_id),
         "kind": result.kind,
         "n_points": int(result.positions.shape[0]),
+        # A rebuild re-projects every stroke and sends the results, which look
+        # exactly like a stroke that was just drawn. The viewport shows the
+        # input surface when one is drawn -- a brush needs something to draw on
+        # -- and without this an echo of an old stroke took the view away from
+        # whoever was looking at the result.
+        "resent": bool(resent),
     }
     arrays = {
         "positions": result.positions,
@@ -242,7 +255,7 @@ def _stroke_frame(result: StrokeResult) -> bytes:
     return protocol.encode(MessageType.STROKE_RESULT, header, arrays)
 
 
-def _uv_frame(layout: UvLayout) -> bytes:
+def _uv_frame(layout: UvLayout, version: int = 0) -> bytes:
     """The flattened mesh, as the viewer draws it.
 
     Sent as an index space of its own rather than as ready-made line segments:
@@ -251,6 +264,7 @@ def _uv_frame(layout: UvLayout) -> bytes:
     quad-dominant face array.
     """
     header = {
+        "version": int(version),
         "n_charts": int(layout.chart_count),
         "n_faces": int(layout.faces.shape[0]),
         "posy": int(layout.faces.shape[1]),
@@ -270,8 +284,9 @@ def _uv_frame(layout: UvLayout) -> bytes:
     return protocol.encode(MessageType.UV_LAYOUT, header, arrays)
 
 
-def _extracted_frame(extraction: Extraction) -> bytes:
+def _extracted_frame(extraction: Extraction, version: int = 0) -> bytes:
     header = {
+        "version": int(version),
         "n_vertices": int(extraction.vertices.shape[0]),
         "n_faces": int(extraction.faces.shape[0]),
         "posy": int(extraction.faces.shape[1]) if extraction.faces.size else 0,
@@ -399,12 +414,13 @@ class _Connection:
                 # is only watching a long solve.
                 self.session.touch()
 
-                # Before anything else, and alone: an unwrap owns the
-                # session's worker thread for its duration, so the status read
-                # below would queue behind it and arrive once, at the end,
-                # describing a wait that was already over.
-                if await self._send_uv_progress():
-                    continue
+                # First, because it is the one report that costs nothing: it
+                # reads a plain attribute rather than the session's worker.
+                # The rest of the tick still runs -- an unwrap no longer holds
+                # that worker, and muting the stream for its duration is what
+                # left the viewport unable to see that the solve it was
+                # waiting for had finished.
+                await self._send_uv_progress()
 
                 try:
                     # A mesh can arrive from the Gradio panel rather than from
@@ -478,6 +494,15 @@ class _Connection:
             await self._send(protocol.encode(MessageType.PROGRESS, {"uv": progress}))
         return progress is not None
 
+    def _stamp(self) -> int:
+        """The geometry version every result frame is labelled with.
+
+        A result takes seconds to build and the mesh can be replaced while it
+        is in flight, so a client needs to be able to tell that the extraction
+        it has just been handed describes the mesh before the last rebuild.
+        """
+        return self.session.geometry_version
+
     async def _send_geometry(self, geometry: Geometry) -> None:
         """Answer a mesh change this socket asked for.
 
@@ -485,7 +510,7 @@ class _Connection:
         repeating the same frame on its next tick.
         """
         self._sent_geometry_version = self.session.geometry_version
-        await self._send(_geometry_frame(geometry))
+        await self._send(_geometry_frame(geometry, self._stamp()))
         await self._send_status()
 
     async def _send_geometry_if_new(self) -> bool:
@@ -505,7 +530,7 @@ class _Connection:
         if geometry is None:
             return False
 
-        await self._send(_geometry_frame(geometry))
+        await self._send(_geometry_frame(geometry, self._stamp()))
         await self._send_status()
         return True
 
@@ -543,6 +568,15 @@ class _Connection:
             # answer with an error.
             uv=uv.available(),
             uv_leniency=self.session.uv_leniency,
+            # Repeated here as well as in its own frame so the control's label
+            # is self-correcting: a client that missed the report saying an
+            # unwrap had ended would otherwise print a percentage forever.
+            uv_progress=self.session.uv_progress,
+            version=self.session.geometry_version,
+            # How many texture slots the imported file filled. The viewport
+            # offers one button per slot and none at all where there are none,
+            # which is every mesh format that carries no materials.
+            textures=len(self.session.source.slots) if self.session.source else 0,
         )
         # Record what actually went out, not what a caller intended to report:
         # a handler that answers SOLVE with active=True must leave the streamer
@@ -583,19 +617,23 @@ class _Connection:
         # The name ends up in a file name on export, so it has to be text.
         name = message.get("name")
         name = str(name) if name is not None else None
+        source: Optional[SourceMesh] = None
         if "vertices" in message.arrays and "faces" in message.arrays:
             vertices = _rows(message.arrays["vertices"], 3, "vertices")
             faces = _rows(message.arrays["faces"], 3, "faces")
         elif message.get("path"):
-            source = Path(str(message.get("path")))
-            vertices, faces = await asyncio.to_thread(load_mesh_file, source)
-            name = name or source.name
+            path = Path(str(message.get("path")))
+            source = await asyncio.to_thread(read_source, path)
+            vertices, faces = await asyncio.to_thread(assets.solver_mesh, source)
+            name = name or path.name
         else:
             raise SessionError(
                 "LOAD_MESH needs either vertices/faces arrays or a 'path' header"
             )
 
-        geometry = await self.session.load_mesh(vertices, faces, name or "mesh", config)
+        geometry = await self.session.load_mesh(
+            vertices, faces, name or "mesh", config, source=source
+        )
         await self._send_geometry(geometry)
 
     async def _on_set_config(self, message: protocol.Message) -> None:
@@ -612,7 +650,7 @@ class _Connection:
         # replacements, or the viewport shows a mesh with no visible reason
         # for the shape its flow has taken.
         for stroke in await self.session.stroke_curves():
-            await self._send(_stroke_frame(stroke))
+            await self._send(_stroke_frame(stroke, resent=True))
         await self._send_stroke_list()
 
     async def _on_stroke(self, message: protocol.Message) -> None:
@@ -687,7 +725,7 @@ class _Connection:
 
     async def _on_extract(self, message: protocol.Message) -> None:
         extraction = await self.session.extract(*_extraction_options(message))
-        await self._send(_extracted_frame(extraction))
+        await self._send(_extracted_frame(extraction, self._stamp()))
         await self._send_status()
 
     async def _on_unwrap(self, message: protocol.Message) -> None:
@@ -695,7 +733,7 @@ class _Connection:
         layout = await self.session.unwrap(
             None if leniency is None else float(leniency)
         )
-        await self._send(_uv_frame(layout))
+        await self._send(_uv_frame(layout, self._stamp()))
         await self._send_status()
 
     async def _on_export(self, message: protocol.Message) -> None:
@@ -719,7 +757,7 @@ class _Connection:
                 layout = await self.session.unwrap(
                     None if leniency is None else float(leniency)
                 )
-                await self._send(_uv_frame(layout))
+                await self._send(_uv_frame(layout, self._stamp()))
             except SessionError as exc:
                 await self._send_error(f"exported without a UV layout: {exc}")
         path = await self.session.export_mesh(fmt)
@@ -728,7 +766,7 @@ class _Connection:
         # size under the button has to be the size of the file that just left.
         extraction = await self.session.extraction()
         if extraction is not None:
-            await self._send(_extracted_frame(extraction))
+            await self._send(_extracted_frame(extraction, self._stamp()))
         header = {
             "url": f"/api/session/{self.session.id}/export",
             "filename": path.name,
@@ -854,19 +892,24 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
         if not payload:
             raise HTTPException(status_code=400, detail="the uploaded file is empty")
 
-        # trimesh reads from disk, and a parser should never see the raw upload
-        # path, so it lands in a scratch file that is removed either way.
+        # The readers work from disk, and a parser should never see the raw
+        # upload path, so it lands in a scratch file removed either way.
         with tempfile.TemporaryDirectory(prefix="imb-upload-") as scratch:
             path = Path(scratch) / f"mesh{suffix}"
             path.write_bytes(payload)
             try:
-                vertices, faces = await asyncio.to_thread(load_mesh_file, path)
+                source = await asyncio.to_thread(read_source, path)
+                vertices, faces = await asyncio.to_thread(assets.solver_mesh, source)
             except Exception as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
             try:
                 geometry = await session.load_mesh(
-                    vertices, faces, Path(file.filename or "mesh").name, settings
+                    vertices,
+                    faces,
+                    Path(file.filename or "mesh").name,
+                    settings,
+                    source=source,
                 )
             except SessionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -877,7 +920,50 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
             "n_faces": int(geometry.faces.shape[0]),
             "scale": float(geometry.scale),
             "config": session.config,
+            "textures": len(source.slots),
         }
+
+    @app.get("/api/session/{session_id}/source")
+    async def source_mesh(session_id: str) -> Response:
+        """The imported model as authored, for the textured views.
+
+        Served over HTTP rather than pushed down the socket: it is the one
+        thing the viewport needs that never changes while a session lives, so
+        it is fetched once and then belongs to the browser's cache.
+        """
+        source = _require_source(sessions, session_id)
+        header = {
+            "name": source.name,
+            "n_vertices": int(source.vertices.shape[0]),
+            "n_faces": int(source.faces.shape[0]),
+            "slots": source.slots,
+            "materials": [material.name for material in source.materials],
+            # (material, first face, face count) -- one draw call each.
+            "groups": [list(group) for group in source.groups],
+        }
+        frame = protocol.encode(
+            MessageType.GEOMETRY,
+            header,
+            {"vertices": source.vertices, "uv": source.uv, "faces": source.faces},
+        )
+        return Response(content=frame, media_type="application/octet-stream")
+
+    @app.get("/api/session/{session_id}/texture/{slot}/{material}")
+    async def texture(session_id: str, slot: int, material: int) -> Response:
+        """One material's map for one slot, as the bytes a browser decodes."""
+        source = _require_source(sessions, session_id)
+        image = source.texture(int(slot), int(material))
+        if image is None:
+            raise HTTPException(
+                status_code=404, detail="that material has no map in that slot"
+            )
+        return Response(
+            content=image.data,
+            media_type=image.mime,
+            # Immutable for the life of the session: the id is in the path and
+            # a new import mints a new one.
+            headers={"cache-control": "private, max-age=3600"},
+        )
 
     @app.get("/api/session/{session_id}/export")
     async def download_export(session_id: str) -> FileResponse:

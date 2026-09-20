@@ -43,14 +43,19 @@
           <section class="block">
             <h2>Mesh</h2>
             <button class="wide primary hero" id="btn-open"
-              data-hint="Load an OBJ, PLY, STL or OFF file. The field is solved for you as soon as it is in, so the grid preview appears without pressing anything else.">
+              data-hint="Load an OBJ, PLY, STL, OFF, glTF, glB, DAE or FBX file. The field is solved for you as soon as it is in, so the grid preview appears without pressing anything else.">
               Import mesh
             </button>
-            <input type="file" id="file-input" accept=".obj,.ply,.stl,.off" hidden />
+            <input type="file" id="file-input" hidden />
             <p class="row muted" id="mesh-line" hidden>
               <span id="mesh-name"></span>
               <span id="mesh-stats"></span>
             </p>
+            <!-- One button per texture map the file carried, filled in from
+                 script because how many there are is a property of the model.
+                 Absent entirely for the formats that carry none. -->
+            <div class="textures" id="texture-slots" role="radiogroup"
+                 aria-label="Texture maps" hidden></div>
           </section>
 
           <!-- The separators are flex items, not borders: the panel's spare

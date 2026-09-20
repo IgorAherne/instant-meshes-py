@@ -529,6 +529,31 @@ kbd {
     background: var(--accent-hot);
 }
 
+/* The imported file's own texture maps, one button each. Sized like the field
+   toggles above, since they are the same kind of control -- a row of small
+   choices -- but only one of them is ever on. */
+.textures {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    margin-top: 7px;
+}
+
+.texture {
+    flex: 1 1 0;
+    min-width: 42px;
+    padding: 4px 2px;
+    font-size: 10px;
+    text-align: center;
+}
+
+.texture[aria-checked="true"],
+.texture[aria-checked="true"]:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Stage                                                              */
 /* ------------------------------------------------------------------ */

@@ -175,6 +175,20 @@ def test_the_asset_mount_leaves_gradios_alone(client) -> None:
     assert client.get("/static/style.css").status_code == 404
 
 
+def test_the_file_pickers_filter_matches_what_the_route_accepts() -> None:
+    """The picker's list is a copy, and a copy can drift.
+
+    A format missing from it cannot be chosen at all; one that is there but
+    not accepted is a file chosen and then refused, which is worse.
+    """
+    from instant_meshes_brush.server import MESH_SUFFIXES, STATIC_DIR
+
+    panel = (STATIC_DIR / "panel.js").read_text(encoding="utf-8")
+    accept = re.search(r"MESH_ACCEPT = '([^']+)'", panel)
+    assert accept, "panel.js no longer declares MESH_ACCEPT"
+    assert set(accept.group(1).split(",")) == set(MESH_SUFFIXES)
+
+
 def test_unknown_session_is_refused(client) -> None:
     with pytest.raises(Exception):
         with client.websocket_connect("/ws/not-a-real-session"):
@@ -736,10 +750,8 @@ def test_unwrapping_reports_its_progress_while_it_runs(
 ) -> None:
     """The fraction has to arrive during the wait, not after it.
 
-    An unwrap holds the session's single worker thread, so the streamer cannot
-    build a status frame while one runs -- every call it would need is queued
-    behind the job being reported on. The progress frame is built from the
-    event loop's side alone, which is the only thing that can get out.
+    It is read straight off the session rather than through the worker thread,
+    so it is the one report that cannot queue behind the job it describes.
     """
     with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
         socket = Socket(ws)
@@ -762,6 +774,216 @@ def test_unwrapping_reports_its_progress_while_it_runs(
     moving = [value for value in reported if value is not None]
     assert moving == sorted(moving), f"progress went backwards: {moving}"
     assert max(moving) >= 0.5
+
+
+def test_the_session_keeps_answering_while_an_unwrap_runs(
+    client, torus, slow_unwrap
+) -> None:
+    """The stream must not go quiet for the length of an unwrap.
+
+    xatlas needs nothing from the core, so it runs off the session's single
+    worker thread; while it held that thread no status could be read, and the
+    viewport sat through a multi-second flatten unable to learn that the solve
+    it was waiting on had finished -- which is how a burst of view keys left it
+    saying "solving" with nothing on screen and no way back.
+    """
+    import asyncio
+
+    async def exercise() -> None:
+        session = await registry_of(client).create()
+        await session.load_mesh(
+            np.asarray(torus.vertices),
+            np.asarray(torus.faces),
+            "torus.obj",
+            {"vertex_count": 150, "deterministic": True},
+        )
+        unwrapping = asyncio.create_task(session.unwrap(0.5))
+        # The stub sleeps 0.45s in total; every status read here would have
+        # queued behind it, and the last one would have landed after the wait.
+        answered = 0
+        while not unwrapping.done():
+            await session.status()
+            answered += 1
+            await asyncio.sleep(0.02)
+        await unwrapping
+        assert answered >= 5, f"only {answered} status reads got through"
+        assert session.uv_progress is None
+        await session.close()
+
+    asyncio.run(exercise())
+
+
+def test_an_abandoned_unwrap_cannot_resurrect_its_progress(torus) -> None:
+    """A thread whose future was dropped keeps running, and keeps reporting.
+
+    Its next report used to set a progress value that nothing was left to
+    clear, and a session that reads as permanently busy is one whose viewport
+    never gets another status frame.
+    """
+    import asyncio
+
+    async def exercise() -> None:
+        session = session_manager.BrushSession("test-abandoned")
+        await session.open()
+        try:
+            stale = session._progress_reporter(session._uv_run)
+            session._uv_run += 1  # as the end of an unwrap does
+            session._uv_progress = None
+            stale(0.5)
+            assert session.uv_progress is None
+        finally:
+            await session.close()
+
+    asyncio.run(exercise())
+
+
+def test_extracting_waits_for_a_running_solve_rather_than_cutting_it_short(
+    client, torus
+) -> None:
+    """Asking to see the result must not throw away the solve in progress.
+
+    Extraction stops the solver so that what it reads is self-consistent, and
+    stopping one that a brush stroke had just started left the field half
+    solved with nothing to restart it: pressing 2 during a solve quietly
+    abandoned the rest of it and extracted the state it happened to be in.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus, vertex_count=400)
+
+        socket.send(MessageType.SOLVE, {"field": "both", "level": -1})
+        socket.expect(MessageType.STATUS)
+        socket.send(MessageType.EXTRACT, {})
+
+        # The reader is serial, so the round that carries the extraction also
+        # carries the status the handler sent straight after it.
+        frames = []
+        for _ in range(60):
+            frames += socket.drain()
+            if any(m.type == MessageType.EXTRACTED for m in frames):
+                break
+            time.sleep(0.05)
+        assert any(m.type == MessageType.EXTRACTED for m in frames), "never extracted"
+
+        # The extraction only comes back once the solve it waited for is done,
+        # so by then both counters have to have been published.
+        status = [m for m in frames if m.type == MessageType.STATUS][-1]
+        assert status.get("solving") is False
+        assert status.get("iterations_q") >= 0
+        assert status.get("iterations_o") >= 0
+
+
+def test_a_rebuilt_stroke_is_marked_as_resent(client, torus) -> None:
+    """A rebuild re-projects its strokes; that is not somebody drawing.
+
+    The viewport shows the input surface whenever a stroke arrives, because a
+    brush needs something to draw on. An echo of an old stroke that is not
+    marked takes the view away from whoever was looking at the result.
+    """
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        load_mesh(socket, torus)
+
+        origins, directions = equator_rays(torus)
+        socket.send(
+            MessageType.STROKE,
+            {"kind": 0, "solve": False},
+            {"ray_origins": origins, "ray_directions": directions},
+        )
+        drawn = socket.expect(MessageType.STROKE_RESULT)
+        assert drawn.get("resent") is False
+
+        socket.send(MessageType.SET_CONFIG, {"config": {"vertex_count": 220}})
+        # Both arrive in the same round, and expect() drops whatever shares a
+        # round with its match.
+        _, echoed = socket.expect_all(MessageType.GEOMETRY, MessageType.STROKE_RESULT)
+        assert echoed.get("resent") is True
+
+
+def registry_of(client) -> SessionRegistry:
+    return client.app.state.registry
+
+
+# ---------------------------------------------------------------------------
+#  The imported file's own materials
+# ---------------------------------------------------------------------------
+
+
+def _textured_glb(torus) -> bytes:
+    """A glB of the torus with one material and one base colour map."""
+    trimesh = pytest.importorskip("trimesh")
+    image = pytest.importorskip("PIL.Image")
+
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(torus.vertices, dtype=np.float64),
+        faces=np.asarray(torus.faces),
+        process=False,
+    )
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=np.zeros((len(mesh.vertices), 2)),
+        material=trimesh.visual.material.PBRMaterial(
+            name="shell", baseColorTexture=image.new("RGB", (16, 16), (12, 200, 90))
+        ),
+    )
+    return trimesh.Scene(mesh).export(file_type="glb")
+
+
+def test_an_uploaded_model_keeps_its_maps_for_the_viewport(client, torus) -> None:
+    """The file as authored, alongside the welded copy the solver works on.
+
+    They are different meshes on purpose: the maps are pinned to UVs that only
+    exist on the unwelded original, and the remesher cannot take that one.
+    """
+    session_id = open_session(client)
+    upload = client.post(
+        f"/api/session/{session_id}/mesh",
+        files={"file": ("torus.glb", _textured_glb(torus), "model/gltf-binary")},
+        data={"config": '{"vertex_count": 150}'},
+    )
+    assert upload.status_code == 200, upload.text
+    assert upload.json()["textures"] == 1, "the base colour map was not found"
+
+    source = client.get(f"/api/session/{session_id}/source")
+    assert source.status_code == 200
+    frame = protocol.decode(source.content)
+    assert frame.header["slots"] == ["base colour"]
+    assert frame.header["materials"] == ["shell"]
+    # Grouped by material, which is what lets the viewer draw one run each.
+    assert sum(count for _, _, count in frame.header["groups"]) == frame.header["n_faces"]
+    assert frame.arrays["uv"].shape == (frame.header["n_vertices"], 2)
+
+    image = client.get(f"/api/session/{session_id}/texture/0/0")
+    assert image.status_code == 200
+    assert image.headers["content-type"] in ("image/jpeg", "image/png")
+    assert len(image.content) > 0
+
+    # A slot that material has nothing in is a 404, which is what tells the
+    # viewer to draw it flat rather than leave the previous map on it.
+    assert client.get(f"/api/session/{session_id}/texture/3/0").status_code == 404
+
+
+def test_a_model_with_no_materials_offers_no_texture_buttons(client, torus) -> None:
+    """Which is every format the viewer took before this, and the usual case."""
+    with client.websocket_connect(f"/ws/{open_session(client)}") as ws:
+        socket = Socket(ws)
+        # LOAD_MESH answers with the geometry and a status in one round, and
+        # expect() drops whatever shares a round with its match.
+        socket.send(
+            MessageType.LOAD_MESH,
+            {"name": "torus.obj", "config": {"vertex_count": 150}},
+            {"vertices": np.asarray(torus.vertices), "faces": np.asarray(torus.faces)},
+        )
+        _, status = socket.expect_all(MessageType.GEOMETRY, MessageType.STATUS)
+    assert status.get("textures") == 0
+
+
+def test_the_source_of_a_session_with_no_import_is_a_404(client, torus) -> None:
+    """A mesh pushed over the socket as arrays was never a file."""
+    session_id = open_session(client)
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        load_mesh(Socket(ws), torus)
+    assert client.get(f"/api/session/{session_id}/source").status_code == 404
+    assert client.get(f"/api/session/{session_id}/texture/0/0").status_code == 404
 
 
 @pytest.mark.skipif(not uv.available(), reason="xatlas is not installed")

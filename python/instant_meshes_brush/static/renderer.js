@@ -632,6 +632,39 @@ function createPointMaterial({ worldSize, minPixels, maxPixels }) {
 /*  Viewer                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Decode one texture map into a GPU texture, or null where there is none.
+ *
+ * The browser does the decoding, from the bytes the file itself carried, so a
+ * 4K map is never re-encoded on its way here. A 404 is the ordinary answer for
+ * a material with no map of the kind being asked for.
+ *
+ * The bitmap is flipped as it is decoded rather than by the unpack flag: three
+ * cannot apply that flag to an ImageBitmap, and an unflipped map lands on the
+ * model upside down.
+ *
+ * @param {string} url
+ * @returns {Promise<THREE.Texture|null>}
+ */
+export async function loadTexture(url) {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+
+    const bitmap = await createImageBitmap(await response.blob(), {
+        imageOrientation: 'flipY',
+    });
+    const texture = new THREE.Texture(bitmap);
+    texture.flipY = false;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.generateMipmaps = true;
+    texture.needsUpdate = true;
+    return texture;
+}
+
 export class Viewer {
     /**
      * @param {HTMLCanvasElement} canvas   WebGL2 target
@@ -697,6 +730,10 @@ export class Viewer {
             strokes: true,
             singularities: true,
             output: false,
+            /* The imported model with its own maps on it. It stands in the
+               same place as the input surface and replaces it, rather than
+               being drawn with it: two coincident surfaces are z-fighting. */
+            source: false,
         };
 
         this._buildLayers();
@@ -797,6 +834,19 @@ export class Viewer {
         this.outputWireframe.visible = false;
         this.outputWireframe.name = 'output';
         this.scene.add(this.outputWireframe);
+
+        /* The imported model, drawn unlit with the maps its author gave it.
+           One Mesh with a material per material in the file: the face array
+           arrives sorted by material, so each one is a group -- a draw call
+           over a run of the index buffer -- and nothing has to be looked up
+           per face. */
+        this.sourceMesh = new THREE.Mesh(emptyGeometry(), []);
+        this.sourceMesh.frustumCulled = false;
+        this.sourceMesh.visible = false;
+        this.sourceMesh.name = 'source';
+        this.scene.add(this.sourceMesh);
+        this._sourceMaterials = [];
+        this._hasSource = false;
 
         this._strokeHandles = [];
         this._hasOutput = false;
@@ -1145,10 +1195,110 @@ export class Viewer {
     }
 
     /* -------------------------------------------------------------- */
+    /*  The imported model, with its own materials                     */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Install the file's own geometry, as authored.
+     *
+     * Not the mesh the solver works on: that one has had its UV seams welded
+     * shut and may have been subdivided, so the maps would not land on it.
+     * This is the original, and it exists only to be looked at.
+     *
+     * @param {{positions: Float32Array, uv: Float32Array,
+     *          indices: Uint32Array, groups: Array<number[]>,
+     *          materials: number} | null} data
+     */
+    setSourceMesh(data) {
+        this._disposeSourceTextures();
+        if (this.sourceMesh.geometry) this.sourceMesh.geometry.dispose();
+
+        if (!data || !data.positions || !data.indices || data.indices.length === 0) {
+            this.sourceMesh.geometry = emptyGeometry();
+            this.sourceMesh.material = [];
+            this._sourceMaterials = [];
+            this._hasSource = false;
+            this._applySource();
+            return;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
+        geometry.setAttribute('uv', new THREE.BufferAttribute(data.uv, 2));
+        geometry.setIndex(new THREE.BufferAttribute(data.indices, 1));
+
+        /* Index counts, not face counts: a group is a slice of the index
+           buffer, and the server counts in whole triangles. */
+        const groups = data.groups && data.groups.length
+            ? data.groups
+            : [[0, 0, data.indices.length / 3]];
+        for (const [material, first, count] of groups) {
+            geometry.addGroup(first * 3, count * 3, material);
+        }
+
+        const count = Math.max(1, data.materials || groups.length);
+        this._sourceMaterials = [];
+        for (let i = 0; i < count; ++i) {
+            /* Unlit on purpose: a map is being inspected, not rendered, and a
+               light of ours would be one more thing between the file and what
+               is on screen. Double sided because a model authored for a
+               renderer that culls nothing often is. */
+            this._sourceMaterials.push(
+                new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
+            );
+        }
+        this.sourceMesh.geometry = geometry;
+        this.sourceMesh.material = this._sourceMaterials;
+        this._hasSource = true;
+        this._applySource();
+    }
+
+    /**
+     * Put one map on each material, or pass null to take them all off.
+     *
+     * A material with nothing for the chosen slot goes flat grey rather than
+     * keeping the map from the slot before: the button says which map is being
+     * looked at, and a surface still wearing the previous one would be lying.
+     *
+     * @param {Array<THREE.Texture|null>|null} textures  one per material
+     */
+    setSourceTextures(textures) {
+        for (let i = 0; i < this._sourceMaterials.length; ++i) {
+            const material = this._sourceMaterials[i];
+            const texture = textures ? textures[i] || null : null;
+            if (material.map && material.map !== texture) material.map.dispose();
+            material.map = texture;
+            material.color.setHex(texture ? 0xffffff : 0x8a8a92);
+            material.needsUpdate = true;
+        }
+    }
+
+    /** Whether the textured original stands in for the input surface. */
+    setSourceVisible(visible) {
+        this.setLayerVisible('source', visible);
+    }
+
+    get hasSource() {
+        return this._hasSource;
+    }
+
+    _applySource() {
+        this.sourceMesh.visible = this._layers.source && this._hasSource;
+    }
+
+    _disposeSourceTextures() {
+        for (const material of this._sourceMaterials) {
+            if (material.map) material.map.dispose();
+            material.dispose();
+        }
+        this._sourceMaterials = [];
+    }
+
+    /* -------------------------------------------------------------- */
     /*  Layers and interaction state                                   */
     /* -------------------------------------------------------------- */
 
-    /** @param {'mesh'|'grid'|'strokes'|'singularities'|'output'} name */
+    /** @param {'mesh'|'grid'|'strokes'|'singularities'|'output'|'source'} name */
     setLayerVisible(name, visible) {
         if (!(name in this._layers)) {
             throw new Error(`unknown layer "${name}"`);
@@ -1167,6 +1317,9 @@ export class Viewer {
                 break;
             case 'singularities':
                 this.singularityMarkers.visible = visible && hasVertices(this.singularityMarkers);
+                break;
+            case 'source':
+                this._applySource();
                 break;
             default:
                 this.outputWireframe.visible = visible && this._hasOutput;

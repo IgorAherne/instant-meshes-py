@@ -8,7 +8,7 @@
 */
 
 /** Formats the upload route accepts; mirrored from server.MESH_SUFFIXES. */
-export const MESH_ACCEPT = '.obj,.ply,.stl,.off';
+export const MESH_ACCEPT = '.obj,.ply,.stl,.off,.glb,.gltf,.dae,.fbx';
 
 /** Symmetry presets, as (rosy, posy) pairs keyed by the select's value. */
 export const SYMMETRIES = {
@@ -167,6 +167,8 @@ export class Panel {
             clear: byId('btn-clear'),
             singularityCount: byId('singularity-count'),
 
+            textureSlots: byId('texture-slots'),
+
             uvZone: byId('uv-zone'),
             uvLeniency: byId('uv-leniency'),
             uvLabel: byId('uv-label'),
@@ -191,6 +193,10 @@ export class Panel {
         this._appliedConfig = null;
         this._settleTimer = 0;
         this._uvTimer = 0;
+
+        /* How many texture buttons are up, and which one is pressed. */
+        this._textureCount = 0;
+        this._textureSlot = null;
 
         /* The one status line shows the selected brush's help by default and
            borrows the space for a message, so both have to be remembered. */
@@ -257,6 +263,16 @@ export class Panel {
         for (const button of document.querySelectorAll('button.seg[data-surface]')) {
             on(button, 'click', () => call('onSurfaceChange', button.dataset.surface));
         }
+
+        /* Delegated, because these buttons are built when a model arrives and
+           replaced when the next one does. Pressing the one already down turns
+           it off: the maps are a way of looking at the model, not a mode. */
+        on(this.el.textureSlots, 'click', (event) => {
+            const button = event.target.closest('button.texture');
+            if (!button) return;
+            const slot = Number(button.dataset.slot);
+            call('onTextureChange', slot === this._textureSlot ? null : slot);
+        });
 
         /* Read at extraction time, so changing it makes the result on screen
            stale without needing a rebuild. `change` rather than `input`, so a
@@ -325,11 +341,23 @@ export class Panel {
     _settleConfig() {
         clearTimeout(this._settleTimer);
         this._settleTimer = setTimeout(() => {
+            this._settleTimer = 0;
             const config = this.readConfig();
             if (!this._appliedConfig || sameConfig(config, this._appliedConfig)) return;
             this._appliedConfig = config;
             if (this.handlers.onConfigChange) this.handlers.onConfigChange(config);
         }, CONFIG_SETTLE_MS);
+    }
+
+    /**
+     * Whether an edited setting is still waiting to be sent.
+     *
+     * The viewport asks before building a result: a mesh half a second from
+     * being rebuilt is not worth extracting, and the work would land just in
+     * time to be thrown away.
+     */
+    configPending() {
+        return Boolean(this._settleTimer);
     }
 
     /* -------------------------------------------------------------- */
@@ -428,9 +456,15 @@ export class Panel {
      * A control the user is currently in is left alone: status frames arrive
      * while a vertex count is half typed, and overwriting it there would fight
      * the person typing.
+     *
+     * So is every control, while an edit is still waiting to be sent. A status
+     * frame carries the config in force, which during those few hundred
+     * milliseconds is the one the edit is replacing: writing it back reverted
+     * the new value and then found nothing to apply, so a target typed while
+     * the solver happened to be busy silently did nothing at all.
      */
     showConfig(config) {
-        if (!config) return;
+        if (!config || this.configPending()) return;
         const editing = document.activeElement;
         const settable = (element) => element !== editing;
 
@@ -477,6 +511,55 @@ export class Panel {
     /** Hide the UV control outright where xatlas is not installed. */
     setUvAvailable(available) {
         this.el.uvZone.hidden = !available;
+    }
+
+    /**
+     * Offer one button per texture map the imported file carried.
+     *
+     * Rebuilt rather than shown and hidden, because the count is a property of
+     * the model: an OBJ has none and the row disappears, a glB may have two, a
+     * character FBX five. None starts pressed -- the model arrives shaded the
+     * way every other model in here is, and a map is something you ask for.
+     */
+    showTextures(count) {
+        const row = this.el.textureSlots;
+        const slots = Math.max(0, Number(count) || 0);
+        if (slots === this._textureCount) return;
+        this._textureCount = slots;
+
+        row.textContent = '';
+        row.hidden = slots === 0;
+        this._textureSlot = null;
+        for (let slot = 0; slot < slots; ++slot) {
+            const button = document.createElement('button');
+            button.className = 'texture';
+            button.dataset.slot = String(slot);
+            button.setAttribute('role', 'radio');
+            button.setAttribute('aria-checked', 'false');
+            button.textContent = `tex ${slot}`;
+            button.dataset.hint =
+                'Show this texture map on the imported model, unlit. Press it ' +
+                'again to go back to the shaded surface the field is drawn on.';
+            row.appendChild(button);
+        }
+    }
+
+    /** Which map is being shown, or null for the shaded surface. */
+    textureSlot() {
+        return this._textureSlot;
+    }
+
+    /** Select a map, or pass null for none. @returns {boolean} true on a change */
+    setTextureSlot(slot) {
+        const wanted = slot === null || slot === undefined ? null : Number(slot);
+        if (wanted === this._textureSlot) return false;
+        this._textureSlot = wanted;
+        for (const button of this.el.textureSlots.querySelectorAll('button.texture')) {
+            button.setAttribute(
+                'aria-checked', String(Number(button.dataset.slot) === wanted)
+            );
+        }
+        return true;
     }
 
     /**

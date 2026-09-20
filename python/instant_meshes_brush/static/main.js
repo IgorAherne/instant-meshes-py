@@ -12,9 +12,9 @@
     frame.
 */
 
-import { MessageType } from './protocol.js';
+import { MessageType, decode } from './protocol.js';
 import { Connection } from './net.js';
-import { Viewer } from './renderer.js';
+import { Viewer, loadTexture } from './renderer.js';
 import { TOOLS, ToolController } from './tools.js';
 import { Panel } from './panel.js';
 
@@ -30,6 +30,9 @@ const STROKE_KIND_EDGE = 1;
 
 /** Stroke ids start at 1, so 0 marks the transient curve of an attractor. */
 const ATTRACTOR_STROKE_ID = 0;
+
+/** What each view is waiting for, for the line that says it is waiting. */
+const BUILD_VERB = { output: 'Extracting', uv: 'Unwrapping' };
 
 function pickArray(arrays, ...names) {
     for (const name of names) {
@@ -118,6 +121,7 @@ function describeStroke(header) {
     return 'Stroke rejected: no surface under the cursor';
 }
 
+
 /* ------------------------------------------------------------------ */
 /*  Application                                                        */
 /* ------------------------------------------------------------------ */
@@ -144,9 +148,30 @@ class App {
         this.hasOutput = false;
         /* The atlas is cut from the extraction, so it goes stale with it. */
         this.hasUv = false;
-        /* One build of each kind in flight; see _chooseSurface. */
-        this._pendingExtract = false;
-        this._pendingUv = false;
+
+        /* The view the user last asked for. A wish rather than a command: what
+           it needs may not exist yet, and _pump builds it as soon as it can. */
+        this._wanted = 'mesh';
+        /* The one build allowed to be in flight: null, 'output' or 'uv'. */
+        this._building = null;
+        /* Set from SET_CONFIG until the GEOMETRY that answers it. Nothing is
+           built for a mesh that is already being replaced. */
+        this._rebuilding = false;
+        /* The server's geometry counter, which every result frame carries: a
+           build takes seconds, and one that lands after the mesh moved on
+           describes something the viewport is no longer showing. */
+        this._version = -1;
+        this._meshName = null;
+
+        /* The imported file as authored, fetched once per model, and the maps
+           of whichever slot is being looked at. Keyed on the model rather than
+           on the geometry version: re-targeting the resolution rebuilds the
+           solver's mesh and leaves the file it came from alone. */
+        this._sourceOf = null;
+        this._sourceLoading = null;
+        this._textureSlot = null;
+        this._textureReady = false;
+
         /* Markers per field, and which field the selected brush can reach. */
         this._singularityCounts = { orientation: 0, position: 0 };
         this._singularityField = null;
@@ -170,7 +195,8 @@ class App {
            them can only make the viewport lie about what is constraining the
            field. Deleting one is a click on its handle. */
         this.viewer.setLayerVisible('strokes', true);
-        this._applySurface(this.panel.surface());
+        this._wanted = this.panel.surface();
+        this._applySurface(this._wanted);
     }
 
     /**
@@ -291,19 +317,16 @@ class App {
         /* Pure quad and smoothing are read at extraction time, so the result
            on screen no longer matches them. Rebuild it now if it is what the
            user is looking at, and otherwise the next time they ask for it. */
-        this.panel.handlers.onExtractOptionsChange = (options) => {
+        this.panel.handlers.onExtractOptionsChange = () => {
             this._invalidateOutput();
-            if (this.panel.surface() !== 'output') return;
-            this.panel.setStatus('Extracting...', false);
-            if (this._pendingExtract) return;
-            this._pendingExtract = true;
-            send(MessageType.EXTRACT, options);
+            this._pump();
         };
 
         /* There is no Apply button: the panel sends this once the remeshing
            settings have stopped changing, and the GEOMETRY frame that comes
            back re-solves itself, so a new target resolution simply appears. */
         this.panel.handlers.onConfigChange = (config) => {
+            this._rebuilding = true;
             this.panel.setStatus('Rebuilding at the new resolution...', false);
             send(MessageType.SET_CONFIG, { config });
         };
@@ -315,63 +338,181 @@ class App {
 
         /* A different chart size is a different atlas; the one on screen is
            only worth re-cutting while somebody is looking at it. */
-        this.panel.handlers.onUvChange = () => {
-            this.hasUv = false;
-            if (this._showingUv()) this._requestUv();
-        };
+        this.panel.handlers.onUvChange = () => this._invalidateUv();
+
+        this.panel.handlers.onTextureChange = (slot) => this._showTexture(slot);
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  The imported file's own materials                              */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Put one of the model's own texture maps on it, or take them all off.
+     *
+     * The maps are authored against the file's UVs, which the mesh the solver
+     * works on no longer has -- its seams are welded shut and it may have been
+     * subdivided -- so this draws the original in its place. Both occupy the
+     * same space, so the swap reads as the surface changing rather than as
+     * something else appearing.
+     */
+    async _showTexture(slot) {
+        if (!this.panel.setTextureSlot(slot)) return;
+        this._textureSlot = this.panel.textureSlot();
+        this._textureReady = false;
+        this._refreshSurface();
+        if (this._textureSlot === null) return;
+
+        /* The model stays up while the maps decode, so the viewport is never
+           blank; the button is already down, which is the press being heard. */
+        const wanted = this._textureSlot;
+        this.panel.setStatus('Loading the texture...', false);
+        try {
+            const source = await this._loadSource();
+            const textures = await this._loadTextures(source, wanted);
+            if (this._textureSlot !== wanted) return;
+            this._apply(() => this.viewer.setSourceTextures(textures));
+            this._textureReady = true;
+            this.panel.setStatus(null, false);
+            this._refreshSurface();
+        } catch (err) {
+            this.panel.setStatus(`Could not show that map: ${err.message}`, true);
+            this.panel.setTextureSlot(null);
+            this._textureSlot = null;
+            this._refreshSurface();
+        }
+    }
+
+    /** Forget the imported file, for when a different one replaces it. */
+    _dropSource() {
+        this._sourceOf = null;
+        this._sourceLoading = null;
+        this._textureSlot = null;
+        this._textureReady = false;
+        this.panel.setTextureSlot(null);
+        this._apply(() => this.viewer.setSourceMesh(null));
+    }
+
+    /** Fetch the model as authored, once per import. */
+    _loadSource() {
+        if (this._sourceOf === this._meshName && this._sourceLoading) {
+            return this._sourceLoading;
+        }
+        this._sourceOf = this._meshName;
+        this._sourceLoading = (async () => {
+            const response = await fetch(
+                `/api/session/${encodeURIComponent(this.sessionId)}/source`
+            );
+            if (!response.ok) throw new Error(`the model could not be read back`);
+            const message = decode(await response.arrayBuffer());
+            const positions = pickArray(message.arrays, 'vertices');
+            const indices = pickArray(message.arrays, 'faces');
+            const uv = pickArray(message.arrays, 'uv');
+            if (!positions || !indices) throw new Error('the model frame is incomplete');
+
+            const materials = (message.header.materials || []).length || 1;
+            this._apply(() =>
+                this.viewer.setSourceMesh({
+                    positions,
+                    uv: uv || new Float32Array((positions.length / 3) * 2),
+                    indices,
+                    groups: message.header.groups || [],
+                    materials,
+                })
+            );
+            return { materials, slots: message.header.slots || [] };
+        })();
+        return this._sourceLoading;
+    }
+
+    /**
+     * One decoded map per material for the chosen slot.
+     *
+     * A material with nothing in that slot gets null, which the renderer draws
+     * flat: the button names a kind of map, and a surface that has none of
+     * that kind should say so rather than keep wearing another one.
+     */
+    async _loadTextures(source, slot) {
+        const base = `/api/session/${encodeURIComponent(this.sessionId)}/texture/${slot}`;
+        const loads = [];
+        for (let material = 0; material < source.materials; ++material) {
+            loads.push(loadTexture(`${base}/${material}`));
+        }
+        return Promise.all(loads);
     }
 
     _showingUv() {
-        return this.panel.surface() === 'uv';
+        return this._wanted === 'uv';
     }
 
     /**
-     * Switch the view, building whatever it needs.
+     * Choose the view to show, and remember it.
      *
      * There is no Extract button and no Unwrap button: asking to see a result
-     * IS the request to produce one. Anything that changes the field marks
-     * both stale, so this rebuilds rather than showing what was made before
-     * the last stroke.
-     *
-     * At most one build of each kind is ever in flight. The server answers
-     * frames in order and an extraction of a large mesh takes seconds, so
-     * without this a hand resting on the number keys queues a minute of work
-     * that nobody is waiting for any more.
+     * IS the request to produce one. The choice is kept rather than acted on
+     * once, so that a result which cannot be built yet -- because the mesh is
+     * being rebuilt, or because one is already being built -- is still built
+     * the moment it can be, instead of the keypress being swallowed.
      */
     _chooseSurface(which) {
+        this._wanted = which;
         this._setSurface(which);
-        if (which === 'output' && !this.hasOutput) {
+        this._pump();
+    }
+
+    /**
+     * Build what the chosen view needs, if anything, and if now is the time.
+     *
+     * Every path that changes what exists calls this rather than deciding for
+     * itself whether to send a request, which is what makes the viewport
+     * self-healing: in whatever order the frames arrive, as soon as the
+     * session is free the chosen view is either on screen or on its way.
+     *
+     * One build at a time, because the server answers frames in order and a
+     * large mesh takes seconds to extract or to flatten: without this, a hand
+     * resting on the number keys queues a minute of work nobody is waiting
+     * for any more, and everything typed behind it -- a new resolution, a
+     * stroke -- waits its turn at the back.
+     */
+    _pump() {
+        if (this._building) return;
+
+        const want = this._wanted;
+        const missing =
+            (want === 'output' && !this.hasOutput) || (want === 'uv' && !this.hasUv);
+        if (!missing) return;
+
+        /* Deferred, never dropped: this runs again from the GEOMETRY frame
+           that ends the rebuild, so the view still arrives. */
+        if (this._rebuilding || this.panel.configPending()) {
+            this.panel.setStatus(`${BUILD_VERB[want]} at the new resolution...`, false);
+            return;
+        }
+
+        this._building = want;
+        if (want === 'output') {
             this.panel.setStatus('Extracting...', false);
-            if (!this._pendingExtract) {
-                this._pendingExtract = true;
-                this.connection.send(MessageType.EXTRACT, this.panel.extractOptions());
-            }
-        } else if (which === 'uv' && !this.hasUv) {
-            this._requestUv();
+            this.connection.send(MessageType.EXTRACT, this.panel.extractOptions());
+        } else {
+            /* Said here rather than waiting for the server's first report:
+               that one cannot arrive until the request has crossed the socket
+               and the streamer has ticked, and a control that sits silent for
+               a fifth of a second reads as one that did not hear the click. */
+            this.panel.showUnwrapping(0);
+            this.connection.send(MessageType.UNWRAP, { leniency: this.panel.uvLeniency() });
         }
     }
 
     /**
-     * Ask for an atlas, once there is a field worth cutting one from.
+     * Forget a build that will never be answered, and try again.
      *
-     * Unwrapping extracts, and extracting stops the solver -- so a pointer
-     * that merely crosses this control on its way somewhere else must not
-     * abandon the solve a brush stroke just started. The request waits for the
-     * field instead, and _showStatus picks it up when the solve ends.
+     * Only three things end one: its own result frame, an error, or the mesh
+     * being replaced underneath it. A flag left set by a fourth is a viewport
+     * whose view keys have gone dead for good, which is exactly the state this
+     * exists to make unreachable.
      */
-    _requestUv() {
-        if (this._pendingUv) return;
-        if (this._solving) {
-            this.panel.setStatus('Unwrapping once the field has settled...', false);
-            return;
-        }
-        this._pendingUv = true;
-        /* Said here rather than waiting for the server's first report: that
-           one cannot arrive until the request has crossed the socket and the
-           streamer has ticked, and a control that sits silent for a fifth of
-           a second reads as one that did not hear the click. */
-        this.panel.showUnwrapping(0);
-        this.connection.send(MessageType.UNWRAP, { leniency: this.panel.uvLeniency() });
+    _abandonBuild() {
+        this._building = null;
     }
 
     /** Level -1 is the hierarchical schedule, which terminates on its own;
@@ -412,16 +553,21 @@ class App {
     _applySurface(which) {
         const output = which === 'output' && this.hasOutput;
         const layout = which === 'uv' && this.hasUv;
+        /* A texture map stands in for the input surface and only for that:
+           the result and the atlas are the remesher's own work, and the maps
+           the file came with say nothing about either. */
+        const textured = !output && !layout && this._textureReady;
         this._apply(() => {
             this.viewer.setLayerVisible('output', output);
             this.viewer.setUvVisible(which === 'uv');
-            this.viewer.setLayerVisible('mesh', !output && !layout);
+            this.viewer.setSourceVisible(textured);
+            this.viewer.setLayerVisible('mesh', !output && !layout && !textured);
         });
     }
 
     /** Re-apply the current view, for when what it needs has just arrived. */
     _refreshSurface() {
-        this._applySurface(this.panel.surface());
+        this._applySurface(this._wanted);
     }
 
     /**
@@ -452,7 +598,7 @@ class App {
         this.hasUv = false;
         this.panel.showUv(null);
         this.pending.uv = { layout: null };
-        if (this._showingUv()) this._requestUv();
+        this._pump();
     }
 
     /**
@@ -538,9 +684,28 @@ class App {
             this.panel.showUv(null);
             this._singularityCounts = { orientation: 0, position: 0 };
             this._showSingularityCount();
-            /* The grid is the point of importing a mesh, and solving it is the
-               only way to see one, so the step is not worth asking for. */
-            this._setSurface('mesh');
+
+            /* This mesh replaces whatever any in-flight build was reading, so
+               that build is over whether or not its frame ever arrives. */
+            this._version = header.version ?? this._version + 1;
+            this._rebuilding = false;
+            this._abandonBuild();
+
+            /* A different model is a different subject: the grid is the point
+               of importing one, and solving it is the only way to see one, so
+               the step is not worth asking for. Re-targeting the same model is
+               not -- the view asked for before the rebuild is still the view
+               wanted after it, and yanking it back to the input is what made a
+               new resolution look like it had cancelled the request. */
+            const name = header.name || '';
+            if (name !== this._meshName) {
+                this._meshName = name;
+                this._wanted = 'mesh';
+                /* A different file, so different materials and different UVs;
+                   the buttons are rebuilt from the status that follows. */
+                this._dropSource();
+            }
+            this._setSurface(this._wanted);
             this.panel.setStatus('Solving the field...', false);
             this._solve();
         });
@@ -565,8 +730,12 @@ class App {
                 return;
             }
             /* A stroke is drawn on the input surface, so seeing where it landed
-               means being back on it -- even if Extract hid it a moment ago. */
-            this._setSurface('mesh');
+               means being back on it -- even if Extract hid it a moment ago.
+               Drawing is a choice of view as much as a keypress is: it is the
+               input the user wants now, and the result is stale anyway.
+               A rebuild re-projects the strokes and sends them again; that is
+               not somebody drawing, and it must not take the view. */
+            if (!header.resent) this._chooseSurface('mesh');
 
             const stroke = decodeStrokeResult(header, arrays);
             if (!stroke) return;
@@ -585,6 +754,11 @@ class App {
         });
 
         conn.on(MessageType.UV_LAYOUT, (header, arrays) => {
+            /* Answered, whatever it says: a frame dropped below without this
+               would leave the view key that asked for it dead for good. */
+            if (this._building === 'uv') this._abandonBuild();
+            if (this._isStale(header)) return;
+
             const uv = pickArray(arrays, 'uv');
             const faces = pickArray(arrays, 'faces');
             const chart = pickArray(arrays, 'chart');
@@ -603,12 +777,17 @@ class App {
                 },
             };
             this.hasUv = true;
-            this._pendingUv = false;
             this.panel.showUv({ charts: header.n_charts ?? 0, leniency: header.leniency });
             this.panel.setStatus(null, false);
+            /* The atlas may not be what is wanted any more -- it is built from
+               an extraction, and asking for that one instead is a keypress. */
+            this._pump();
         });
 
         conn.on(MessageType.EXTRACTED, (header, arrays) => {
+            if (this._building === 'output') this._abandonBuild();
+            if (this._isStale(header)) return;
+
             const wireframe = pickArray(arrays, 'wireframe');
             const colors = pickArray(arrays, 'wireframe_color', 'wireframeColor', 'colors');
             if (!wireframe || !colors) {
@@ -632,13 +811,15 @@ class App {
             this.panel.showOutput({ vertices: vertexCount, faces: faceCount });
             this.panel.setStatus(`Extracted ${faceCount} faces`, false);
             this.hasOutput = faceCount > 0;
-            this._pendingExtract = false;
             /* Shown rather than selected: whoever asked for this already
                chose the view, and an extraction of a large mesh lands long
                enough afterwards that they may well have moved on. Pulling
                them back to it here is what made a burst of 1/2/3 end up
                somewhere nobody pressed. */
             this._refreshSurface();
+            /* An extraction is also the first half of an atlas, so the wish
+               that is waiting on it may now be buildable. */
+            this._pump();
         });
 
         conn.on(MessageType.EXPORT_READY, (header) => {
@@ -648,7 +829,7 @@ class App {
             this.panel.setStatus(`Exported ${header.filename}`, false);
             /* The one place a result is worth switching to unasked: this is
                what was just written, and seeing it is the point of the file. */
-            this._setSurface('output');
+            this._chooseSurface('output');
         });
 
         /* Its own frame rather than a field on STATUS: the unwrapper holds the
@@ -667,12 +848,37 @@ class App {
                running, so nothing else would take the label back down. */
             this.panel.showUnwrapping(null);
             /* A build that answered with an error answered all the same, and
-               nothing else clears the way for the next attempt. */
-            this._pendingExtract = false;
-            this._pendingUv = false;
+               nothing else clears the way for the next attempt. Not pumped
+               from here: a request that has just failed would only fail again,
+               and the next status frame or keypress is soon enough to retry. */
+            this._abandonBuild();
+            this._rebuilding = false;
         });
 
-        conn.onStatus((status) => this.panel.showLink(status));
+        conn.onStatus((status) => {
+            this.panel.showLink(status);
+            /* A socket that went away took the reply to anything in flight
+               with it. Reconnecting replays what was queued, not what was
+               already sent, so the wait has to be given up here or the view
+               keys stay dead for the life of the page. */
+            if (status.state !== 'open') {
+                this._abandonBuild();
+                this._rebuilding = false;
+            }
+        });
+    }
+
+    /**
+     * Whether a result describes a mesh the viewport has already replaced.
+     *
+     * A build takes seconds; a rebuild takes one keystroke. Without this, an
+     * extraction of the mesh from before the last resolution change arrives
+     * and is shown -- and, worse, counts as the output that exists, so the
+     * view the user is looking at is quietly of something else.
+     */
+    _isStale(header) {
+        return header.version !== undefined && this._version >= 0
+            && header.version < this._version;
     }
 
     _showStatus(header) {
@@ -684,16 +890,20 @@ class App {
         this._solving = running;
         if (header.ready !== undefined) this.panel.setReady(Boolean(header.ready));
         if (header.uv !== undefined) this.panel.setUvAvailable(Boolean(header.uv));
+        /* How many maps the imported file carried. Zero for every format that
+           has no materials, which is when the row is not there at all. */
+        if (header.textures !== undefined) this.panel.showTextures(header.textures);
+        /* Carried on every status as well as in its own frame, so a report
+           this client missed cannot leave a percentage on the label forever. */
+        if (header.uv_progress !== undefined) {
+            this.panel.showUnwrapping(header.uv_progress);
+        }
         this.panel.setSolving(running);
         /* The field has moved, so whatever was extracted from the old one no
-           longer describes it. Once per solve, not once per status frame. */
-        if (running && !this._wasSolving) {
-            this._invalidateOutput();
-            /* Dropping the output while it is the surface on screen would
-               leave an empty stage -- which is what erasing a stroke while
-               looking at the result used to do. */
-            if (this.panel.surface() === 'output') this._setSurface('mesh');
-        }
+           longer describes it. Once per solve, not once per status frame.
+           The selection stands: _applySurface holds the input up underneath
+           until the replacement arrives, so nothing has to be taken away. */
+        if (running && !this._wasSolving) this._invalidateOutput();
         this._wasSolving = running;
 
         if (header.config) this.panel.showConfig(header.config);
@@ -703,9 +913,10 @@ class App {
            that it is working is worth the space, and only while it is. */
         this.panel.setStatus(running ? 'Solving the field...' : null, false);
 
-        /* A layout asked for mid-solve was deferred rather than dropped. Last,
-           so the request's own message is the one left on the line. */
-        if (!running && this._showingUv() && !this.hasUv) this._requestUv();
+        /* Whatever happened, this is the point at which the session is known
+           to be idle or busy -- so it is the point at which what the user
+           asked to see gets built, if it still needs building. */
+        this._pump();
     }
 }
 

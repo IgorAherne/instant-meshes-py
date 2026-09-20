@@ -25,10 +25,17 @@ app = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "trimesh>=4.0",
+    # Decodes the texture maps a glTF or an FBX carries, and shrinks them to
+    # preview size. trimesh pulls it in for glTF anyway; named here because
+    # assets.py needs it for every format, not just that one.
+    "pillow>=9.0",
     # UV unwrapping of the extracted mesh. Optional at runtime -- the viewer
     # hides its UV control where this is missing -- but a remesher that cannot
     # hand back a texture space is half a retopology tool, so it ships with it.
     "xatlas>=0.0.9",
+    # FBX, which no pure-Python reader covers. Optional at runtime: without it
+    # every other format still loads and an FBX is refused by name.
+    "assimp-py>=1.0",
 ]
 dev = ["pytest>=7.0"]
 

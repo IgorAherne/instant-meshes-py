@@ -24,6 +24,8 @@ screen-space input handled by the GUI. This fork separates the two:
 | Distribution | build the app yourself | `pip install`, self-contained wheels |
 | Field preview | native OpenGL geometry shader | ported to WebGL2 in the browser |
 | Texture space | none | xatlas atlas on the quads, written into the OBJ |
+| Input formats | OBJ, PLY, ALN | those plus STL, OFF, glTF/glB, DAE and FBX |
+| Imported materials | ignored | kept, and the maps can be looked at on the model |
 
 The algorithm itself is untouched: same hierarchy, same field optimiser, same
 extraction, same results.
@@ -139,6 +141,44 @@ flattened into its texture space. Never two at once — the first two occupy the
 same space. Choosing either result builds one; drawing a stroke switches back
 to the input and marks both stale, so the next look at them is rebuilt from the
 field you just changed.
+
+Choosing a view is a standing request rather than a command that either lands
+or is lost. Only one result is ever being built at a time, and nothing is built
+for a mesh that is about to be rebuilt — so a burst of `1`/`2`/`3`, or a view
+key pressed in the middle of a re-target, costs one build rather than one per
+press, and the view you asked for appears as soon as the session is free.
+Asking for a result while the field is still moving waits for the solve instead
+of cutting it short.
+
+## Imported materials
+
+| Format | Geometry | UVs | Texture maps |
+|---|---|---|---|
+| OBJ, PLY, STL, OFF | yes | where the file has them | from the `.mtl`, if it is beside the file |
+| glTF, glB, DAE | yes | yes | yes, including the ones glB embeds |
+| FBX | needs `assimp-py` | yes | embedded ones; external ones only when opened from disk |
+
+A file with texture maps gets a row of **tex 0**, **tex 1** … buttons under its
+name, one per kind of map anything in it has — colour, normal, metal/rough,
+specular, emissive, occlusion, in that order, up to six. Pressing one draws the
+imported model unlit with that map on it; pressing it again goes back to the
+shaded surface the field is drawn on. None is pressed to begin with.
+
+The model you see there is the file as authored, not the mesh the remesher
+works on: the maps are pinned to UVs that only exist while the corners a seam
+split apart stay apart, and the remesher needs those welded shut. Both come out
+of one read. A material with no map of the kind being shown goes flat grey
+rather than keeping the one before it.
+
+Nothing is transferred onto the output mesh yet; this is for looking at what
+you imported.
+
+An FBX needs `assimp-py`, which ships with the `app` extra. Its texture maps
+have to be *embedded* in the file for a browser upload to carry them — the
+upload is one file, not the folder of maps beside it — and those are read out
+of the FBX directly, because Assimp's Python binding reports an embedded map as
+`*0` with no way to ask what `*0` holds. A file opened from a path on disk can
+also use maps sitting next to it.
 
 **UV chunks** cuts the atlas, and is the only xatlas control there is. The
 slider is how far one chunk may stretch before xatlas gives up on it and starts
@@ -315,6 +355,37 @@ texture indices rather than pointing it at the origin.
 no progress callback, so its own call is one opaque block — the number holds
 there and then jumps; the rest of the pipeline reports honestly.
 
+The unwrap runs off the session's worker thread, because it needs nothing from
+the C++ core and can take tens of seconds; while it held that thread no status
+could be read from the session at all, and a viewport watching one had no way
+to learn that anything else had finished.
+
+### Reading a model with its materials
+
+`instant_meshes_brush.assets` reads a file twice over, once for each consumer:
+
+```python
+from instant_meshes_brush import assets
+
+source = assets.load_source("character.glb")
+vertices, faces = assets.solver_mesh(source)     # welded, for the remesher
+
+print(source.slots)                              # ['base colour', 'normal']
+print([m.name for m in source.materials])
+skin = source.texture(0, 1)                      # slot 0 of material 1
+skin.mime, len(skin.data)                        # ('image/jpeg', 412_338)
+```
+
+`source` keeps the file as authored — corners split along every UV seam, faces
+sorted by material with `source.groups` naming the runs, and each material's
+maps decoded, shrunk to `MAX_TEXTURE_PX` and re-encoded as the bytes a browser
+takes directly. `solver_mesh` welds the seams shut and drops the triangles that
+collapse; a hierarchy built on split corners has a crack down every seam.
+
+Slots are numbered over the channels *something* in the file fills, so slot 1
+is the normal map on every material that has one rather than "whatever came
+second", and a model with only colour and emissive gets two slots, not six.
+
 ### Reproducible output
 
 `Config(deterministic=True)` makes a run bit-identical, **including across
@@ -332,6 +403,8 @@ ext/tbb_shim/               header-only std::thread stand-in for Intel TBB
 ext/pss_shim/               likewise for the pss parallel sort
 python/instant_meshes_brush/
     protocol.py             binary WebSocket framing (paired with protocol.js)
+    assets.py               the imported file as authored: materials and maps
+    fbx_media.py            the texture images an FBX carries inside itself
     uv.py                   xatlas atlas, mapped back onto the quads
     session_manager.py      one C++ session per browser, with a TTL sweeper
     server.py               FastAPI: /viewer, /imb-assets, /ws/{id}, uploads

@@ -45,6 +45,7 @@ from typing import (
 import numpy as np
 
 from . import _core, uv
+from .assets import SourceMesh
 from .uv import UnwrapError, UvLayout
 
 LOG = logging.getLogger(__name__)
@@ -373,6 +374,11 @@ class BrushSession:
         self._core: Optional["_core.Session"] = None
         self._config = _core.Config()
         self._geometry: Optional[Geometry] = None
+        #: The file as it was authored -- UVs, materials, texture maps. Kept
+        #: beside the solver's copy rather than fed into it: the remesher wants
+        #: one welded triangle soup and has no use for any of this, but the
+        #: viewport can only show the model as its author left it from here.
+        self._source: Optional[SourceMesh] = None
         self._geometry_version = 0
         self._extracted: Optional["_core.ExtractedMesh"] = None
         #: The atlas of the extraction on hand, and the slider position it was
@@ -380,10 +386,16 @@ class BrushSession:
         self._uv: Optional[UvLayout] = None
         self._uv_leniency = uv.DEFAULT_LENIENCY
         #: How far the unwrapper has got, or None while it is not running.
-        #: Written from the worker thread and read from the event loop, which
-        #: is safe for a single attribute and is why it is not a queue: the
-        #: streamer samples it, so a report it misses costs nothing.
+        #: Written from the unwrapping thread and read from the event loop,
+        #: which is safe for a single attribute and is why it is not a queue:
+        #: the streamer samples it, so a report it misses costs nothing.
         self._uv_progress: Optional[float] = None
+        #: Which unwrap the progress above belongs to.  A thread whose future
+        #: was abandoned keeps running and keeps reporting; without this its
+        #: next report would resurrect a progress value that nothing is left to
+        #: clear, and a session that looks permanently busy is one whose UI
+        #: never comes back.
+        self._uv_run = 0
         self._export_dir: Optional[Path] = None
 
         self._executor = ThreadPoolExecutor(
@@ -543,12 +555,18 @@ class BrushSession:
 
     # -- input -------------------------------------------------------------
 
+    @property
+    def source(self) -> Optional[SourceMesh]:
+        """The imported file with its materials, or None if none was kept."""
+        return self._source
+
     async def load_mesh(
         self,
         vertices: Any,
         faces: Any,
         name: str = "mesh",
         config: Optional[Mapping[str, Any]] = None,
+        source: Optional[SourceMesh] = None,
     ) -> Geometry:
         """Replace the input mesh and preprocess it, returning the result."""
         v = _as_rows(vertices, 3, "vertices", np.float32)
@@ -566,6 +584,8 @@ class BrushSession:
                 self._config = config_from_mapping(config, self._config)
             await self._call(core.set_mesh, v, f)
             self.mesh_name = name
+            # After the invalidate above, which drops the previous file's.
+            self._source = source
             return await self._preprocess_locked()
 
     async def load_file(
@@ -616,6 +636,9 @@ class BrushSession:
         self._drop_extraction()
 
     def _invalidate_locked(self) -> None:
+        # The file is gone, so are its materials; a caller loading a new mesh
+        # puts the new ones back, and everyone else is simply clearing up.
+        self._source = None
         self._set_geometry_locked(None)
 
     def _drop_extraction(self) -> None:
@@ -811,16 +834,25 @@ class BrushSession:
             await asyncio.gather(task, return_exceptions=True)
 
     async def ensure_solved(self) -> bool:
-        """Solve both fields if nothing ever has. True if that had to happen.
+        """Wait for, or run, the solve an extraction has to read. True if it waited.
 
         Solving is a consequence of importing, retargeting or brushing rather
         than something a user asks for, so there is no longer a button to press
         when it has not happened.  Extraction reads the fields directly, and on
         an unsolved hierarchy that means extracting the solver's random initial
         state, so it holds the guarantee up itself.
+
+        A solve already running is waited out rather than cut short.  Extracting
+        stops the solver, and stopping one that a brush stroke had just started
+        left the field half solved with nothing to restart it -- so asking to
+        see the result while the field was still moving quietly threw the rest
+        of that solve away.
         """
         if self._closed or self._core is None or self._geometry is None:
             return False
+        if self.solving:
+            await self.wait_solve()
+            return True
         if (await self.status()).has_field:
             return False
         await self.solve("both", -1)
@@ -959,6 +991,9 @@ class BrushSession:
         # Set before the extraction rather than after it: on a mesh that has
         # never been extracted that is most of the wait, and a control that
         # says nothing for the first two seconds looks broken.
+        self._uv_run += 1
+        run = self._uv_run
+        report = self._progress_reporter(run)
         self._uv_progress = 0.0
         try:
             # Outside the lock: extract() takes it, and takes it again through
@@ -975,20 +1010,35 @@ class BrushSession:
                 mesh = self._extracted
                 if mesh is None:
                     raise SessionError("nothing to unwrap")
+                # The arrays are read on the worker, because only that thread
+                # may touch the core -- but xatlas is then run off it. It needs
+                # nothing from the core and takes tens of seconds, and while it
+                # held the worker no status could be read: the streamer went
+                # silent for the whole unwrap, which left the viewport unable
+                # to tell that the solve it was waiting for had ended.
+                vertices, faces = await self._call(_extraction_arrays, mesh)
                 try:
-                    layout = await self._call(
-                        _unwrap_extraction, mesh, target, self._report_uv_progress
+                    layout = await asyncio.to_thread(
+                        uv.unwrap, vertices, faces, target, report
                     )
                 except UnwrapError as exc:
                     raise SessionError(str(exc)) from exc
                 self._uv = layout
                 return layout
         finally:
+            # Bumped as well as cleared: an abandoned thread that reports again
+            # after this must not set it back to a number.
+            self._uv_run += 1
             self._uv_progress = None
 
-    def _report_uv_progress(self, fraction: float) -> None:
-        """Called from the worker thread; the streamer samples the result."""
-        self._uv_progress = min(1.0, max(0.0, float(fraction)))
+    def _progress_reporter(self, run: int) -> Callable[[float], None]:
+        """A progress callback bound to one unwrap. The streamer samples it."""
+
+        def report(fraction: float) -> None:
+            if run == self._uv_run:
+                self._uv_progress = min(1.0, max(0.0, float(fraction)))
+
+        return report
 
     async def extraction(self) -> Optional[Extraction]:
         """Read the extracted mesh on hand, without building a new one.
@@ -1055,13 +1105,13 @@ def _stroke_result(stroke_id: int, kind: str, curve: "_core.Curve") -> StrokeRes
     )
 
 
-def _unwrap_extraction(
-    mesh: "_core.ExtractedMesh",
-    leniency: float,
-    progress: Callable[[float], None],
-) -> UvLayout:
-    """Read the extracted mesh and flatten it, both on the session's worker."""
-    return uv.unwrap(mesh.vertices, mesh.faces, leniency, progress)
+def _extraction_arrays(mesh: "_core.ExtractedMesh") -> Tuple[np.ndarray, np.ndarray]:
+    """Copy the geometry out of the core, for use on any thread.
+
+    Copied rather than handed over: the arrays go to a thread that keeps
+    running after this session may have dropped the mesh they came from.
+    """
+    return np.array(mesh.vertices, copy=True), np.array(mesh.faces, copy=True)
 
 
 def _write_textured_obj(path: str, mesh: "_core.ExtractedMesh", layout: UvLayout) -> None:
