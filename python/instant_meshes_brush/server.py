@@ -21,10 +21,26 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import re
 import secrets
+import shutil
 import tempfile
+import zipfile
+import zlib
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    BinaryIO,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import uvicorn
@@ -80,6 +96,22 @@ WS_MAX_SIZE = 256 * 1024 * 1024
 #: unusable file before it reaches a parser.
 MESH_SUFFIXES = assets.SUFFIXES
 
+#: Which file of an upload is the model when none of the files picked is one
+#: (a zip): the formats that carry the most of a model first.
+MODEL_PREFERENCE: Tuple[str, ...] = (
+    ".fbx", ".glb", ".gltf", ".obj", ".dae", ".ply", ".stl", ".off"
+)
+
+#: Ceiling on what one upload puts on disk, a zip's unpacked contents included.
+MAX_UPLOAD_BYTES = 2 * 1024**3
+
+#: Ceiling on the files one zip may unpack to.
+MAX_ZIP_MEMBERS = 10_000
+
+#: How long a browser may keep a map it fetched with the import's generation
+#: in the URL: for good, because that URL can never mean other bytes.
+TEXTURE_CACHE = "private, max-age=31536000, immutable"
+
 #: Stroke flavours a client may name, mapped to the session call they select.
 _STROKE_KINDS: Dict[Any, str] = {
     int(_core.StrokeKind.ORIENTATION): "orientation",
@@ -134,29 +166,232 @@ def _rows(array: Any, width: int, what: str) -> np.ndarray:
 
 
 def read_source(path: Path) -> SourceMesh:
-    """Read a model file with its materials and maps, as SessionError on failure."""
+    """Read a model file with its materials and maps, as SessionError on failure.
+
+    The previews are encoded straight away, which frees the images decoded to
+    tell what each map is; a session would otherwise hold on to them until
+    somebody asked to see a map.
+    """
     try:
-        return assets.load_source(path)
+        source = assets.load_source(path)
     except AssetError as exc:
         raise SessionError(str(exc)) from exc
+    source.encode_previews()
+    return source
 
 
 def load_mesh_file(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     """Read any supported file down to the triangles the remesher takes."""
     try:
-        return assets.solver_mesh(read_source(path))
+        return assets.solver_mesh(assets.load_source(path, materials=False))
     except AssetError as exc:
         raise SessionError(str(exc)) from exc
 
 
-def _require_source(sessions: SessionRegistry, session_id: str) -> SourceMesh:
+def _require_source(
+    sessions: SessionRegistry, session_id: str
+) -> Tuple[BrushSession, SourceMesh]:
     session = sessions.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="unknown session")
     source = session.source
     if source is None:
         raise HTTPException(status_code=404, detail="this session has no imported model")
-    return source
+    return session, source
+
+
+# ---------------------------------------------------------------------------
+#  Uploads
+# ---------------------------------------------------------------------------
+
+
+class UploadError(Exception):
+    """An upload that cannot be imported, with the HTTP status that says why."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+class _Budget:
+    """The bytes an upload may still write before it is refused."""
+
+    def __init__(self, limit: int) -> None:
+        self.left = limit
+
+    def take(self, count: int) -> None:
+        self.left -= count
+        if self.left < 0:
+            raise UploadError(
+                413, f"the upload unpacks to more than {MAX_UPLOAD_BYTES // 1024**3} GB"
+            )
+
+
+#: Characters no file name here may hold: path separators, and what Windows
+#: refuses in a name.
+_UNSAFE_CHARACTERS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"{port}{n}" for port in ("com", "lpt") for n in range(1, 10)}
+)
+
+
+def _safe_name(raw: str) -> str:
+    """A name that is safe to create a file under: a base name, nothing refused.
+
+    A browser sends a base name, but the name is the client's to choose, and
+    one that holds ``../`` or ``C:`` must still land inside the upload folder.
+    """
+    base = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    base = _UNSAFE_CHARACTERS.sub("_", base).strip().rstrip(". ")
+    if not base:
+        return "file"
+    if base.split(".", 1)[0].lower() in _RESERVED_NAMES:
+        return f"_{base}"
+    return base
+
+
+def _copy(source: BinaryIO, target: Path, budget: _Budget) -> None:
+    with target.open("wb") as out:
+        while True:
+            chunk = source.read(1 << 20)
+            if not chunk:
+                return
+            budget.take(len(chunk))
+            out.write(chunk)
+
+
+def _member_parts(name: str) -> Optional[List[str]]:
+    """The safe path parts a zip member unpacks to, or None to leave it out.
+
+    A member that climbs out of the archive ("zip slip") refuses the whole
+    zip rather than being skipped: an archive built to write outside the
+    folder it is unpacked into is not one to take anything else from either.
+    """
+    text = name.replace("\\", "/")
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if text.startswith("/") or re.match(r"^[A-Za-z]:", text) or ".." in parts:
+        raise UploadError(400, f"the zip holds a path that leads out of it: {name}")
+    if not parts or parts[0] == "__MACOSX" or parts[-1].startswith("._"):
+        return None  # macOS resource forks, which only look like the files
+    return [_safe_name(part) for part in parts]
+
+
+#: What reading a zip member raises when it cannot be unpacked: encrypted
+#: (RuntimeError), an unsupported compression, or damaged data.
+_UNZIP_ERRORS = (RuntimeError, NotImplementedError, EOFError, zipfile.BadZipFile, zlib.error)
+
+
+def _unzip(handle: BinaryIO, folder: Path, budget: _Budget) -> None:
+    try:
+        archive = zipfile.ZipFile(handle)
+    except zipfile.BadZipFile as exc:
+        raise UploadError(
+            400, "the zip could not be opened: it is damaged or not a zip"
+        ) from exc
+    root = folder.resolve()
+    with archive:
+        members = [info for info in archive.infolist() if not info.is_dir()]
+        if len(members) > MAX_ZIP_MEMBERS:
+            raise UploadError(413, f"the zip holds more than {MAX_ZIP_MEMBERS} files")
+        for info in members:
+            parts = _member_parts(info.filename)
+            if parts is None:
+                continue
+            target = folder.joinpath(*parts)
+            if not target.resolve().is_relative_to(root):
+                raise UploadError(
+                    400, f"the zip holds a path that leads out of it: {info.filename}"
+                )
+            if target.exists():
+                continue  # two names that sanitise alike: the first one wins
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with archive.open(info) as member:
+                    _copy(member, target, budget)
+            except _UNZIP_ERRORS as exc:
+                raise UploadError(400, f"{info.filename} could not be unpacked: {exc}") from exc
+
+
+def _pick_model(folder: Path) -> Optional[Path]:
+    """The model among unpacked files: by format, then the shallowest, then by name."""
+    rank = {suffix: position for position, suffix in enumerate(MODEL_PREFERENCE)}
+    found = [
+        path
+        for path in folder.rglob("*")
+        if path.is_file() and path.suffix.lower() in MESH_SUFFIXES
+    ]
+    if not found:
+        return None
+    return min(
+        found,
+        key=lambda path: (
+            rank.get(path.suffix.lower(), len(rank)),
+            len(path.relative_to(folder).parts),
+            str(path).lower(),
+        ),
+    )
+
+
+def _gather_maps(folder: Path, model_folder: Path) -> None:
+    """Link every file of the upload that sits outside the model's folder into it.
+
+    Maps are only ever looked for inside the model's own folder, and an asset
+    pack keeps them in a sibling (``Meshes/model.fbx`` beside ``Textures/``).
+    Linked by base name; a name the model's folder already has is left alone.
+    """
+    if model_folder == folder:
+        return
+    for path in list(folder.rglob("*")):
+        if not path.is_file() or path.is_relative_to(model_folder):
+            continue
+        target = model_folder / path.name
+        if target.exists():
+            continue
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copyfile(path, target)
+
+
+def store_upload(files: Sequence[Tuple[str, BinaryIO]], folder: Path) -> Path:
+    """Write an upload into ``folder`` and return the model file among it.
+
+    ``files`` are ``(file name, readable)`` pairs: the model with its material
+    library, buffers and maps, or a zip holding them, which keeps its folder
+    layout.  Names are reduced to safe base names.  The model is the first
+    file picked that is one, else the best one a zip unpacked.
+    """
+    budget = _Budget(MAX_UPLOAD_BYTES)
+    picked: Optional[Path] = None
+    for name, handle in files:
+        safe = _safe_name(name)
+        if Path(safe).suffix.lower() == ".zip":
+            _unzip(handle, folder, budget)
+            continue
+        target = folder / safe
+        if target.exists():
+            continue  # the first of two files with one name wins
+        _copy(handle, target, budget)
+        if picked is None and target.suffix.lower() in MESH_SUFFIXES:
+            picked = target
+
+    model = picked or _pick_model(folder)
+    if model is None:
+        supported = ", ".join(sorted(MESH_SUFFIXES))
+        suffix = Path(_safe_name(files[0][0])).suffix.lower() if files else ""
+        if len(files) == 1 and suffix != ".zip":
+            raise UploadError(
+                415, f"unsupported mesh format '{suffix}'; use one of {supported}"
+            )
+        raise UploadError(
+            415, f"none of the uploaded files is a model; use one of {supported}"
+        )
+    if model.stat().st_size == 0:
+        raise UploadError(400, f"the uploaded file {model.name} is empty")
+    _gather_maps(folder, model.parent)
+    return model
 
 
 def _as_config(values: Any, what: str) -> Optional[Mapping[str, Any]]:
@@ -573,10 +808,10 @@ class _Connection:
             # unwrap had ended would otherwise print a percentage forever.
             uv_progress=self.session.uv_progress,
             version=self.session.geometry_version,
-            # How many texture slots the imported file filled. The viewport
-            # offers one button per slot and none at all where there are none,
-            # which is every mesh format that carries no materials.
-            textures=len(self.session.source.slots) if self.session.source else 0,
+            # How many map views the imported file has. The viewport offers a
+            # button for each and none at all where there are none, which is
+            # every mesh format that carries no materials.
+            textures=len(self.session.source.buttons) if self.session.source else 0,
         )
         # Record what actually went out, not what a caller intended to report:
         # a handler that answers SOLVE with active=True must leave the streamer
@@ -860,26 +1095,24 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
     @app.post("/api/session/{session_id}/mesh")
     async def upload_mesh(
         session_id: str,
-        file: UploadFile = File(...),
+        files: Optional[List[UploadFile]] = File(default=None),
+        file: Optional[UploadFile] = File(default=None),
         config: Optional[str] = Form(default=None),
     ) -> Dict[str, Any]:
-        """Load a mesh straight from the viewport's own file picker.
+        """Load a model straight from the viewport's own file picker.
 
-        The reply is deliberately just a summary: the geometry itself reaches
-        every socket attached to this session through the streamer, so a second
-        viewport watching the same session updates too.
+        ``files`` is the model with everything it refers to -- material
+        library, buffers, maps -- or one zip of them; ``file`` is the single
+        model older clients send.  The reply is deliberately just a summary:
+        the geometry itself reaches every socket attached to this session
+        through the streamer, so a second viewport watching it updates too.
         """
         session = sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="unknown session")
-
-        suffix = Path(file.filename or "mesh.obj").suffix.lower()
-        if suffix not in MESH_SUFFIXES:
-            raise HTTPException(
-                status_code=415,
-                detail=f"unsupported mesh format '{suffix}'; "
-                       f"use one of {', '.join(sorted(MESH_SUFFIXES))}",
-            )
+        uploads = [*(files or []), *([file] if file is not None else [])]
+        if not uploads:
+            raise HTTPException(status_code=400, detail="no file was uploaded")
 
         settings: Optional[Mapping[str, Any]] = None
         if config:
@@ -888,28 +1121,24 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
             except json.JSONDecodeError as exc:
                 raise HTTPException(status_code=400, detail=f"bad config: {exc}") from exc
 
-        payload = await file.read()
-        if not payload:
-            raise HTTPException(status_code=400, detail="the uploaded file is empty")
-
         # The readers work from disk, and a parser should never see the raw
-        # upload path, so it lands in a scratch file removed either way.
+        # upload path, so everything lands in a scratch folder removed either
+        # way.  Nothing needs it afterwards: the maps' bytes are read in.
         with tempfile.TemporaryDirectory(prefix="imb-upload-") as scratch:
-            path = Path(scratch) / f"mesh{suffix}"
-            path.write_bytes(payload)
+            named = [(upload.filename or "", upload.file) for upload in uploads]
             try:
-                source = await asyncio.to_thread(read_source, path)
+                model = await asyncio.to_thread(store_upload, named, Path(scratch))
+            except UploadError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+            try:
+                source = await asyncio.to_thread(read_source, model)
                 vertices, faces = await asyncio.to_thread(assets.solver_mesh, source)
             except Exception as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
             try:
                 geometry = await session.load_mesh(
-                    vertices,
-                    faces,
-                    Path(file.filename or "mesh").name,
-                    settings,
-                    source=source,
+                    vertices, faces, model.name, settings, source=source
                 )
             except SessionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -920,39 +1149,62 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
             "n_faces": int(geometry.faces.shape[0]),
             "scale": float(geometry.scale),
             "config": session.config,
-            "textures": len(source.slots),
+            "textures": len(source.buttons),
+            "generation": session.source_generation,
+            "warnings": list(source.warnings),
         }
 
     @app.get("/api/session/{session_id}/source")
     async def source_mesh(session_id: str) -> Response:
         """The imported model as authored, for the textured views.
 
-        Served over HTTP rather than pushed down the socket: it is the one
-        thing the viewport needs that never changes while a session lives, so
-        it is fetched once and then belongs to the browser's cache.
+        Served over HTTP rather than pushed down the socket: it is big, and
+        only a viewport that shows the model textured needs it.  The header
+        names the import's ``generation``, which every texture URL carries.
         """
-        source = _require_source(sessions, session_id)
+        session, source = _require_source(sessions, session_id)
         header = {
             "name": source.name,
+            "generation": session.source_generation,
             "n_vertices": int(source.vertices.shape[0]),
             "n_faces": int(source.faces.shape[0]),
-            "slots": source.slots,
-            "materials": [material.name for material in source.materials],
             # (material, first face, face count) -- one draw call each.
             "groups": [list(group) for group in source.groups],
+            **source.describe(),
         }
         frame = protocol.encode(
             MessageType.GEOMETRY,
             header,
-            {"vertices": source.vertices, "uv": source.uv, "faces": source.faces},
+            {
+                "vertices": source.vertices,
+                "normals": source.normals,
+                "uv": source.uv,
+                "faces": source.faces,
+            },
         )
-        return Response(content=frame, media_type="application/octet-stream")
+        # Never cached: the same URL describes whatever was imported last.
+        return Response(
+            content=frame,
+            media_type="application/octet-stream",
+            headers={"cache-control": "no-store"},
+        )
 
     @app.get("/api/session/{session_id}/texture/{slot}/{material}")
-    async def texture(session_id: str, slot: int, material: int) -> Response:
-        """One material's map for one slot, as the bytes a browser decodes."""
-        source = _require_source(sessions, session_id)
-        image = source.texture(int(slot), int(material))
+    async def texture(
+        session_id: str, slot: int, material: int, g: Optional[int] = None
+    ) -> Response:
+        """One material's map for one slot, as the bytes a browser decodes.
+
+        ``g`` is the generation from /source.  With it the answer is cached
+        for good; a generation that has since been replaced is a 404, never
+        the new model's map under the old model's URL.
+        """
+        session, source = _require_source(sessions, session_id)
+        if g is not None and g != session.source_generation:
+            raise HTTPException(
+                status_code=404, detail="that model has been replaced; read /source again"
+            )
+        image = await asyncio.to_thread(source.texture, int(slot), int(material))
         if image is None:
             raise HTTPException(
                 status_code=404, detail="that material has no map in that slot"
@@ -960,9 +1212,7 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
         return Response(
             content=image.data,
             media_type=image.mime,
-            # Immutable for the life of the session: the id is in the path and
-            # a new import mints a new one.
-            headers={"cache-control": "private, max-age=3600"},
+            headers={"cache-control": TEXTURE_CACHE if g is not None else "no-store"},
         )
 
     @app.get("/api/session/{session_id}/export")

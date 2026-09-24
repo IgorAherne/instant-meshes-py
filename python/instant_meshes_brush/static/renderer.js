@@ -14,6 +14,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
+import { RoomEnvironment } from './vendor/RoomEnvironment.js';
 import { FieldMaterial } from './field_material.js';
 
 /* Stroke ribbons: viewer.cpp:2692-2693 and the 0.85 alpha of viewer.cpp:2810. */
@@ -39,6 +40,49 @@ const PREVIEW_STYLE = 'rgba(255, 255, 255, 0.392)';
 const PREVIEW_WIDTH = 4;
 
 const IDENTITY = new THREE.Matrix4();
+
+/* The imported model's own materials.  A material with nothing in the map
+   being inspected is drawn this flat grey. */
+const NO_MAP_GREY = 0x8a8a92;
+
+/* The lit view's key light, in camera space: up and to the left of the view,
+   where a studio key usually sits, so the model is lit from wherever it is
+   looked at.  The room environment supplies the rest of the light. */
+const KEY_LIGHT_INTENSITY = 1.5;
+const KEY_LIGHT_POSITION = [-1.0, 1.2, 0.6];
+
+/* Blur of the prefiltered room environment, as the hub's viewer uses. */
+const ENVIRONMENT_SIGMA = 0.04;
+
+/* Khronos PBR Neutral, the curve three's NeutralToneMapping applies (without
+   the exposure factor, which is 1 here).  Inlined because three only defines
+   its own when the renderer tone maps globally, and that would re-grade every
+   other material in this viewer -- the field, the result and the UV layout. */
+const PBR_NEUTRAL_GLSL = `
+vec3 imbPbrNeutral( vec3 color ) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min( color.r, min( color.g, color.b ) );
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+    float peak = max( color.r, max( color.g, color.b ) );
+    if ( peak < startCompression ) return color;
+    float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / ( peak + d - startCompression );
+    color *= newPeak / peak;
+    float g = 1.0 - 1.0 / ( desaturation * ( peak - newPeak ) + 1.0 );
+    return mix( color, vec3( newPeak ), g );
+}
+`;
+
+/* How the inspect view turns one texel into a grey or a colour, per channel. */
+const INSPECT_CHANNEL = {
+    rgb: 'texel.rgb',
+    r: 'vec3( texel.r )',
+    g: 'vec3( texel.g )',
+    b: 'vec3( texel.b )',
+    a: 'vec3( texel.a )',
+};
 
 /* An arbitrary direction with no symmetry with respect to the axes; the native
    singularity geometry shader uses the same one to build a tangent frame. */
@@ -628,34 +672,163 @@ function createPointMaterial({ worldSize, minPixels, maxPixels }) {
     });
 }
 
+/**
+ * Splice `replacement` into a three.js shader in place of `search`.
+ *
+ * The patches below depend on the text of the vendored r169 chunks; a copy of
+ * three that no longer has it must fail loudly here rather than compile a
+ * material that silently ignores the patch.
+ */
+function patchShader(source, search, replacement) {
+    if (!source.includes(search)) {
+        throw new Error(`the vendored three.js shader has no "${search}" to patch`);
+    }
+    return source.replace(search, replacement);
+}
+
+/**
+ * One map shown as the file stores it: unlit, and every byte on screen as it
+ * is in the file.
+ *
+ * The map is decoded without any colour space (see loadTexture) and the
+ * viewer writes linear output, so a stored 128 lands on screen as 128 -- where
+ * an sRGB-decoded map would show as 55.  A single channel is shown as grey,
+ * which is how a packed roughness or metallic map is read.
+ *
+ * @param {THREE.Texture|null} texture  null: this material has no such map
+ * @param {{channel: string, flipGreen: boolean, invert: boolean}} view
+ */
+function inspectMaterial(texture, { channel, flipGreen, invert }) {
+    /* Double sided because a model authored for a renderer that culls
+       nothing often is, and this view is for looking, not for judging. */
+    const material = new THREE.MeshBasicMaterial({
+        color: texture ? 0xffffff : NO_MAP_GREY,
+        map: texture,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+    });
+    if (!texture) return material;
+
+    const shown = INSPECT_CHANNEL[channel] ?? INSPECT_CHANNEL.rgb;
+    material.onBeforeCompile = (shader) => {
+        shader.fragmentShader = patchShader(
+            shader.fragmentShader,
+            '#include <map_fragment>',
+            `vec4 texel = texture2D( map, vMapUv );
+            ${flipGreen ? 'texel.g = 1.0 - texel.g;' : ''}
+            vec3 shown = ${shown};
+            diffuseColor.rgb *= ${invert ? '1.0 - shown' : 'shown'};`
+        );
+    };
+    material.customProgramCacheKey = () => `imb-inspect-${channel}-${flipGreen}-${invert}`;
+    return material;
+}
+
+/**
+ * One of the file's materials, rendered the way a PBR engine would.
+ *
+ * The maps arrive in the server's canonical layout: base colour sRGB with
+ * opacity in alpha, an OpenGL (+Y) normal map, and ORM -- occlusion in red,
+ * roughness in green, metalness in blue, which is exactly where three's
+ * aoMap, roughnessMap and metalnessMap read them.  The factors multiply the
+ * maps as glTF defines.
+ *
+ * The viewer's global colour settings stay as they are (linear output, no
+ * tone mapping), so this material ends its own shader with PBR Neutral and
+ * the sRGB transfer function.
+ *
+ * @param {object} spec  one entry of the /source header's `materials`
+ * @param {{basecolor: THREE.Texture|null, normal: THREE.Texture|null,
+ *          orm: THREE.Texture|null, emissive: THREE.Texture|null}} maps
+ * @param {{flipGreen: boolean, invertRoughness: boolean, occlusion: boolean}} options
+ *        occlusion: bind the ORM's red channel, which holds a real AO map
+ */
+function litMaterial(spec, maps, { flipGreen, invertRoughness, occlusion }) {
+    const [r, g, b, a] = spec.base_color_factor ?? [1, 1, 1, 1];
+    const [er, eg, eb] = spec.emissive ?? [0, 0, 0];
+    const scale = spec.normal_scale ?? 1;
+    const orm = maps.orm ?? null;
+    const material = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(r, g, b),
+        opacity: a,
+        roughness: spec.roughness ?? 1,
+        metalness: spec.metallic ?? 1,
+        emissive: new THREE.Color(er, eg, eb),
+        map: maps.basecolor ?? null,
+        emissiveMap: maps.emissive ?? null,
+        roughnessMap: orm,
+        metalnessMap: orm,
+        aoMap: occlusion ? orm : null,
+        aoMapIntensity: spec.occlusion_strength ?? 1,
+        normalMap: maps.normal ?? null,
+        normalMapType: spec.normal_space === 'object'
+            ? THREE.ObjectSpaceNormalMap
+            : THREE.TangentSpaceNormalMap,
+        /* The model's own UVs are v-up and its maps are decoded flipped, so
+           an OpenGL map needs no correction and a DirectX one is (1, -1). */
+        normalScale: new THREE.Vector2(scale, flipGreen ? -scale : scale),
+        side: spec.double_sided ? THREE.DoubleSide : THREE.FrontSide,
+        transparent: spec.alpha_mode === 'BLEND',
+        alphaTest: spec.alpha_mode === 'MASK' ? spec.alpha_cutoff ?? 0.5 : 0,
+    });
+
+    material.onBeforeCompile = (shader) => {
+        let fragment = patchShader(
+            shader.fragmentShader, 'void main() {', `${PBR_NEUTRAL_GLSL}\nvoid main() {`
+        );
+        fragment = patchShader(
+            fragment,
+            '#include <colorspace_fragment>',
+            `gl_FragColor.rgb = imbPbrNeutral( gl_FragColor.rgb );
+            gl_FragColor = sRGBTransferOETF( gl_FragColor );`
+        );
+        if (invertRoughness) {
+            fragment = patchShader(
+                fragment,
+                '#include <roughnessmap_fragment>',
+                patchShader(
+                    THREE.ShaderChunk.roughnessmap_fragment,
+                    'texelRoughness.g',
+                    '( 1.0 - texelRoughness.g )'
+                )
+            );
+        }
+        shader.fragmentShader = fragment;
+    };
+    material.customProgramCacheKey = () => `imb-lit-${invertRoughness}`;
+    return material;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Viewer                                                             */
 /* ------------------------------------------------------------------ */
 
 /**
- * Decode one texture map into a GPU texture, or null where there is none.
+ * Decode one texture map into a GPU texture.
  *
- * The browser does the decoding, from the bytes the file itself carried, so a
- * 4K map is never re-encoded on its way here. A 404 is the ordinary answer for
- * a material with no map of the kind being asked for.
+ * The browser does the decoding, from the bytes the server sent, and nothing
+ * is converted on the way: no colour profile, no gamma, no premultiplied
+ * alpha, so a data map (normal, roughness...) reaches the shader as stored.
+ * `colorspace` 'srgb' has the GPU decode sRGB to linear while sampling, which
+ * is what a lit colour map needs; anything else samples the stored values.
  *
  * The bitmap is flipped as it is decoded rather than by the unpack flag: three
  * cannot apply that flag to an ImageBitmap, and an unflipped map lands on the
  * model upside down.
  *
- * @param {string} url
- * @returns {Promise<THREE.Texture|null>}
+ * @param {Blob} blob
+ * @param {'srgb'|'linear'} colorspace
+ * @returns {Promise<THREE.Texture>}
  */
-export async function loadTexture(url) {
-    const response = await fetch(url);
-    if (!response.ok) return null;
-
-    const bitmap = await createImageBitmap(await response.blob(), {
+export async function loadTexture(blob, colorspace) {
+    const bitmap = await createImageBitmap(blob, {
         imageOrientation: 'flipY',
+        premultiplyAlpha: 'none',
+        colorSpaceConversion: 'none',
     });
     const texture = new THREE.Texture(bitmap);
     texture.flipY = false;
-    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.colorSpace = colorspace === 'srgb' ? THREE.SRGBColorSpace : THREE.NoColorSpace;
     texture.wrapS = THREE.RepeatWrapping;
     texture.wrapT = THREE.RepeatWrapping;
     texture.minFilter = THREE.LinearMipmapLinearFilter;
@@ -835,18 +1008,22 @@ export class Viewer {
         this.outputWireframe.name = 'output';
         this.scene.add(this.outputWireframe);
 
-        /* The imported model, drawn unlit with the maps its author gave it.
-           One Mesh with a material per material in the file: the face array
-           arrives sorted by material, so each one is a group -- a draw call
-           over a run of the index buffer -- and nothing has to be looked up
-           per face. */
+        /* The imported model, wearing the maps its author gave it: one of them
+           as stored, or all of them lit.  One Mesh with a material per
+           material in the file: the face array arrives sorted by material, so
+           each one is a group -- a draw call over a run of the index buffer --
+           and nothing has to be looked up per face. */
         this.sourceMesh = new THREE.Mesh(emptyGeometry(), []);
         this.sourceMesh.frustumCulled = false;
         this.sourceMesh.visible = false;
         this.sourceMesh.name = 'source';
         this.scene.add(this.sourceMesh);
         this._sourceMaterials = [];
+        this._sourceMaterialCount = 0;
         this._hasSource = false;
+        /* The lit view's environment and key light, built the first time
+           it is asked for: a viewer that never shows it never pays for it. */
+        this._environment = null;
 
         this._strokeHandles = [];
         this._hasOutput = false;
@@ -1205,18 +1382,21 @@ export class Viewer {
      * shut and may have been subdivided, so the maps would not land on it.
      * This is the original, and it exists only to be looked at.
      *
-     * @param {{positions: Float32Array, uv: Float32Array,
-     *          indices: Uint32Array, groups: Array<number[]>,
-     *          materials: number} | null} data
+     * The normals are the file's own, or ones the server smoothed across the
+     * UV seams, so the lit view shows no seam where a chart ends.  No
+     * tangents: three derives the normal map's frame per pixel.
+     *
+     * @param {{positions: Float32Array, normals: Float32Array,
+     *          uv: Float32Array, indices: Uint32Array,
+     *          groups: Array<number[]>, materials: number} | null} data
      */
     setSourceMesh(data) {
-        this._disposeSourceTextures();
+        this._replaceSourceMaterials([]);
         if (this.sourceMesh.geometry) this.sourceMesh.geometry.dispose();
 
         if (!data || !data.positions || !data.indices || data.indices.length === 0) {
             this.sourceMesh.geometry = emptyGeometry();
-            this.sourceMesh.material = [];
-            this._sourceMaterials = [];
+            this._sourceMaterialCount = 0;
             this._hasSource = false;
             this._applySource();
             return;
@@ -1224,6 +1404,7 @@ export class Viewer {
 
         const geometry = new THREE.BufferGeometry();
         geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
+        geometry.setAttribute('normal', new THREE.BufferAttribute(data.normals, 3));
         geometry.setAttribute('uv', new THREE.BufferAttribute(data.uv, 2));
         geometry.setIndex(new THREE.BufferAttribute(data.indices, 1));
 
@@ -1236,41 +1417,87 @@ export class Viewer {
             geometry.addGroup(first * 3, count * 3, material);
         }
 
-        const count = Math.max(1, data.materials || groups.length);
-        this._sourceMaterials = [];
-        for (let i = 0; i < count; ++i) {
-            /* Unlit on purpose: a map is being inspected, not rendered, and a
-               light of ours would be one more thing between the file and what
-               is on screen. Double sided because a model authored for a
-               renderer that culls nothing often is. */
-            this._sourceMaterials.push(
-                new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
-            );
-        }
+        this._sourceMaterialCount = Math.max(1, data.materials || groups.length);
         this.sourceMesh.geometry = geometry;
-        this.sourceMesh.material = this._sourceMaterials;
         this._hasSource = true;
         this._applySource();
     }
 
     /**
-     * Put one map on each material, or pass null to take them all off.
+     * Show one map, as the file stores it, on every material that has it.
      *
-     * A material with nothing for the chosen slot goes flat grey rather than
-     * keeping the map from the slot before: the button says which map is being
-     * looked at, and a surface still wearing the previous one would be lying.
+     * A material with nothing for the chosen map goes flat grey rather than
+     * keeping the map from before: the button says which map is being looked
+     * at, and a surface still wearing the previous one would be lying.
      *
-     * @param {Array<THREE.Texture|null>|null} textures  one per material
+     * The textures stay the caller's: they are shared between views and
+     * released by whoever decoded them.
+     *
+     * @param {Array<THREE.Texture|null>} textures  one per material
+     * @param {{channel: 'rgb'|'r'|'g'|'b'|'a', flipGreen: boolean,
+     *          invert: boolean}} view
      */
-    setSourceTextures(textures) {
-        for (let i = 0; i < this._sourceMaterials.length; ++i) {
-            const material = this._sourceMaterials[i];
-            const texture = textures ? textures[i] || null : null;
-            if (material.map && material.map !== texture) material.map.dispose();
-            material.map = texture;
-            material.color.setHex(texture ? 0xffffff : 0x8a8a92);
-            material.needsUpdate = true;
+    setSourceInspect(textures, view) {
+        const materials = [];
+        for (let i = 0; i < this._sourceMaterialCount; ++i) {
+            materials.push(inspectMaterial(textures[i] || null, view));
         }
+        this._replaceSourceMaterials(materials);
+    }
+
+    /**
+     * Render the model with all of its maps, lit.
+     *
+     * A studio room reflected in it and a key light at the camera, one
+     * physically based material per material in the file.  The textures stay
+     * the caller's, as for setSourceInspect.
+     *
+     * @param {Array<object>} specs  the /source header's `materials`
+     * @param {Array<object>} maps   per material: {basecolor, normal, orm,
+     *                               emissive}, each a texture or null
+     * @param {{flipGreen: boolean, invertRoughness: boolean,
+     *          occlusion: boolean}} options
+     */
+    setSourceLit(specs, maps, options) {
+        this._ensureLighting();
+        const materials = [];
+        for (let i = 0; i < this._sourceMaterialCount; ++i) {
+            /* A face group naming a material the header does not describe
+               still gets drawn, as glTF's default material. */
+            materials.push(litMaterial(specs[i] ?? {}, maps[i] ?? {}, options));
+        }
+        this._replaceSourceMaterials(materials);
+    }
+
+    /**
+     * The room environment and the key light, made once.
+     *
+     * Both only affect physically based materials, and the lit source is the
+     * only one here, so the rest of the viewer looks exactly as before.  The
+     * key is parented to the camera -- which therefore has to be in the scene
+     * -- so it keeps its place in the view as the model is orbited.
+     */
+    _ensureLighting() {
+        if (this._environment) return;
+        const generator = new THREE.PMREMGenerator(this.renderer);
+        const room = new RoomEnvironment();
+        this._environment = generator.fromScene(room, ENVIRONMENT_SIGMA).texture;
+        room.dispose();
+        generator.dispose();
+        this.scene.environment = this._environment;
+
+        const key = new THREE.DirectionalLight(0xffffff, KEY_LIGHT_INTENSITY);
+        key.position.fromArray(KEY_LIGHT_POSITION);
+        /* A camera looks down its own -Z. */
+        key.target.position.set(0, 0, -1);
+        this.camera.add(key, key.target);
+        this.scene.add(this.camera);
+    }
+
+    _replaceSourceMaterials(materials) {
+        for (const material of this._sourceMaterials) material.dispose();
+        this._sourceMaterials = materials;
+        this.sourceMesh.material = materials;
     }
 
     /** Whether the textured original stands in for the input surface. */
@@ -1284,14 +1511,6 @@ export class Viewer {
 
     _applySource() {
         this.sourceMesh.visible = this._layers.source && this._hasSource;
-    }
-
-    _disposeSourceTextures() {
-        for (const material of this._sourceMaterials) {
-            if (material.map) material.map.dispose();
-            material.dispose();
-        }
-        this._sourceMaterials = [];
     }
 
     /* -------------------------------------------------------------- */
@@ -1561,6 +1780,9 @@ export class Viewer {
             object.geometry.dispose();
             object.material.dispose();
         }
+        this._replaceSourceMaterials([]);
+        this.sourceMesh.geometry.dispose();
+        if (this._environment) this._environment.dispose();
         this.renderer.dispose();
     }
 }

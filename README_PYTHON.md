@@ -25,7 +25,7 @@ screen-space input handled by the GUI. This fork separates the two:
 | Field preview | native OpenGL geometry shader | ported to WebGL2 in the browser |
 | Texture space | none | xatlas atlas on the quads, written into the OBJ |
 | Input formats | OBJ, PLY, ALN | those plus STL, OFF, glTF/glB, DAE and FBX |
-| Imported materials | ignored | kept, and the maps can be looked at on the model |
+| Imported materials | ignored | each map's role guessed, shown one by one or lit together |
 
 The algorithm itself is untouched: same hierarchy, same field optimiser, same
 extraction, same results.
@@ -154,15 +154,35 @@ of cutting it short.
 
 | Format | Geometry | UVs | Texture maps |
 |---|---|---|---|
-| OBJ, PLY, STL, OFF | yes | where the file has them | from the `.mtl`, if it is beside the file |
-| glTF, glB, DAE | yes | yes | yes, including the ones glB embeds |
-| FBX | needs `assimp-py` | yes | embedded ones; external ones only when opened from disk |
+| OBJ, PLY, STL, OFF | yes | where the file has them | from the `.mtl` (every map key and option) |
+| glTF, glB | yes | yes | every `*Texture`, `KHR_materials_*` included, embedded or beside the file |
+| DAE, FBX | needs `assimp-py` | yes | embedded ones, and ones found inside the model's folder |
 
-A file with texture maps gets a row of **tex 0**, **tex 1** … buttons under its
-name, one per kind of map anything in it has — colour, normal, metal/rough,
-specular, emissive, occlusion, in that order, up to six. Pressing one draws the
-imported model unlit with that map on it; pressing it again goes back to the
-shaded surface the field is drawn on. None is pressed to begin with.
+Upload the model together with its textures (pick several files, drop a folder,
+or one `.zip`); only files inside the model's own folder are ever read.
+
+Every map is given a **role** — base colour, normal, height, roughness, gloss,
+metallic, specular, AO, emissive, opacity, or a packed ORM / metal-smoothness /
+HDRP mask — by `texroles.classify`: points from the slot it is bound to, the
+exporter (Blender's ShininessExponent is roughness, 3ds Max's is gloss), words in
+its file name, and pixel statistics that can overrule them (a unit-vector image
+is a normal map; a curl test on it tells OpenGL green from DirectX). The R of a
+glTF metallicRoughness map is never read as AO unless the file says so.
+`materials.py` then builds each material's **canonical maps**: base colour with
+opacity in alpha (sRGB), an OpenGL tangent-space normal map, ORM (R = AO,
+G = roughness, B = metallic; gloss and smoothness inverted), emissive, 16-bit
+height, and whatever has no canonical place as it is.
+
+The row under the model's name reads **None · All · Base colour · Opacity ·
+Normal · Roughness · Metallic · AO · Emissive · Height**, then any other maps
+by role, with only the buttons the file really has. A map button draws that map
+unlit, exactly as stored (a 128 grey reads 128). **All** is the model lit as a
+game engine would show it: one physically based material per material, a
+studio environment and a light at the camera. **None** goes back to the shaded
+surface the field is drawn on, and is pressed to begin with. Hovering a button
+names the files behind it, why each was taken for that role and how sure the
+guess is; a "?" marks one under 60 %. Normal has a "flip G" toggle and
+Roughness an "invert" one, for a wrong guess.
 
 The model you see there is the file as authored, not the mesh the remesher
 works on: the maps are pinned to UVs that only exist while the corners a seam
@@ -170,15 +190,14 @@ split apart stay apart, and the remesher needs those welded shut. Both come out
 of one read. A material with no map of the kind being shown goes flat grey
 rather than keeping the one before it.
 
-Nothing is transferred onto the output mesh yet; this is for looking at what
-you imported.
+Nothing is transferred onto the output mesh here; this is for looking at what
+you imported. (Spellcast3D bakes the maps onto the output mesh with its own
+baker, which reads models through the same modules.)
 
-An FBX needs `assimp-py`, which ships with the `app` extra. Its texture maps
-have to be *embedded* in the file for a browser upload to carry them — the
-upload is one file, not the folder of maps beside it — and those are read out
-of the FBX directly, because Assimp's Python binding reports an embedded map as
-`*0` with no way to ask what `*0` holds. A file opened from a path on disk can
-also use maps sitting next to it.
+An FBX or DAE needs `assimp-py`, which ships with the `app` extra. An FBX's
+embedded maps are read out of the file directly, because Assimp's Python
+binding reports an embedded map as `*0` with no way to ask what `*0` holds; the
+FBX is scaled to metres by its own unit setting.
 
 **UV chunks** cuts the atlas, and is the only xatlas control there is. The
 slider is how far one chunk may stretch before xatlas gives up on it and starts
@@ -370,11 +389,16 @@ from instant_meshes_brush import assets
 source = assets.load_source("character.glb")
 vertices, faces = assets.solver_mesh(source)     # welded, for the remesher
 
-print(source.slots)                              # ['base colour', 'normal']
+print([slot.key for slot in source.slots])       # ['basecolor', 'normal', 'orm']
+print([button.id for button in source.buttons])  # ['basecolor', 'normal', 'roughness', 'metallic']
 print([m.name for m in source.materials])
 skin = source.texture(0, 1)                      # slot 0 of material 1
 skin.mime, len(skin.data)                        # ('image/jpeg', 412_338)
+full = source.materials[1].canonical()           # full-resolution canonical maps
 ```
+
+`assets.load_source(path, materials=False)` reads the geometry alone, for a
+remesh that never shows the maps.
 
 `source` keeps the file as authored — corners split along every UV seam, faces
 sorted by material with `source.groups` naming the runs, and each material's
@@ -382,9 +406,9 @@ maps decoded, shrunk to `MAX_TEXTURE_PX` and re-encoded as the bytes a browser
 takes directly. `solver_mesh` welds the seams shut and drops the triangles that
 collapse; a hierarchy built on split corners has a crack down every seam.
 
-Slots are numbered over the channels *something* in the file fills, so slot 1
-is the normal map on every material that has one rather than "whatever came
-second", and a model with only colour and emissive gets two slots, not six.
+Slots are numbered over the canonical maps *something* in the file has, so a
+slot is the normal map on every material that has one rather than "whatever
+came second", and a model with only colour and emissive gets two slots.
 
 ### Reproducible output
 
@@ -404,7 +428,9 @@ ext/pss_shim/               likewise for the pss parallel sort
 python/instant_meshes_brush/
     protocol.py             binary WebSocket framing (paired with protocol.js)
     assets.py               the imported file as authored: materials and maps
-    fbx_media.py            the texture images an FBX carries inside itself
+    materials.py            glTF / MTL / FBX materials -> canonical maps
+    texroles.py texstats.py what each texture map is (base colour, normal, ORM...)
+    fbx_media.py            an FBX's materials, texture bindings and embedded images
     uv.py                   xatlas atlas, mapped back onto the quads
     session_manager.py      one C++ session per browser, with a TTL sweeper
     server.py               FastAPI: /viewer, /imb-assets, /ws/{id}, uploads

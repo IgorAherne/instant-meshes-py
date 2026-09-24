@@ -16,10 +16,20 @@ import { MessageType, decode } from './protocol.js';
 import { Connection } from './net.js';
 import { Viewer, loadTexture } from './renderer.js';
 import { TOOLS, ToolController } from './tools.js';
-import { Panel } from './panel.js';
+import { MESH_ACCEPT, Panel, suffixOf } from './panel.js';
 
 /** Preview rate asked of the server; the RAF loop coalesces anything faster. */
 const SUBSCRIBE_FPS = 15;
+
+/** What the upload route takes as the model itself: a mesh file, or a zip
+ *  holding one with its textures. */
+const MODEL_SUFFIXES = new Set([...MESH_ACCEPT.split(','), '.zip']);
+
+/**
+ * The maps the lit view reads, by the name the /source header keys each
+ * material's maps on, and how each is decoded: colour is sRGB, the rest data.
+ */
+const LIT_MAPS = { basecolor: 'srgb', normal: 'linear', orm: 'linear', emissive: 'srgb' };
 
 /* ------------------------------------------------------------------ */
 /*  Frame decoding                                                     */
@@ -123,6 +133,69 @@ function describeStroke(header) {
 
 
 /* ------------------------------------------------------------------ */
+/*  The imported model's maps                                          */
+/* ------------------------------------------------------------------ */
+
+/** One map, decoded, or null where the server has none. */
+async function fetchTexture(url, colorspace) {
+    const response = await fetch(url);
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`a map could not be fetched (${response.status})`);
+    return loadTexture(await response.blob(), colorspace);
+}
+
+function releaseTexture(texture) {
+    if (!texture) return;
+    texture.dispose();
+    texture.image.close();
+}
+
+/**
+ * The decoded maps, shared between the views that use them.
+ *
+ * Keyed on the URL -- which names the import's generation, so a re-import
+ * never finds the maps of the model before it -- and on the colour space, so
+ * one file can be both inspected as stored and lit as sRGB.  Only what the
+ * view on screen uses is kept: a character with five 2K maps per material
+ * would otherwise pile up hundreds of megabytes of GPU memory one button
+ * press at a time.
+ */
+class TextureCache {
+    constructor() {
+        this._entries = new Map();
+    }
+
+    /** @returns {{key: string, texture: Promise<THREE.Texture|null>}} */
+    get(url, colorspace) {
+        const key = `${colorspace} ${url}`;
+        let texture = this._entries.get(key);
+        if (!texture) {
+            texture = fetchTexture(url, colorspace);
+            this._entries.set(key, texture);
+            /* A failure is not remembered: the next press tries again. */
+            texture.catch(() => {
+                if (this._entries.get(key) === texture) this._entries.delete(key);
+            });
+        }
+        return { key, texture };
+    }
+
+    /** Release every map but those under `keys`, decoded or still coming. */
+    keep(keys) {
+        for (const [key, texture] of this._entries) {
+            if (keys.has(key)) continue;
+            this._entries.delete(key);
+            texture.then(releaseTexture, () => {});
+        }
+    }
+
+    clear() {
+        this.keep(new Set());
+    }
+}
+
+
+/* ------------------------------------------------------------------ */
 /*  Application                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -163,14 +236,22 @@ class App {
         this._version = -1;
         this._meshName = null;
 
-        /* The imported file as authored, fetched once per model, and the maps
-           of whichever slot is being looked at. Keyed on the model rather than
-           on the geometry version: re-targeting the resolution rebuilds the
-           solver's mesh and leaves the file it came from alone. */
-        this._sourceOf = null;
+        /* The imported file as authored, fetched once per import, with its
+           maps. Keyed on the import's generation rather than on the geometry
+           version: re-targeting the resolution rebuilds the solver's mesh and
+           leaves the file it came from alone. */
+        this._source = null;
         this._sourceLoading = null;
-        this._textureSlot = null;
+        /* Bumped whenever the model is replaced, so a fetch that set out
+           before cannot install what it brings back. */
+        this._sourceToken = 0;
+        /* How the maps are being looked at ('none', 'all' or a map's id),
+           whether the model on screen already wears that view, and which
+           request to show one is the latest. */
+        this._textureView = 'none';
         this._textureReady = false;
+        this._viewToken = 0;
+        this._textures = new TextureCache();
 
         /* Markers per field, and which field the selected brush can reach. */
         this._singularityCounts = { orientation: 0, position: 0 };
@@ -334,13 +415,21 @@ class App {
         this.panel.handlers.onLayerToggle = (name, visible) =>
             this._apply(() => this.viewer.setLayerVisible(name, visible));
 
-        this.panel.handlers.onOpenFile = (file) => this._uploadMesh(file);
+        this.panel.handlers.onOpenFiles = (files) => this._uploadMesh(files);
 
         /* A different chart size is a different atlas; the one on screen is
            only worth re-cutting while somebody is looking at it. */
         this.panel.handlers.onUvChange = () => this._invalidateUv();
 
-        this.panel.handlers.onTextureChange = (slot) => this._showTexture(slot);
+        this.panel.handlers.onTextureChange = (view) => this._showTextures(view);
+
+        /* Flip green and invert change what the normal and roughness maps
+           mean, so a view that reads either is built again. */
+        this.panel.handlers.onMapOptionsChange = () => {
+            if (['all', 'normal', 'roughness'].includes(this._textureView)) {
+                this._loadTextureView(this._textureView);
+            }
+        };
     }
 
     /* -------------------------------------------------------------- */
@@ -348,7 +437,11 @@ class App {
     /* -------------------------------------------------------------- */
 
     /**
-     * Put one of the model's own texture maps on it, or take them all off.
+     * Show the model's maps a given way, or take them off.
+     *
+     * 'all' renders every map together, lit; a map's id ('roughness',
+     * 'tex3'...) shows that one as the file stores it; 'none' goes back to the
+     * surface the field is drawn on.
      *
      * The maps are authored against the file's UVs, which the mesh the solver
      * works on no longer has -- its seams are welded shut and it may have been
@@ -356,89 +449,196 @@ class App {
      * same space, so the swap reads as the surface changing rather than as
      * something else appearing.
      */
-    async _showTexture(slot) {
-        if (!this.panel.setTextureSlot(slot)) return;
-        this._textureSlot = this.panel.textureSlot();
-        this._textureReady = false;
-        this._refreshSurface();
-        if (this._textureSlot === null) return;
+    _showTextures(view) {
+        if (!this.panel.setTextureView(view)) return;
+        this._textureView = this.panel.textureView();
+        if (this._textureView === 'none') {
+            /* A view still decoding must not come up after None was pressed. */
+            ++this._viewToken;
+            this._textureReady = false;
+            this._refreshSurface();
+            return;
+        }
+        this._loadTextureView(this._textureView);
+    }
 
-        /* The model stays up while the maps decode, so the viewport is never
-           blank; the button is already down, which is the press being heard. */
-        const wanted = this._textureSlot;
-        this.panel.setStatus('Loading the texture...', false);
+    /**
+     * Decode what `view` needs and put it on the model.
+     *
+     * Whatever is on screen stays up while the maps decode -- the previous
+     * view, or the field -- so the viewport is never blank and switching
+     * maps never flashes the grid in between; the button is already down,
+     * which is the press being heard.
+     */
+    async _loadTextureView(view) {
+        const token = ++this._viewToken;
+        this.panel.setStatus('Loading the maps...', false);
         try {
-            const source = await this._loadSource();
-            const textures = await this._loadTextures(source, wanted);
-            if (this._textureSlot !== wanted) return;
-            this._apply(() => this.viewer.setSourceTextures(textures));
+            const source = await this._ensureSource();
+            if (!source || token !== this._viewToken) return;
+            const keys = new Set();
+            const textures = await this._viewTextures(source, view, keys);
+            if (token !== this._viewToken) return;
+
+            const options = this.panel.mapOptions();
+            this._apply(() => {
+                if (view === 'all') {
+                    this.viewer.setSourceLit(source.materials, textures, {
+                        ...options,
+                        occlusion: source.occlusion,
+                    });
+                } else {
+                    this.viewer.setSourceInspect(textures, {
+                        channel: source.buttons.find((button) => button.id === view).channel,
+                        flipGreen: view === 'normal' && options.flipGreen,
+                        invert: view === 'roughness' && options.invertRoughness,
+                    });
+                }
+            });
+            this._textures.keep(keys);
             this._textureReady = true;
             this.panel.setStatus(null, false);
             this._refreshSurface();
         } catch (err) {
-            this.panel.setStatus(`Could not show that map: ${err.message}`, true);
-            this.panel.setTextureSlot(null);
-            this._textureSlot = null;
+            if (token !== this._viewToken) return;
+            this.panel.setStatus(`Could not show the maps: ${err.message}`, true);
+            this.panel.setTextureView('none');
+            this._textureView = 'none';
+            this._textureReady = false;
             this._refreshSurface();
         }
     }
 
-    /** Forget the imported file, for when a different one replaces it. */
-    _dropSource() {
-        this._sourceOf = null;
+    /**
+     * The decoded maps a view needs, and the cache keys they sit under.
+     *
+     * 'all' takes every map the lit material reads, per material. One map
+     * takes that slot from every material that fills it, and null for the
+     * rest, which the renderer draws flat: the button names a kind of map,
+     * and a surface that has none of that kind should say so rather than
+     * keep wearing another one.
+     */
+    _viewTextures(source, view, keys) {
+        const texture = (slot, material, colorspace) => {
+            const url = `/api/session/${encodeURIComponent(this.sessionId)}/texture/` +
+                `${slot}/${material}?g=${source.generation}`;
+            const entry = this._textures.get(url, colorspace);
+            keys.add(entry.key);
+            return entry.texture;
+        };
+
+        if (view === 'all') {
+            return Promise.all(source.materials.map(async (spec, material) => {
+                const maps = {};
+                await Promise.all(Object.entries(LIT_MAPS).map(async ([role, colorspace]) => {
+                    const slot = spec.maps ? spec.maps[role] : undefined;
+                    maps[role] = slot === undefined
+                        ? null
+                        : await texture(slot, material, colorspace);
+                }));
+                return maps;
+            }));
+        }
+
+        const button = source.buttons.find((candidate) => candidate.id === view);
+        if (!button) return Promise.reject(new Error('this model has no such map'));
+        /* Decoded as stored, whatever the map holds: this view shows bytes. */
+        return Promise.all(source.materials.map((spec, material) =>
+            Object.values(spec.maps || {}).includes(button.slot)
+                ? texture(button.slot, material, 'linear')
+                : null
+        ));
+    }
+
+    /**
+     * Follow the server's count of the model's maps.
+     *
+     * The buttons are built from the model's own description, which comes
+     * with its geometry, so a model with maps is fetched as soon as it is
+     * known to have them. One without is never fetched at all.
+     */
+    _syncTextures(count) {
+        if (count > 0) {
+            if (!this._sourceLoading) {
+                this._ensureSource().catch((err) =>
+                    this.panel.setStatus(`Could not read the model's maps: ${err.message}`, true)
+                );
+            }
+            return;
+        }
+        if (this._source || this._sourceLoading) this._forgetSource();
+    }
+
+    /**
+     * Forget the imported file, for when a different one replaces it.
+     *
+     * Everything goes, including the buttons: they describe the old file,
+     * and a failed fetch is only retried for a new one.
+     */
+    _forgetSource() {
+        ++this._sourceToken;
+        ++this._viewToken;
+        this._source = null;
         this._sourceLoading = null;
-        this._textureSlot = null;
+        this._textureView = 'none';
         this._textureReady = false;
-        this.panel.setTextureSlot(null);
+        this.panel.showTextures([]);
         this._apply(() => this.viewer.setSourceMesh(null));
+        this._textures.clear();
+        this._refreshSurface();
     }
 
     /** Fetch the model as authored, once per import. */
-    _loadSource() {
-        if (this._sourceOf === this._meshName && this._sourceLoading) {
-            return this._sourceLoading;
-        }
-        this._sourceOf = this._meshName;
-        this._sourceLoading = (async () => {
-            const response = await fetch(
-                `/api/session/${encodeURIComponent(this.sessionId)}/source`
-            );
-            if (!response.ok) throw new Error(`the model could not be read back`);
-            const message = decode(await response.arrayBuffer());
-            const positions = pickArray(message.arrays, 'vertices');
-            const indices = pickArray(message.arrays, 'faces');
-            const uv = pickArray(message.arrays, 'uv');
-            if (!positions || !indices) throw new Error('the model frame is incomplete');
-
-            const materials = (message.header.materials || []).length || 1;
-            this._apply(() =>
-                this.viewer.setSourceMesh({
-                    positions,
-                    uv: uv || new Float32Array((positions.length / 3) * 2),
-                    indices,
-                    groups: message.header.groups || [],
-                    materials,
-                })
-            );
-            return { materials, slots: message.header.slots || [] };
-        })();
+    _ensureSource() {
+        if (!this._sourceLoading) this._sourceLoading = this._fetchSource(this._sourceToken);
         return this._sourceLoading;
     }
 
     /**
-     * One decoded map per material for the chosen slot.
+     * The model as authored, installed in the viewer, with its buttons.
      *
-     * A material with nothing in that slot gets null, which the renderer draws
-     * flat: the button names a kind of map, and a surface that has none of
-     * that kind should say so rather than keep wearing another one.
+     * @returns {Promise<object|null>} null when the model was replaced while
+     *          this was on its way, and what it brought back describes that
      */
-    async _loadTextures(source, slot) {
-        const base = `/api/session/${encodeURIComponent(this.sessionId)}/texture/${slot}`;
-        const loads = [];
-        for (let material = 0; material < source.materials; ++material) {
-            loads.push(loadTexture(`${base}/${material}`));
+    async _fetchSource(token) {
+        const response = await fetch(
+            `/api/session/${encodeURIComponent(this.sessionId)}/source`
+        );
+        if (!response.ok) throw new Error('the model could not be read back');
+        const message = decode(await response.arrayBuffer());
+        if (token !== this._sourceToken) return null;
+
+        const { header, arrays } = message;
+        const positions = pickArray(arrays, 'vertices');
+        const normals = pickArray(arrays, 'normals');
+        const uv = pickArray(arrays, 'uv');
+        const indices = pickArray(arrays, 'faces');
+        if (!positions || !normals || !uv || !indices) {
+            throw new Error('the model frame is incomplete');
         }
-        return Promise.all(loads);
+
+        const materials = header.materials || [];
+        const buttons = header.buttons || [];
+        this._apply(() =>
+            this.viewer.setSourceMesh({
+                positions,
+                normals,
+                uv,
+                indices,
+                groups: header.groups || [],
+                materials: materials.length,
+            })
+        );
+        this._source = {
+            generation: header.generation,
+            materials,
+            buttons,
+            /* The ORM's red channel is only occlusion where some material
+               had a real AO map; the server then offers AO. */
+            occlusion: buttons.some((button) => button.id === 'ao'),
+        };
+        this.panel.showTextures(buttons, materials);
+        return this._source;
     }
 
     _showingUv() {
@@ -604,14 +804,29 @@ class App {
     /**
      * Upload through HTTP rather than the socket.
      *
-     * The server parses the file with trimesh and loads it into the session;
-     * the geometry itself comes back over the WebSocket, so a second viewport
-     * watching the same session updates too.
+     * A model rarely travels alone: an OBJ names its MTL, which names its
+     * textures, and a glTF can keep its buffers and images beside it. Every
+     * file goes up together -- or one zip holding them -- so the server finds
+     * them where the model says they are. It parses them and loads the model
+     * into the session; the geometry itself comes back over the WebSocket, so
+     * a second viewport watching the same session updates too.
+     *
+     * @param {File[]} files
      */
-    async _uploadMesh(file) {
-        this.panel.setStatus(`Loading ${file.name}...`, false);
+    async _uploadMesh(files) {
+        const model = files.find((file) => MODEL_SUFFIXES.has(suffixOf(file.name)));
+        if (!model) {
+            this.panel.setStatus(
+                'None of those is a 3D model: pick the FBX, OBJ, glTF, GLB... ' +
+                '(or a zip) together with its textures', true
+            );
+            return;
+        }
+        const others = files.length - 1;
+        const company = others > 0 ? ` and ${others} more file${others === 1 ? '' : 's'}` : '';
+        this.panel.setStatus(`Loading ${model.name}${company}...`, false);
         const body = new FormData();
-        body.append('file', file, file.name);
+        for (const file of files) body.append('files', file, file.name);
         body.append('config', JSON.stringify(this.panel.readConfig()));
 
         try {
@@ -623,8 +838,13 @@ class App {
                 const detail = await response.json().catch(() => ({}));
                 throw new Error(detail.detail || `upload failed (${response.status})`);
             }
+            const reply = await response.json();
             /* The GEOMETRY frame that follows fills in the rest. */
             this.panel.showOutput(null);
+            /* A new import even under the same file name, which the GEOMETRY
+               frame cannot tell apart from a rebuild: its maps are new. */
+            this._forgetSource();
+            this._syncTextures(Number(reply.textures) || 0);
         } catch (err) {
             this.panel.setStatus(err.message, true);
         }
@@ -702,8 +922,9 @@ class App {
                 this._meshName = name;
                 this._wanted = 'mesh';
                 /* A different file, so different materials and different UVs;
-                   the buttons are rebuilt from the status that follows. */
-                this._dropSource();
+                   the buttons are rebuilt once the status that follows says
+                   it has maps. */
+                this._forgetSource();
             }
             this._setSurface(this._wanted);
             this.panel.setStatus('Solving the field...', false);
@@ -890,9 +1111,9 @@ class App {
         this._solving = running;
         if (header.ready !== undefined) this.panel.setReady(Boolean(header.ready));
         if (header.uv !== undefined) this.panel.setUvAvailable(Boolean(header.uv));
-        /* How many maps the imported file carried. Zero for every format that
-           has no materials, which is when the row is not there at all. */
-        if (header.textures !== undefined) this.panel.showTextures(header.textures);
+        /* How many map buttons the imported file has. Zero for every format
+           that carries no materials, which is when the row is not there. */
+        if (header.textures !== undefined) this._syncTextures(header.textures);
         /* Carried on every status as well as in its own frame, so a report
            this client missed cannot leave a percentage on the label forever. */
         if (header.uv_progress !== undefined) {

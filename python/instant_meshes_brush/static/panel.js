@@ -10,6 +10,20 @@
 /** Formats the upload route accepts; mirrored from server.MESH_SUFFIXES. */
 export const MESH_ACCEPT = '.obj,.ply,.stl,.off,.glb,.gltf,.dae,.fbx';
 
+/** What travels with a model: its material library, its buffers, its texture
+ *  maps -- or the whole lot as one zip. */
+export const COMPANION_ACCEPT =
+    '.mtl,.bin,.png,.jpg,.jpeg,.tga,.tif,.tiff,.bmp,.webp,.dds,.psd,.zip';
+
+/** Every file the import takes, for filtering a dropped folder. */
+const IMPORT_SUFFIXES = new Set(`${MESH_ACCEPT},${COMPANION_ACCEPT}`.split(','));
+
+/** A file's lower-case suffix, with its dot; '' when it has none. */
+export function suffixOf(name) {
+    const dot = name.lastIndexOf('.');
+    return dot > 0 ? name.slice(dot).toLowerCase() : '';
+}
+
 /** Symmetry presets, as (rosy, posy) pairs keyed by the select's value. */
 export const SYMMETRIES = {
     '4,4': { rosy: 4, posy: 4 },
@@ -84,6 +98,188 @@ function sameConfig(a, b) {
     if (!a || !b) return false;
     const keys = Object.keys(a);
     return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Texture maps                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The maps a model can carry, in the order their buttons appear.  Anything
+ * the server could not name ("tex 3") follows, in slot order.
+ */
+const MAP_ORDER = [
+    'basecolor', 'opacity', 'normal', 'roughness', 'metallic', 'ao', 'emissive', 'height',
+];
+
+/** Below this, the guess about what a map is gets a "?" on its button. */
+const UNSURE_BELOW = 0.6;
+
+/**
+ * Which of the server's texture guesses feed which button, for guesses that
+ * do not list their channels.  A packed ORM feeds three, a spec/gloss map is
+ * converted into colour, metalness and roughness.
+ */
+const BUTTON_ROLES = {
+    basecolor: ['basecolor', 'specular', 'spec_gloss'],
+    opacity: ['opacity'],
+    normal: ['normal'],
+    roughness: ['roughness', 'gloss', 'orm', 'metal_smooth', 'mask_hdrp', 'spec_gloss'],
+    metallic: ['metallic', 'orm', 'metal_smooth', 'mask_hdrp', 'specular', 'spec_gloss'],
+    ao: ['ao', 'orm', 'mask_hdrp'],
+    emissive: ['emissive'],
+    height: ['height'],
+};
+
+const CHANNEL_NAMES = { r: 'red', g: 'green', b: 'blue', a: 'alpha' };
+
+/** Files and reasons listed per button in its hint, at most. */
+const HINT_FILES = 3;
+const HINT_REASONS = 3;
+
+/**
+ * The client-side corrections a map button can carry: preview only, the
+ * files themselves are never touched.
+ */
+const MAP_OPTIONS = {
+    normal: {
+        option: 'flipGreen',
+        label: 'flip G',
+        hint: 'Flip the green channel. For a DirectX-style normal map, whose bumps ' +
+            'look pushed in and whose light comes from the wrong side.\n\n' +
+            'Changes this preview only.',
+    },
+    roughness: {
+        option: 'invertRoughness',
+        label: 'invert',
+        hint: 'Invert the map. For a gloss (smoothness) map that was read as ' +
+            'roughness: what should shine looks matt and the other way round.\n\n' +
+            'Changes this preview only.',
+    },
+};
+
+const NONE_HINT =
+    'Take the maps off and show the surface the field grid is drawn on.';
+const ALL_HINT =
+    'The model as a game engine would render it: every map together, lit by a ' +
+    'studio environment and a light at the camera.';
+const MAP_HINT =
+    'Shows this one map on the model, unlit, exactly as the file stores it. ' +
+    'None goes back to the field grid.';
+
+/** Whether a guess about one of the model's files feeds `button`. */
+function feeds(guess, button) {
+    if (guess.channels) return button.id in guess.channels;
+    return (BUTTON_ROLES[button.id] || []).includes(guess.role);
+}
+
+function percent(confidence) {
+    return `${Math.round(Number(confidence) * 100)}%`;
+}
+
+/**
+ * Describe where a button's map came from, for its hover help, and how sure
+ * the server was of what it is.
+ *
+ * The server says, per material, which file it took for what and why; a
+ * button gathers the guesses that feed it -- a guess that lists its
+ * channels names every button it feeds, "Specular" (tex 0) included.
+ * Without that list, a map the server could not name ("tex 3") is whatever
+ * file sits in that slot, so it collects the files of every material that
+ * has one there.
+ *
+ * @returns {{hint: string, confidence: number|null, unsure: boolean}}
+ */
+function describeMap(button, materials) {
+    const known = button.id in BUTTON_ROLES;
+    const seen = new Set();
+    const guesses = [];
+    for (const material of materials) {
+        const hasSlot = Object.values(material.maps || {}).includes(button.slot);
+        for (const guess of material.guesses || []) {
+            const ours = known || guess.channels
+                ? feeds(guess, button)
+                : hasSlot && guess.role === 'other';
+            if (!ours || seen.has(guess.file)) continue;
+            seen.add(guess.file);
+            guesses.push(guess);
+        }
+    }
+
+    const channel = CHANNEL_NAMES[button.channel];
+    const lines = [channel ? `${button.label}: the ${channel} channel of` : `${button.label}:`];
+    for (const guess of guesses.slice(0, HINT_FILES)) {
+        lines.push(`${guess.file} -- ${percent(guess.confidence)} sure`);
+        for (const reason of (guess.evidence || []).slice(0, HINT_REASONS)) {
+            lines.push(`- ${reason}`);
+        }
+        if (button.id === 'normal' && guess.y_convention) {
+            const style = guess.y_convention === 'directx'
+                ? 'DirectX (green down), turned into OpenGL'
+                : 'OpenGL (green up)';
+            lines.push(`- read as ${style}${guess.y_confident ? '' : ', a guess'}`);
+        }
+    }
+    if (guesses.length > HINT_FILES) {
+        lines.push(`...and ${guesses.length - HINT_FILES} more files`);
+    }
+    if (guesses.length === 0) lines.push('(no details from the file)');
+    lines.push('', MAP_HINT);
+
+    const confidences = guesses.map((guess) => Number(guess.confidence));
+    const confidence = confidences.length ? Math.min(...confidences) : null;
+    return {
+        hint: lines.join('\n'),
+        confidence,
+        unsure: confidence !== null && confidence < UNSURE_BELOW,
+    };
+}
+
+/**
+ * The map buttons as the panel shows them: in panel order -- the named maps
+ * first, then the unnamed ones by slot -- each with its hover help and
+ * whether it earns a "?".
+ *
+ * @param {Array<object>} buttons    the /source header's `buttons`
+ * @param {Array<object>} materials  the header's `materials`
+ * @returns {Array<object>} each button plus {hint, confidence, unsure}
+ */
+export function describeButtons(buttons, materials) {
+    const rank = (button) => {
+        const index = MAP_ORDER.indexOf(button.id);
+        return index >= 0 ? index : MAP_ORDER.length + Number(button.slot);
+    };
+    return [...buttons]
+        .sort((a, b) => rank(a) - rank(b))
+        .map((button) => ({ ...button, ...describeMap(button, materials) }));
+}
+
+/**
+ * Every file under some dropped entries that the import can use.
+ *
+ * A folder is walked to the bottom -- `readEntries` answers in batches, so it
+ * is called until it returns none -- and whatever the import has no use for
+ * (a .blend, notes) is left behind.
+ *
+ * @param {Array<FileSystemEntry>} entries
+ * @returns {Promise<File[]>}
+ */
+export async function importableFiles(entries) {
+    const found = (await Promise.all(entries.map(filesUnder))).flat();
+    return found.filter((file) => IMPORT_SUFFIXES.has(suffixOf(file.name)));
+}
+
+async function filesUnder(entry) {
+    if (entry.isFile) {
+        return [await new Promise((resolve, reject) => entry.file(resolve, reject))];
+    }
+    const reader = entry.createReader();
+    const files = [];
+    for (;;) {
+        const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+        if (batch.length === 0) return files;
+        for (const child of batch) files.push(...(await filesUnder(child)));
+    }
 }
 
 /**
@@ -184,7 +380,7 @@ export class Panel {
             statusText: byId('status-text'),
         };
 
-        this.el.file.setAttribute('accept', MESH_ACCEPT);
+        this.el.file.setAttribute('accept', `${MESH_ACCEPT},${COMPANION_ACCEPT}`);
         this.hints = new Hints(byId('tip'));
 
         /* The config as the server last reported it, which is what an edit is
@@ -194,9 +390,12 @@ export class Panel {
         this._settleTimer = 0;
         this._uvTimer = 0;
 
-        /* How many texture buttons are up, and which one is pressed. */
-        this._textureCount = 0;
-        this._textureSlot = null;
+        /* What the texture row was last built from, which view of the maps
+           is pressed ('none', 'all' or a map's id), and the preview-only
+           corrections on the normal and roughness buttons. */
+        this._textureSignature = '';
+        this._textureView = 'none';
+        this._mapOptions = { flipGreen: false, invertRoughness: false };
 
         /* The one status line shows the selected brush's help by default and
            borrows the space for a message, so both have to be remembered. */
@@ -220,11 +419,12 @@ export class Panel {
 
         on(this.el.open, 'click', () => this.el.file.click());
         on(this.el.file, 'change', () => {
-            const file = this.el.file.files && this.el.file.files[0];
+            const files = [...(this.el.file.files || [])];
             /* Clearing the value lets the same file be chosen twice running. */
             this.el.file.value = '';
-            if (file) call('onOpenFile', file);
+            if (files.length) call('onOpenFiles', files);
         });
+        this._bindDrop(on, call);
 
         /* The slider and the number box are two views of one value, but not of
            one scale: only the box is in vertices.  Neither writes back into the
@@ -265,13 +465,18 @@ export class Panel {
         }
 
         /* Delegated, because these buttons are built when a model arrives and
-           replaced when the next one does. Pressing the one already down turns
-           it off: the maps are a way of looking at the model, not a mode. */
+           replaced when the next one does. */
         on(this.el.textureSlots, 'click', (event) => {
+            const toggle = event.target.closest('button.texture-option');
+            if (toggle) {
+                const name = toggle.dataset.option;
+                this._mapOptions = { ...this._mapOptions, [name]: !this._mapOptions[name] };
+                toggle.setAttribute('aria-pressed', String(this._mapOptions[name]));
+                call('onMapOptionsChange', this.mapOptions());
+                return;
+            }
             const button = event.target.closest('button.texture');
-            if (!button) return;
-            const slot = Number(button.dataset.slot);
-            call('onTextureChange', slot === this._textureSlot ? null : slot);
+            if (button) call('onTextureChange', button.dataset.view);
         });
 
         /* Read at extraction time, so changing it makes the result on screen
@@ -328,6 +533,55 @@ export class Panel {
                 () => call('onUvChange', this.uvLeniency()),
                 UV_SETTLE_MS
             );
+        });
+    }
+
+    /**
+     * Take a model dropped anywhere on the viewer: files, or a whole folder.
+     *
+     * A folder is how a model usually arrives -- the FBX or OBJ beside its
+     * textures, often in a subfolder of their own -- so it is walked and
+     * everything the import can use is sent.  The entries have to be taken
+     * while the drop event is still running, which is why they are read
+     * before the first await.
+     */
+    _bindDrop(on, call) {
+        const stage = byId('stage');
+        const carriesFiles = (event) =>
+            Boolean(event.dataTransfer) && [...event.dataTransfer.types].includes('Files');
+
+        on(document, 'dragover', (event) => {
+            if (!carriesFiles(event)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+            stage.classList.add('dropping');
+        });
+        on(document, 'dragleave', (event) => {
+            if (!event.relatedTarget) stage.classList.remove('dropping');
+        });
+        on(document, 'drop', async (event) => {
+            if (!carriesFiles(event)) return;
+            event.preventDefault();
+            stage.classList.remove('dropping');
+
+            const entries = [...event.dataTransfer.items]
+                .map((item) => item.webkitGetAsEntry && item.webkitGetAsEntry())
+                .filter(Boolean);
+            const loose = [...event.dataTransfer.files];
+            try {
+                const files = entries.length
+                    ? await importableFiles(entries)
+                    : loose.filter((file) => IMPORT_SUFFIXES.has(suffixOf(file.name)));
+                if (files.length) {
+                    call('onOpenFiles', files);
+                } else {
+                    this.setStatus('Nothing in that drop can be imported: drop a 3D model ' +
+                        '(FBX, OBJ, glTF, GLB...) with its textures, or a folder or zip ' +
+                        'holding one', true);
+                }
+            } catch (err) {
+                this.setStatus(`Could not read the dropped files: ${err.message}`, true);
+            }
         });
     }
 
@@ -514,52 +768,96 @@ export class Panel {
     }
 
     /**
-     * Offer one button per texture map the imported file carried.
+     * Offer the ways of looking at the maps the imported file carried.
      *
-     * Rebuilt rather than shown and hidden, because the count is a property of
-     * the model: an OBJ has none and the row disappears, a glB may have two, a
-     * character FBX five. None starts pressed -- the model arrives shaded the
-     * way every other model in here is, and a map is something you ask for.
+     * None, All, then one button per kind of map -- Base colour, Normal,
+     * Roughness... -- whichever material it came from; a packed map gives one
+     * button per channel it packs.  Rebuilt whenever the list changes, not
+     * just its length, because it is a property of the model: an OBJ with no
+     * maps has no row at all.  None starts pressed -- the model arrives shaded
+     * the way every other model in here is, and a map is something you ask for.
+     *
+     * @param {Array<{id: string, label: string, slot: number, channel: string}>} buttons
+     *        the /source header's `buttons`
+     * @param {Array<object>} materials  the header's `materials`, whose
+     *        guesses say which file each map came from and why
      */
-    showTextures(count) {
-        const row = this.el.textureSlots;
-        const slots = Math.max(0, Number(count) || 0);
-        if (slots === this._textureCount) return;
-        this._textureCount = slots;
+    showTextures(buttons, materials = []) {
+        const described = describeButtons(buttons || [], materials);
+        const signature = JSON.stringify(described);
+        if (signature === this._textureSignature) return;
+        this._textureSignature = signature;
 
+        const row = this.el.textureSlots;
         row.textContent = '';
-        row.hidden = slots === 0;
-        this._textureSlot = null;
-        for (let slot = 0; slot < slots; ++slot) {
-            const button = document.createElement('button');
-            button.className = 'texture';
-            button.dataset.slot = String(slot);
-            button.setAttribute('role', 'radio');
-            button.setAttribute('aria-checked', 'false');
-            button.textContent = `tex ${slot}`;
-            button.dataset.hint =
-                'Show this texture map on the imported model, unlit. Press it ' +
-                'again to go back to the shaded surface the field is drawn on.';
-            row.appendChild(button);
+        row.hidden = described.length === 0;
+        this._textureView = 'none';
+        this._mapOptions = { flipGreen: false, invertRoughness: false };
+        if (described.length === 0) return;
+
+        row.append(
+            this._textureButton('none', 'None', NONE_HINT),
+            this._textureButton('all', 'All', ALL_HINT)
+        );
+        for (const map of described) {
+            const button = this._textureButton(map.id, map.label, map.hint);
+            if (map.unsure) {
+                const mark = document.createElement('span');
+                mark.className = 'unsure';
+                mark.textContent = '?';
+                button.append(mark);
+                button.setAttribute('aria-label', `${map.label} (uncertain)`);
+            }
+            const extra = MAP_OPTIONS[map.id];
+            if (!extra) {
+                row.append(button);
+                continue;
+            }
+            /* The correction sits against its map, not in a menu: the moment
+               a normal map looks inside out is the moment to press it. */
+            const toggle = document.createElement('button');
+            toggle.className = 'texture-option';
+            toggle.dataset.option = extra.option;
+            toggle.setAttribute('aria-pressed', 'false');
+            toggle.textContent = extra.label;
+            toggle.dataset.hint = extra.hint;
+            const pair = document.createElement('span');
+            pair.className = 'texture-pair';
+            pair.append(button, toggle);
+            row.append(pair);
         }
     }
 
-    /** Which map is being shown, or null for the shaded surface. */
-    textureSlot() {
-        return this._textureSlot;
+    _textureButton(view, label, hint) {
+        const button = document.createElement('button');
+        button.className = 'texture';
+        button.dataset.view = view;
+        button.setAttribute('role', 'radio');
+        button.setAttribute('aria-checked', String(view === this._textureView));
+        button.textContent = label;
+        button.dataset.hint = hint;
+        return button;
     }
 
-    /** Select a map, or pass null for none. @returns {boolean} true on a change */
-    setTextureSlot(slot) {
-        const wanted = slot === null || slot === undefined ? null : Number(slot);
-        if (wanted === this._textureSlot) return false;
-        this._textureSlot = wanted;
+    /** Which view of the maps is pressed: 'none', 'all' or a map's id. */
+    textureView() {
+        return this._textureView;
+    }
+
+    /** Press one view of the maps. @returns {boolean} true on a change */
+    setTextureView(view) {
+        const wanted = view || 'none';
+        if (wanted === this._textureView) return false;
+        this._textureView = wanted;
         for (const button of this.el.textureSlots.querySelectorAll('button.texture')) {
-            button.setAttribute(
-                'aria-checked', String(Number(button.dataset.slot) === wanted)
-            );
+            button.setAttribute('aria-checked', String(button.dataset.view === wanted));
         }
         return true;
+    }
+
+    /** The preview-only corrections: {flipGreen, invertRoughness}. */
+    mapOptions() {
+        return { ...this._mapOptions };
     }
 
     /**

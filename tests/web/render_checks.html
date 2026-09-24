@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Viewer render checks</title>
+    <!--
+      Served from the repository root (see README.md), so these relative URLs
+      reach the viewer's own modules: what is checked is the code that ships.
+    -->
+    <script type="importmap">
+      { "imports": { "three": "../../python/instant_meshes_brush/static/vendor/three.module.js" } }
+    </script>
+    <style>
+      body { margin: 16px; background: #1e1e22; color: #d8d8dd; font: 13px/1.5 "Segoe UI", system-ui, sans-serif; }
+      #host { position: relative; width: 64px; height: 64px; }
+      #host canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+      table { border-collapse: collapse; margin-top: 12px; }
+      td, th { padding: 3px 10px; border-bottom: 1px solid #34343a; text-align: left; }
+      .pass { color: #6fcf8f; } .fail { color: #ef7a6a; font-weight: 600; }
+      pre { white-space: pre-wrap; color: #8b8b94; }
+    </style>
+  </head>
+  <body>
+    <h1>Viewer render checks</h1>
+    <div id="host"><canvas id="view"></canvas><canvas id="overlay"></canvas></div>
+    <table><thead><tr><th>check</th><th>measured</th><th>expected</th><th></th></tr></thead>
+      <tbody id="rows"></tbody></table>
+    <!-- The headless runner reads this: {"pass": bool, "checks": [...]}. -->
+    <pre id="result">running</pre>
+    <script type="module" src="render_checks.js"></script>
+  </body>
+</html>

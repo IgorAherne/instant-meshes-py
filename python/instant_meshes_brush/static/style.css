@@ -529,9 +529,10 @@ kbd {
     background: var(--accent-hot);
 }
 
-/* The imported file's own texture maps, one button each. Sized like the field
-   toggles above, since they are the same kind of control -- a row of small
-   choices -- but only one of them is ever on. */
+/* The imported file's own texture maps: None, All, one button per kind of map.
+   Sized like the field toggles below, since they are the same kind of control
+   -- a row of small choices -- but only one of them is ever on. Each button is
+   as wide as its name and the row wraps, so "Base colour" never ellipsises. */
 .textures {
     display: flex;
     flex-wrap: wrap;
@@ -540,17 +541,56 @@ kbd {
 }
 
 .texture {
-    flex: 1 1 0;
+    flex: 1 1 auto;
     min-width: 42px;
-    padding: 4px 2px;
+    padding: 4px 5px;
     font-size: 10px;
     text-align: center;
+    white-space: nowrap;
 }
 
 .texture[aria-checked="true"],
 .texture[aria-checked="true"]:hover {
     background: var(--accent);
     border-color: var(--accent);
+    color: #fff;
+}
+
+/* The server's guess about what this map is was a weak one. */
+.texture .unsure {
+    margin-left: 2px;
+    font-weight: 700;
+    color: #e0b050;
+}
+
+.texture[aria-checked="true"] .unsure {
+    color: #ffe2a0;
+}
+
+/* A map button with its preview-only correction fused to its right edge. */
+.texture-pair {
+    display: flex;
+    flex: 1 1 auto;
+}
+
+.texture-pair > .texture {
+    border-radius: 4px 0 0 4px;
+}
+
+.texture-option {
+    flex: 0 0 auto;
+    margin-left: -1px;
+    padding: 4px 4px;
+    border-radius: 0 4px 4px 0;
+    font-size: 9px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.texture-option[aria-pressed="true"],
+.texture-option[aria-pressed="true"]:hover {
+    background: #6a5a2a;
+    border-color: #8a7432;
     color: #fff;
 }
 
@@ -562,6 +602,22 @@ kbd {
     position: relative;
     flex: 1;
     min-width: 0;
+}
+
+/* Files dragged over the viewer: the drop will be imported. */
+#stage.dropping::after {
+    content: "Drop to import";
+    position: absolute;
+    inset: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed var(--focus);
+    border-radius: 8px;
+    background: rgba(74, 120, 208, 0.12);
+    color: var(--text);
+    font-size: 15px;
+    pointer-events: none;
 }
 
 #view,

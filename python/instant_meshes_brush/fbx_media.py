@@ -1,30 +1,38 @@
-"""The texture images an FBX file carries inside itself.
+"""What a binary FBX says about its materials, straight from the file.
 
-Assimp reads FBX geometry, its UVs and which material each mesh uses, but a
-material's texture path comes back as ``*0`` for a map the file embeds and
-there is no way through its Python binding to ask what ``*0`` holds.  Embedded
-is the only kind that can work here: the browser uploads one file, not the
-folder of maps that sat beside it in the exporter.  So the images are taken out
-of the file directly.
+Assimp reads FBX geometry, its UVs and which material each mesh uses, but it
+hands back ``*0`` for a texture the file embeds, with no way through its Python
+binding to ask what ``*0`` holds, and it files every texture under one of its
+own channel types, which loses what the exporter actually wrote.  Blender binds
+its roughness map to ``ShininessExponent`` and its metallic map to
+``ReflectionFactor``; 3ds Max binds glossiness to the first and an environment
+map to ``ReflectionColor``.  Telling those apart needs the raw property name
+and the program that wrote the file, so both are read here, along with the
+embedded image bytes.
 
 Only as much of the format as that needs is implemented.  A binary FBX is a
-tree of records -- a length, a property list, then nested records -- and the
-three object kinds that matter are ``Material`` (a name), ``Texture`` (the link
-between the two) and ``Video`` (the bytes, under ``Content``).  ``Connections``
+tree of records -- a length, a property list, then nested records.  The object
+kinds that matter are ``Material`` (a name), ``Texture`` (the link between the
+two, and the file name of the map), ``LayeredTexture`` (a stack of textures
+bound as one) and ``Video`` (the bytes, under ``Content``).  ``Connections``
 says which belongs to which, and names the material property each texture is
-bound to, which is what makes a map a normal map rather than a colour one.
+bound to.  ``FBXHeaderExtension`` names the exporter and ``GlobalSettings``
+holds the file's axes and unit.
 
 Anything unexpected -- an ASCII FBX, a version this does not know, a truncated
-file -- returns nothing rather than raising.  The geometry has already loaded
-by then, and a model without its maps is still a model to remesh.
+file -- returns None rather than raising.  The geometry has already loaded by
+then, and a model without its maps is still a model to remesh.
 """
 
 from __future__ import annotations
 
 import logging
 import struct
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+
+import numpy as np
 
 LOG = logging.getLogger(__name__)
 
@@ -38,35 +46,104 @@ WIDE_VERSION = 7500
 #: cannot ask for a terabyte before anything has been read.
 MAX_IMAGE_BYTES = 256 * 1024 * 1024
 
-#: Material properties an FBX texture is bound to, and the channel each means.
-#: Spelled lower case here and matched that way: exporters disagree about case
-#: and about their vendor prefixes ("Maya|normalCamera"), and the tail after
-#: the last '|' is the part they agree on.
-_PROPERTIES: Dict[str, str] = {
-    "diffusecolor": "base colour",
-    "diffuse": "base colour",
-    "basecolor": "base colour",
-    "base_color": "base colour",
-    "normalmap": "normal",
-    "normalcamera": "normal",
-    "bump": "normal",
-    "bumpmap": "normal",
-    "shininessexponent": "metal/rough",
-    "shininess": "metal/rough",
-    "roughness": "metal/rough",
-    "metalness": "metal/rough",
-    "specularcolor": "specular",
-    "specularfactor": "specular",
-    "reflectionfactor": "specular",
-    "emissivecolor": "emissive",
-    "emissive": "emissive",
-    "ambientcolor": "occlusion",
-    "ambientocclusion": "occlusion",
+#: Scalar property types: their struct format and byte size.
+_SCALARS: Dict[str, Tuple[str, int]] = {
+    "Y": ("<h", 2),
+    "C": ("<?", 1),
+    "I": ("<i", 4),
+    "F": ("<f", 4),
+    "D": ("<d", 8),
+    "L": ("<q", 8),
 }
 
-#: Channel for a texture whose binding property is not one of the above. A file
-#: that names only one map almost always means the colour one.
-_FALLBACK_CHANNEL = "base colour"
+
+class TextureBinding(NamedTuple):
+    """One texture bound to one property of a material."""
+
+    #: The material property exactly as the file spells it: ``"DiffuseColor"``,
+    #: ``"3dsMax|Parameters|bump_map"``, ``"Maya|normalCamera"``.
+    property: str
+    #: The image file the texture names (its RelativeFilename, else FileName),
+    #: or the texture's own name when it names no file.  Paths are the
+    #: exporter's, from another machine as often as not.
+    file_name: str
+    #: The image the file embeds, or None when it has to be found on disk.
+    data: Optional[bytes]
+
+
+@dataclass(frozen=True)
+class Material:
+    """One FBX material and the textures bound to it."""
+
+    name: str
+    textures: Tuple[TextureBinding, ...]
+
+
+@dataclass(frozen=True)
+class GlobalSettings:
+    """The axis system and unit the file's coordinates are written in.
+
+    FBX names three axes -- up, front and coord -- each as an index (0 = X,
+    1 = Y, 2 = Z) and a sign.  The defaults are Maya's, which glTF shares:
+    +Y up, +Z front, +X coord.  3ds Max writes +Z up and -Y front.
+    """
+
+    up_axis: int = 1
+    up_sign: int = 1
+    front_axis: int = 2
+    front_sign: int = 1
+    coord_axis: int = 0
+    coord_sign: int = 1
+    #: Centimetres per file unit (1 = centimetres, 100 = metres).
+    unit_scale: float = 1.0
+
+    def axes(self) -> np.ndarray:
+        """``(3, 3)`` matrix taking file coordinates to glTF's frame.
+
+        Its rows are the coord, up and front axes, so they land on +X, +Y
+        and +Z.  A signed permutation: it only swaps and flips axes.  Its
+        determinant is -1 when the file's frame is left-handed, and triangles
+        then need their winding reversed to keep facing outward.
+        """
+        basis = np.zeros((3, 3))
+        for row, (axis, sign) in enumerate(
+            (
+                (self.coord_axis, self.coord_sign),
+                (self.up_axis, self.up_sign),
+                (self.front_axis, self.front_sign),
+            )
+        ):
+            basis[row, axis] = 1.0 if sign >= 0 else -1.0
+        return basis
+
+    @property
+    def metres_per_unit(self) -> float:
+        return self.unit_scale / 100.0
+
+    @property
+    def valid(self) -> bool:
+        """Whether the three axes are distinct, i.e. :meth:`axes` is invertible."""
+        return sorted((self.up_axis, self.front_axis, self.coord_axis)) == [0, 1, 2]
+
+
+@dataclass(frozen=True)
+class FbxMedia:
+    """Everything :func:`read` took out of one file."""
+
+    #: Every Material object, in the order the file lists them, with or
+    #: without textures.
+    materials: Tuple[Material, ...]
+    #: ``FBXHeaderExtension`` Creator, e.g. "FBX SDK/FBX Plugins version 2012.2".
+    creator: str
+    #: SceneInfo ``Original|ApplicationName``, e.g. "3ds Max",
+    #: "Blender (stable FBX IO)".  Often empty.
+    application: str
+    settings: GlobalSettings
+
+    @property
+    def exporter(self) -> str:
+        """The program that wrote the file, as briefly as the file says it."""
+        return self.application or self.creator
 
 
 class _Record:
@@ -87,6 +164,16 @@ class _Record:
 
     def every(self, name: str) -> List["_Record"]:
         return [child for child in self.children if child.name == name]
+
+    def first_text(self, *names: str) -> str:
+        """The first string property of the first child named, or ''."""
+        for name in names:
+            child = self.find(name)
+            if child is not None and child.props:
+                text = _text(child.props[0])
+                if text:
+                    return text
+        return ""
 
 
 class _Reader:
@@ -110,6 +197,8 @@ class _Reader:
         at += 1
         if end == 0:
             return None, at + name_length
+        if end > len(self.data):
+            raise ValueError("record runs past the end of the file")
         name = self.data[at : at + name_length].decode("utf-8", "replace")
         at += name_length
 
@@ -133,10 +222,8 @@ class _Reader:
         kind = self.data[at : at + 1].decode("ascii", "replace")
         at += 1
 
-        scalars = {"Y": ("<h", 2), "C": ("<?", 1), "I": ("<i", 4),
-                   "F": ("<f", 4), "D": ("<d", 8), "L": ("<q", 8)}
-        if kind in scalars:
-            fmt, size = scalars[kind]
+        if kind in _SCALARS:
+            fmt, size = _SCALARS[kind]
             return struct.unpack_from(fmt, self.data, at)[0], at + size
 
         if kind in ("S", "R"):
@@ -174,111 +261,129 @@ def _text(value: Any) -> str:
     return str(value or "")
 
 
-def _channel(binding: str) -> str:
-    """The channel a material property name stands for."""
-    tail = binding.rsplit("|", 1)[-1].strip().lower()
-    return _PROPERTIES.get(tail, _FALLBACK_CHANNEL)
+def _properties70(record: Optional[_Record]) -> Dict[str, Any]:
+    """``{name: first value}`` of a record's ``Properties70`` block."""
+    block = record.find("Properties70") if record is not None else None
+    values: Dict[str, Any] = {}
+    for entry in block.every("P") if block is not None else ():
+        # P: name, type, label, flags, value...
+        if len(entry.props) >= 5:
+            values[_text(entry.props[0])] = entry.props[4]
+    return values
 
 
-def _content(video: _Record, beside: Optional[Path]) -> Optional[bytes]:
-    """The image bytes a Video record stands for.
+def _settings(record: Optional[_Record]) -> GlobalSettings:
+    values = _properties70(record)
+    defaults = GlobalSettings()
 
-    Embedded first, because that is the only kind an upload can carry. A file
-    opened from disk may still have its maps in the folder next to it, which is
-    how an exporter that did not tick "embed media" leaves them.
-    """
+    def number(name: str, default: float) -> float:
+        value = values.get(name, default)
+        return float(value) if isinstance(value, (int, float)) else default
+
+    settings = GlobalSettings(
+        up_axis=int(number("UpAxis", defaults.up_axis)),
+        up_sign=int(number("UpAxisSign", defaults.up_sign)),
+        front_axis=int(number("FrontAxis", defaults.front_axis)),
+        front_sign=int(number("FrontAxisSign", defaults.front_sign)),
+        coord_axis=int(number("CoordAxis", defaults.coord_axis)),
+        coord_sign=int(number("CoordAxisSign", defaults.coord_sign)),
+        unit_scale=number("UnitScaleFactor", defaults.unit_scale) or defaults.unit_scale,
+    )
+    if not settings.valid:
+        LOG.info("ignoring an FBX axis system with repeated axes: %s", settings)
+        return GlobalSettings(unit_scale=settings.unit_scale)
+    return settings
+
+
+def _embedded(video: _Record) -> Optional[bytes]:
     holder = video.find("Content")
     data = holder.props[0] if holder is not None and holder.props else None
-    if isinstance(data, (bytes, bytearray)) and data:
-        if len(data) > MAX_IMAGE_BYTES:
-            LOG.warning("skipping a %d byte embedded texture", len(data))
-            return None
-        return bytes(data)
-    return _beside(video, beside)
-
-
-def _beside(video: _Record, folder: Optional[Path]) -> Optional[bytes]:
-    """An external map, looked for where the file that named it lives."""
-    if folder is None:
+    if not isinstance(data, (bytes, bytearray)) or not data:
         return None
-    for field in ("RelativeFilename", "Filename"):
-        named = _text(video.find(field).props[0]) if video.find(field) else ""
-        if not named:
-            continue
-        # Only ever inside the folder the model came from: a path out of a
-        # file is data, and "..\..\Windows\..." is a path like any other.
-        name = PureWindowsPath(named.replace("\\", "/")).name
-        if not name:
-            continue
-        for candidate in (folder / name, folder / "textures" / name):
-            try:
-                if candidate.is_file() and candidate.stat().st_size <= MAX_IMAGE_BYTES:
-                    return candidate.read_bytes()
-            except OSError:
-                LOG.debug("could not read %s", candidate, exc_info=True)
-    return None
+    if len(data) > MAX_IMAGE_BYTES:
+        LOG.warning("skipping a %d byte embedded texture", len(data))
+        return None
+    return bytes(data)
 
 
-def read(path: Path) -> Dict[str, List[Tuple[str, bytes]]]:
-    """Embedded maps per material name: ``{name: [(channel, bytes), ...]}``.
+def _base_name(named: str) -> str:
+    return PureWindowsPath(named.replace("\\", "/")).name.lower()
 
-    An empty result means the file has none this can reach, which is the
-    ordinary answer for an FBX whose textures live beside it on disk.
+
+def read(path: Path) -> Optional[FbxMedia]:
+    """The materials, textures, exporter and axes of a binary FBX.
+
+    None when the file is not a binary FBX this can parse -- an ASCII FBX, a
+    truncated one, or no FBX at all.  Assimp is the reader of last resort for
+    those.
     """
     try:
         return _read(Path(path))
     except Exception:
-        LOG.info("no embedded textures read from %s", path, exc_info=True)
-        return {}
+        LOG.info("could not read the FBX materials of %s", path, exc_info=True)
+        return None
 
 
-def _read(path: Path) -> Dict[str, List[Tuple[str, bytes]]]:
-    folder = path.parent
+def _read(path: Path) -> Optional[FbxMedia]:
     data = path.read_bytes()
     if not data.startswith(MAGIC):
-        return {}  # ASCII FBX, or not an FBX at all
+        return None  # ASCII FBX, or not an FBX at all
     (version,) = struct.unpack_from("<I", data, len(MAGIC))
 
     reader = _Reader(data, version)
     at = len(MAGIC) + 4
-    objects: Optional[_Record] = None
-    connections: Optional[_Record] = None
+    top: Dict[str, _Record] = {}
     while at < len(data) - 16:
         record, at = reader.record(at)
         if record is None:
             break
-        if record.name == "Objects":
-            objects = record
-        elif record.name == "Connections":
-            connections = record
-        if objects is not None and connections is not None:
-            break
+        top.setdefault(record.name, record)
+        if "Objects" in top and "Connections" in top:
+            break  # everything after (Takes) is animation
+    objects, connections = top.get("Objects"), top.get("Connections")
     if objects is None or connections is None:
-        return {}
+        return None
+
+    header = top.get("FBXHeaderExtension")
+    creator = header.first_text("Creator") if header is not None else ""
+    if not creator and "Creator" in top and top["Creator"].props:
+        creator = _text(top["Creator"].props[0])
+    scene_info = header.find("SceneInfo") if header is not None else None
+    application = _text(_properties70(scene_info).get("Original|ApplicationName", ""))
 
     materials: Dict[int, str] = {}
-    videos: Dict[int, bytes] = {}
-    textures: Dict[int, Optional[int]] = {}
+    textures: Dict[int, Tuple[str, str]] = {}  # texture -> (the file it names, its name)
+    videos: Dict[int, Tuple[str, Optional[bytes]]] = {}
+    layered: Dict[int, List[int]] = {}  # layered texture -> its textures
     for child in objects.children:
-        if not child.props:
+        if not child.props or not isinstance(child.props[0], int):
             continue
         identity = child.props[0]
-        if not isinstance(identity, int):
-            continue
+        name = _object_name(child.props[1] if len(child.props) > 1 else b"")
         if child.name == "Material":
-            materials[identity] = _object_name(
-                child.props[1] if len(child.props) > 1 else b""
-            ) or f"material {len(materials)}"
-        elif child.name == "Video":
-            content = _content(child, folder)
-            if content is not None:
-                videos[identity] = content
+            materials[identity] = name or f"material {len(materials)}"
         elif child.name == "Texture":
-            textures[identity] = None
+            textures[identity] = (child.first_text("RelativeFilename", "FileName"), name)
+        elif child.name == "Video":
+            named = child.first_text("RelativeFilename", "Filename", "FileName")
+            videos[identity] = (named, _embedded(child))
+        elif child.name == "LayeredTexture":
+            layered[identity] = []
+
+    # Some exporters embed one copy of an image that several Video records
+    # name, so a Video without content borrows the bytes of one with the
+    # same file name.
+    by_file = {
+        _base_name(named): content
+        for named, content in videos.values()
+        if content is not None and named
+    }
 
     # Connections are written child-first: a Video hangs off a Texture, and
-    # that Texture hangs off the property of a Material it colours.
-    bindings: List[Tuple[int, int, str]] = []  # (texture, material, property)
+    # that Texture (or a LayeredTexture stacking it) hangs off the property of
+    # the Material it feeds.
+    video_of: Dict[int, int] = {}
+    bindings: List[Tuple[int, int, str]] = []  # (texture or layered, material, property)
     for link in connections.every("C"):
         props = link.props
         if len(props) < 3 or not isinstance(props[1], int) or not isinstance(props[2], int):
@@ -286,15 +391,30 @@ def _read(path: Path) -> Dict[str, List[Tuple[str, bytes]]]:
         kind = _text(props[0])
         child, parent = props[1], props[2]
         if child in videos and parent in textures:
-            textures[parent] = child
-        elif child in textures and parent in materials:
+            video_of[parent] = child
+        elif child in textures and parent in layered:
+            layered[parent].append(child)
+        elif (child in textures or child in layered) and parent in materials:
             binding = _text(props[3]) if kind == "OP" and len(props) > 3 else ""
             bindings.append((child, parent, binding))
 
-    found: Dict[str, List[Tuple[str, bytes]]] = {}
-    for texture, material, binding in bindings:
-        video = textures.get(texture)
-        if video is None:
-            continue
-        found.setdefault(materials[material], []).append((_channel(binding), videos[video]))
-    return found
+    found: Dict[int, List[TextureBinding]] = {identity: [] for identity in materials}
+    for source, material, binding in bindings:
+        for texture in layered.get(source, [source]):
+            named, label = textures[texture]
+            content: Optional[bytes] = None
+            if texture in video_of:
+                video_named, content = videos[video_of[texture]]
+                named = named or video_named
+            if content is None and named:
+                content = by_file.get(_base_name(named))
+            found[material].append(TextureBinding(binding, named or label, content))
+
+    return FbxMedia(
+        materials=tuple(
+            Material(name, tuple(found[identity])) for identity, name in materials.items()
+        ),
+        creator=creator,
+        application=application,
+        settings=_settings(top.get("GlobalSettings")),
+    )

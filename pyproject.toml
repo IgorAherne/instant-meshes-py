@@ -78,3 +78,6 @@ environment = { MACOSX_DEPLOYMENT_TARGET = "10.15" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "realasset: reads model files that exist only on the author's machine; skipped elsewhere",
+]

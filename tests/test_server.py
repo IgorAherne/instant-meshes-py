@@ -14,16 +14,22 @@ hanging the suite.
 
 from __future__ import annotations
 
+import io
+import json
 import re
+import tempfile
 import time
-from typing import Dict, List
+import uuid
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pytest
 
-from instant_meshes_brush import protocol, uv
+from instant_meshes_brush import protocol, server, uv
 from instant_meshes_brush.protocol import MessageType
-from instant_meshes_brush.server import STATIC_URL, build_app
+from instant_meshes_brush.server import STATIC_URL, TEXTURE_CACHE, build_app
 from instant_meshes_brush import session_manager
 from instant_meshes_brush.session_manager import SessionRegistry
 
@@ -528,8 +534,9 @@ def test_extract_solves_a_field_that_never_was(client, torus) -> None:
         load_mesh(socket, torus)  # deliberately no SOLVE
 
         socket.send(MessageType.EXTRACT, {})
-        extracted = socket.expect(MessageType.EXTRACTED)
-        field = socket.expect(MessageType.FIELD)
+        # The solve's field and the extraction can share a round, and
+        # expect() drops whatever shares a round with its match.
+        extracted, field = socket.expect_all(MessageType.EXTRACTED, MessageType.FIELD)
 
     assert extracted.get("n_faces") > 0
     assert field.get("iterations_q") >= 0, "the field was never solved"
@@ -909,7 +916,20 @@ def registry_of(client) -> SessionRegistry:
 # ---------------------------------------------------------------------------
 
 
-def _textured_glb(torus) -> bytes:
+def _png(colour: Sequence[int], size: int = 16) -> bytes:
+    image = pytest.importorskip("PIL.Image")
+    buffer = io.BytesIO()
+    image.new("RGB", (size, size), tuple(colour)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def _colour_of(content: bytes) -> np.ndarray:
+    image = pytest.importorskip("PIL.Image")
+    with image.open(io.BytesIO(content)) as decoded:
+        return np.asarray(decoded.convert("RGB")).reshape(-1, 3).mean(0)
+
+
+def _textured_glb(torus, colour: Sequence[int] = (12, 200, 90)) -> bytes:
     """A glB of the torus with one material and one base colour map."""
     trimesh = pytest.importorskip("trimesh")
     image = pytest.importorskip("PIL.Image")
@@ -922,10 +942,61 @@ def _textured_glb(torus) -> bytes:
     mesh.visual = trimesh.visual.TextureVisuals(
         uv=np.zeros((len(mesh.vertices), 2)),
         material=trimesh.visual.material.PBRMaterial(
-            name="shell", baseColorTexture=image.new("RGB", (16, 16), (12, 200, 90))
+            name="shell", baseColorTexture=image.new("RGB", (16, 16), tuple(colour))
         ),
     )
     return trimesh.Scene(mesh).export(file_type="glb")
+
+
+def _obj_text(torus, library: str = "torus.mtl") -> str:
+    lines = [f"mtllib {library}"]
+    lines += [f"v {x:.6f} {y:.6f} {z:.6f}" for x, y, z in torus.vertices]
+    lines += ["vt 0.25 0.25", "usemtl paint"]
+    lines += [f"f {a + 1}/1 {b + 1}/1 {c + 1}/1" for a, b, c in torus.faces]
+    return "\n".join(lines) + "\n"
+
+
+def _upload(client, session_id: str, *files: Tuple[str, bytes]):
+    return client.post(
+        f"/api/session/{session_id}/mesh",
+        files=[("files", (name, data, "application/octet-stream")) for name, data in files],
+        data={"config": '{"vertex_count": 150, "deterministic": true}'},
+    )
+
+
+def _imported(client, session_id: str, *files: Tuple[str, bytes]) -> Dict:
+    """Upload, and the reply of an upload that worked."""
+    response = _upload(client, session_id, *files)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _zip(members: Sequence[Tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, data in members:
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+def _source(client, session_id: str) -> protocol.Message:
+    response = client.get(f"/api/session/{session_id}/source")
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    return protocol.decode(response.content)
+
+
+def _base_colour(client, session_id: str) -> np.ndarray:
+    """The average colour of material 0's base colour map, fetched as the viewer does."""
+    frame = _source(client, session_id)
+    button = next(b for b in frame.header["buttons"] if b["id"] == "basecolor")
+    url = (
+        f"/api/session/{session_id}/texture/{button['slot']}/0"
+        f"?g={frame.header['generation']}"
+    )
+    response = client.get(url)
+    assert response.status_code == 200, response.text
+    return _colour_of(response.content)
 
 
 def test_an_uploaded_model_keeps_its_maps_for_the_viewport(client, torus) -> None:
@@ -933,6 +1004,7 @@ def test_an_uploaded_model_keeps_its_maps_for_the_viewport(client, torus) -> Non
 
     They are different meshes on purpose: the maps are pinned to UVs that only
     exist on the unwelded original, and the remesher cannot take that one.
+    Sent as the single ``file`` older viewers post.
     """
     session_id = open_session(client)
     upload = client.post(
@@ -943,23 +1015,224 @@ def test_an_uploaded_model_keeps_its_maps_for_the_viewport(client, torus) -> Non
     assert upload.status_code == 200, upload.text
     assert upload.json()["textures"] == 1, "the base colour map was not found"
 
-    source = client.get(f"/api/session/{session_id}/source")
-    assert source.status_code == 200
-    frame = protocol.decode(source.content)
-    assert frame.header["slots"] == ["base colour"]
-    assert frame.header["materials"] == ["shell"]
+    frame = _source(client, session_id)
+    assert frame.header["slots"] == [{"slot": 0, "role": "basecolor", "label": "Base colour"}]
+    assert [material["name"] for material in frame.header["materials"]] == ["shell"]
     # Grouped by material, which is what lets the viewer draw one run each.
     assert sum(count for _, _, count in frame.header["groups"]) == frame.header["n_faces"]
     assert frame.arrays["uv"].shape == (frame.header["n_vertices"], 2)
+    normals = frame.arrays["normals"]
+    assert normals.shape == frame.arrays["vertices"].shape
+    assert np.allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-5)
 
     image = client.get(f"/api/session/{session_id}/texture/0/0")
     assert image.status_code == 200
     assert image.headers["content-type"] in ("image/jpeg", "image/png")
+    # A URL without the generation could mean another model's map tomorrow.
+    assert image.headers["cache-control"] == "no-store"
     assert len(image.content) > 0
 
     # A slot that material has nothing in is a 404, which is what tells the
     # viewer to draw it flat rather than leave the previous map on it.
     assert client.get(f"/api/session/{session_id}/texture/3/0").status_code == 404
+
+
+def test_the_source_header_describes_the_maps(client, torus) -> None:
+    """Everything the viewer builds its map buttons and its lit material from."""
+    session_id = open_session(client)
+    _imported(client, session_id, ("torus.glb", _textured_glb(torus)))
+
+    header = _source(client, session_id).header
+    json.dumps(header, allow_nan=False)  # what JSON.parse in a browser accepts
+    assert isinstance(header["generation"], int)
+    assert header["buttons"] == [
+        {
+            "id": "basecolor",
+            "label": "Base colour",
+            "slot": 0,
+            "channel": "rgb",
+            "colorspace": "srgb",
+        }
+    ]
+    (material,) = header["materials"]
+    assert material["maps"] == {"basecolor": 0}
+    assert material["alpha_mode"] == "OPAQUE" and material["double_sided"] is False
+    assert len(material["base_color_factor"]) == 4 and len(material["emissive"]) == 3
+    (guess,) = material["guesses"]
+    assert guess["role"] == "basecolor" and guess["channels"] == {"basecolor": "rgb"}
+    assert 0.0 < guess["confidence"] <= 1.0 and guess["evidence"]
+
+
+def test_a_reimport_gives_its_maps_new_urls(client, torus) -> None:
+    """A map is cached for good under its generation, so a new import needs a new one.
+
+    The same session can import one model after another.  With the URL alone
+    naming the slot, the browser went on showing the first model's maps.
+    """
+    session_id = open_session(client)
+    _imported(client, session_id, ("a.glb", _textured_glb(torus, (250, 10, 10))))
+    first = _source(client, session_id).header["generation"]
+    red = client.get(f"/api/session/{session_id}/texture/0/0?g={first}")
+    assert red.headers["cache-control"] == TEXTURE_CACHE
+    assert _colour_of(red.content)[0] > 200
+
+    _imported(client, session_id, ("b.glb", _textured_glb(torus, (10, 10, 250))))
+    second = _source(client, session_id).header["generation"]
+    assert second != first
+    assert client.get(f"/api/session/{session_id}/texture/0/0?g={first}").status_code == 404
+    blue = client.get(f"/api/session/{session_id}/texture/0/0?g={second}")
+    assert blue.status_code == 200 and _colour_of(blue.content)[2] > 200
+
+
+def test_the_status_counts_the_map_buttons(client, torus) -> None:
+    session_id = open_session(client)
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        socket = Socket(ws)
+        socket.send(MessageType.SUBSCRIBE, {"fps": 60})
+        socket.expect(MessageType.STATUS)
+        _imported(client, session_id, ("torus.glb", _textured_glb(torus)))
+        _, status = socket.expect_all(MessageType.GEOMETRY, MessageType.STATUS)
+    assert status.get("textures") == 1
+
+
+def test_an_obj_upload_finds_its_library_and_maps(client, torus) -> None:
+    """An OBJ is three files at least, and the picker sends them all."""
+    session_id = open_session(client)
+    reply = _imported(
+        client,
+        session_id,
+        ("albedo.png", _png((30, 60, 220))),
+        ("torus.obj", _obj_text(torus).encode()),
+        ("torus.mtl", b"newmtl paint\nKd 1 1 1\nmap_Kd albedo.png\n"),
+    )
+    assert reply["name"] == "torus.obj", "the model is the file that is a model"
+    assert reply["textures"] == 1
+    assert _base_colour(client, session_id)[2] > 200
+
+
+def test_a_gltf_upload_finds_its_buffers_and_maps(client, torus) -> None:
+    """A .gltf names its buffer and its maps by paths the upload flattens."""
+    positions = np.asarray(torus.vertices, dtype=np.float32)
+    corners = np.asarray(torus.faces, dtype=np.uint32).reshape(-1)
+    uv = np.full((positions.shape[0], 2), 0.5, dtype=np.float32)
+    binary = positions.tobytes() + uv.tobytes() + corners.tobytes()
+    offsets = [0, positions.nbytes, positions.nbytes + uv.nbytes, len(binary)]
+    document = {
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [
+            {
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "TEXCOORD_0": 1},
+                        "indices": 2,
+                        "material": 0,
+                    }
+                ]
+            }
+        ],
+        "materials": [
+            {"name": "paint", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}
+        ],
+        "textures": [{"source": 0}],
+        "images": [{"uri": "textures/albedo.png"}],
+        "buffers": [{"uri": "data/torus.bin", "byteLength": len(binary)}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": start, "byteLength": stop - start}
+            for start, stop in zip(offsets, offsets[1:])
+        ],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": positions.shape[0],
+                "type": "VEC3",
+                "min": positions.min(0).tolist(),
+                "max": positions.max(0).tolist(),
+            },
+            {"bufferView": 1, "componentType": 5126, "count": uv.shape[0], "type": "VEC2"},
+            {"bufferView": 2, "componentType": 5125, "count": corners.size, "type": "SCALAR"},
+        ],
+    }
+
+    session_id = open_session(client)
+    reply = _imported(
+        client,
+        session_id,
+        ("torus.gltf", json.dumps(document).encode()),
+        ("torus.bin", binary),
+        ("albedo.png", _png((220, 200, 20))),
+    )
+    assert reply["n_vertices"] > 0 and reply["textures"] == 1
+    colour = _base_colour(client, session_id)
+    assert colour[0] > 200 and colour[1] > 180
+
+
+def test_a_zip_keeps_its_folders_and_the_maps_are_still_found(client, torus) -> None:
+    """An asset pack keeps its maps beside the model's folder, not in it."""
+    session_id = open_session(client)
+    pack = _zip(
+        [
+            ("Pack/Meshes/torus.obj", _obj_text(torus).encode()),
+            ("Pack/Meshes/torus.mtl", b"newmtl paint\nmap_Kd ../Textures/albedo.png\n"),
+            ("Pack/Textures/albedo.png", _png((240, 120, 10))),
+            ("Pack/readme.txt", b"thanks for downloading"),
+            ("__MACOSX/Pack/Meshes/._torus.fbx", b"resource fork, not a model"),
+        ]
+    )
+    reply = _imported(client, session_id, ("pack.zip", pack))
+    assert reply["name"] == "torus.obj" and reply["textures"] == 1
+    assert _base_colour(client, session_id)[0] > 200
+
+
+def test_a_zip_that_climbs_out_of_its_folder_is_refused(client, torus) -> None:
+    """Zip slip: a member named ``../x`` would be written beside the upload folder."""
+    session_id = open_session(client)
+    escape = f"escaped-{uuid.uuid4().hex}.png"
+    names = (f"../{escape}", f"a/../../{escape}", f"/{escape}", f"C:/{escape}", f"..\\{escape}")
+    for name in names:
+        pack = _zip([("torus.obj", _obj_text(torus).encode()), (name, _png((0, 0, 0)))])
+        upload = _upload(client, session_id, ("pack.zip", pack))
+        assert upload.status_code == 400, name
+        assert "leads out of it" in upload.json()["detail"]
+    for folder in (Path(tempfile.gettempdir()), Path(Path(tempfile.gettempdir()).anchor)):
+        assert not (folder / escape).exists()
+
+
+def test_uploaded_names_are_reduced_to_safe_base_names(tmp_path) -> None:
+    """The browser names the files, and a name is the client's to choose."""
+    stored = server.store_upload(
+        [
+            ("..\\..\\evil.png", io.BytesIO(b"png")),
+            ("C:/Windows/model.obj", io.BytesIO(b"v 0 0 0\n")),
+            ("CON.mtl", io.BytesIO(b"newmtl a\n")),
+            ('bad:"name"?.png', io.BytesIO(b"png")),
+        ],
+        tmp_path,
+    )
+    assert stored == tmp_path / "model.obj"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "_CON.mtl",
+        "bad__name__.png",
+        "evil.png",
+        "model.obj",
+    ]
+
+
+def test_a_zip_picks_the_richest_model_it_holds(tmp_path) -> None:
+    """With no model picked by hand, FBX beats glB beats glTF beats OBJ."""
+    pack = _zip([("a/model.obj", b"v 0 0 0\n"), ("b/c/model.fbx", b"fbx"), ("m.gltf", b"{}")])
+    model = server.store_upload([("pack.zip", io.BytesIO(pack))], tmp_path)
+    assert model == tmp_path / "b" / "c" / "model.fbx"
+
+
+def test_an_upload_without_a_model_says_so(client) -> None:
+    session_id = open_session(client)
+    upload = _upload(client, session_id, ("a.png", _png((1, 2, 3))), ("b.mtl", b"newmtl b\n"))
+    assert upload.status_code == 415
+    assert "none of the uploaded files is a model" in upload.json()["detail"]
 
 
 def test_a_model_with_no_materials_offers_no_texture_buttons(client, torus) -> None:

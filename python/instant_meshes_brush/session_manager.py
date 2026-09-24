@@ -379,6 +379,7 @@ class BrushSession:
         #: one welded triangle soup and has no use for any of this, but the
         #: viewport can only show the model as its author left it from here.
         self._source: Optional[SourceMesh] = None
+        self._source_generation = 0
         self._geometry_version = 0
         self._extracted: Optional["_core.ExtractedMesh"] = None
         #: The atlas of the extraction on hand, and the slider position it was
@@ -560,6 +561,20 @@ class BrushSession:
         """The imported file with its materials, or None if none was kept."""
         return self._source
 
+    @property
+    def source_generation(self) -> int:
+        """Increments whenever the imported file is replaced or dropped.
+
+        Texture URLs carry it, which is what lets a browser cache a map for
+        good: the same session can import another model, and a map fetched
+        for the old one must never be shown on the new one.
+        """
+        return self._source_generation
+
+    def _set_source_locked(self, source: Optional[SourceMesh]) -> None:
+        self._source = source
+        self._source_generation += 1
+
     async def load_mesh(
         self,
         vertices: Any,
@@ -585,7 +600,7 @@ class BrushSession:
             await self._call(core.set_mesh, v, f)
             self.mesh_name = name
             # After the invalidate above, which drops the previous file's.
-            self._source = source
+            self._set_source_locked(source)
             return await self._preprocess_locked()
 
     async def load_file(
@@ -638,7 +653,7 @@ class BrushSession:
     def _invalidate_locked(self) -> None:
         # The file is gone, so are its materials; a caller loading a new mesh
         # puts the new ones back, and everyone else is simply clearing up.
-        self._source = None
+        self._set_source_locked(None)
         self._set_geometry_locked(None)
 
     def _drop_extraction(self) -> None:
