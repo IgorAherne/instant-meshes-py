@@ -3,7 +3,8 @@
 
     The whole UI lives in this document: panel.js owns the controls, this file
     owns the session and the frames that flow through it.  A host page embeds
-    the viewer with one <iframe> and reproduces none of it.
+    the viewer with one <iframe> and reproduces none of it; what it may change
+    -- the panel's side, the Export button -- it says in the URL (options.js).
 
     Network frames are never applied straight away.  Each one is folded into a
     small pending set and drained once per animation frame, so a burst of FIELD
@@ -17,6 +18,7 @@ import { Connection } from './net.js';
 import { Viewer, loadTexture } from './renderer.js';
 import { TOOLS, ToolController } from './tools.js';
 import { MESH_ACCEPT, Panel, suffixOf } from './panel.js';
+import { readViewerOptions } from './options.js';
 
 /** Preview rate asked of the server; the RAF loop coalesces anything faster. */
 const SUBSCRIBE_FPS = 15;
@@ -196,15 +198,74 @@ class TextureCache {
 
 
 /* ------------------------------------------------------------------ */
+/*  The page around the viewer                                         */
+/* ------------------------------------------------------------------ */
+
+/** What the host page may say about a result it was handed. */
+const EXPORT_STATES = new Set(['busy', 'done', 'error']);
+
+/** How long a press waits for the page's first answer before it may be
+ *  pressed again: a double click must not hand the result over twice. */
+const HOST_ANSWER_MS = 2000;
+
+/**
+ * The conversation with the page that embeds the viewer, in host mode.
+ *
+ * Both directions are pinned to the one origin the page named in the URL:
+ * a request is posted to that origin only -- the browser drops it if the
+ * parent is anything else -- and an answer counts only when it comes from
+ * the parent window AND from that origin, so neither another frame on the
+ * page nor a page that navigated the parent elsewhere can speak for it.
+ */
+class HostLink {
+    /**
+     * @param {string} origin  the host page's origin, checked by options.js
+     * @param {(state: string, message: string) => void} onState
+     */
+    constructor(origin, onState) {
+        this.origin = origin;
+        this._onMessage = (event) => {
+            if (event.source !== window.parent || event.origin !== this.origin) return;
+            const data = event.data;
+            if (!data || typeof data !== 'object' || data.type !== 'export-state') return;
+            if (!EXPORT_STATES.has(data.state)) return;
+            onState(data.state, typeof data.message === 'string' ? data.message : '');
+        };
+        window.addEventListener('message', this._onMessage);
+    }
+
+    /** @param {object} message  sent with `source: 'instant-meshes'` added */
+    post(message) {
+        window.parent.postMessage({ source: 'instant-meshes', ...message }, this.origin);
+    }
+
+    dispose() {
+        window.removeEventListener('message', this._onMessage);
+    }
+}
+
+
+/* ------------------------------------------------------------------ */
 /*  Application                                                        */
 /* ------------------------------------------------------------------ */
 
 class App {
-    constructor(viewer, connection, panel, sessionId) {
+    /**
+     * @param {object} options  the embedding page's wishes, from options.js
+     */
+    constructor(viewer, connection, panel, sessionId, options) {
         this.viewer = viewer;
         this.connection = connection;
         this.panel = panel;
         this.sessionId = sessionId;
+
+        /* In host mode the Export button belongs to the page around the
+           viewer: it is asked, and says when it is busy and when it is done. */
+        this.host = options.exportAction === 'host'
+            ? new HostLink(options.hostOrigin, (state, message) => this._onHostState(state, message))
+            : null;
+        /* Set between a press and the page's first answer to it. */
+        this._hostWait = 0;
 
         /* Drained by the render loop; see the module comment. */
         this.pending = {
@@ -320,6 +381,31 @@ class App {
         this.panel.setStatus('Undid the last stroke', false);
     }
 
+    /**
+     * Hand the result to the host page instead of writing a file.
+     *
+     * Nothing is exported from here and nothing is downloaded: the page
+     * fetches the mesh through its own server, which shares this session,
+     * and it answers busy, then done or error. The settings travel with the
+     * request so the page can keep them beside the mesh they made.
+     */
+    _handToHost() {
+        if (this._hostWait) return;
+        this._hostWait = setTimeout(() => { this._hostWait = 0; }, HOST_ANSWER_MS);
+        this.host.post({
+            type: 'export-request',
+            session: this.sessionId,
+            settings: this.panel.exportSettings(),
+            strokes: this.strokes.size,
+        });
+    }
+
+    _onHostState(state, message) {
+        clearTimeout(this._hostWait);
+        this._hostWait = 0;
+        this.panel.setExportState(state, message);
+    }
+
     /* -------------------------------------------------------------- */
     /*  Per-frame application of network state                         */
     /* -------------------------------------------------------------- */
@@ -391,7 +477,10 @@ class App {
         this.panel.handlers.onSelectTool = (id) => this.tools.setTool(id);
         this.panel.handlers.onClearStrokes = () => send(MessageType.CLEAR_STROKES);
 
-        this.panel.handlers.onExport = (options) => send(MessageType.EXPORT, options);
+        this.panel.handlers.onExport = (options) => {
+            if (this.host) this._handToHost();
+            else send(MessageType.EXPORT, options);
+        };
 
         this.panel.handlers.onSurfaceChange = (which) => this._chooseSurface(which);
 
@@ -1154,6 +1243,13 @@ function fail(message) {
 }
 
 function boot() {
+    /* The layout first, so even a viewer that cannot start sits where the
+       page put it. index.html has already moved the panel if it was asked
+       to; this is the same decision, made with the rest. */
+    const options = readViewerOptions(location.search, { embedded: window.parent !== window });
+    for (const warning of options.warnings) console.warn(`Instant Meshes viewer: ${warning}`);
+    document.documentElement.dataset.panel = options.panel;
+
     const sessionId = new URLSearchParams(location.search).get('session');
     if (!sessionId) {
         fail('No session in the URL; open this page as /viewer?session=<id>');
@@ -1164,6 +1260,7 @@ function boot() {
     let panel;
     try {
         panel = new Panel({});
+        panel.useExportOptions(options);
         viewer = new Viewer(document.getElementById('view'), document.getElementById('overlay'));
     } catch (err) {
         fail(err.message);
@@ -1179,7 +1276,7 @@ function boot() {
     });
 
     /* Kept on window so a dev console can poke at a live session. */
-    window.app = new App(viewer, connection, panel, sessionId);
+    window.app = new App(viewer, connection, panel, sessionId, options);
     connection.connect();
 }
 

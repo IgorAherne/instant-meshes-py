@@ -1,5 +1,10 @@
 # Browser checks for the viewer's texture views
 
+(Also here: `test_viewer_options.py`, pytest under node like the next one. It
+reads the viewer's URL options -- panel side, Export label, host mode and its
+origin -- from URLs built by `server.viewer_url`, and checks every row of the
+mouse navigation table in `static/navigation.js`.)
+
 The texture row of the viewer (None, All, Base colour, Normal, Roughness...) has
 two halves, and each has its own check.
 

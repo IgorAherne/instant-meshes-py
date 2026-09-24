@@ -16,6 +16,7 @@ import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { RoomEnvironment } from './vendor/RoomEnvironment.js';
 import { FieldMaterial } from './field_material.js';
+import { ORBIT, PAN, ZOOM, dragAction } from './navigation.js';
 
 /* Stroke ribbons: viewer.cpp:2692-2693 and the 0.85 alpha of viewer.cpp:2810. */
 const STROKE_THICKNESS_DIVISOR = 1.5;
@@ -40,6 +41,32 @@ const PREVIEW_STYLE = 'rgba(255, 255, 255, 0.392)';
 const PREVIEW_WIDTH = 4;
 
 const IDENTITY = new THREE.Matrix4();
+
+/* The OrbitControls slot each mouse button reads its drag from. */
+const BUTTON_SLOTS = ['LEFT', 'MIDDLE', 'RIGHT'];
+
+/**
+ * The OrbitControls action that performs `action` for this press.
+ *
+ * OrbitControls has a shortcut of its own: while Ctrl, Shift or Meta is held
+ * it turns a rotate into a pan and a pan into a rotate.  navigation.js has
+ * already decided what those keys mean, so the swap is undone in advance --
+ * Shift + middle pans because it is handed a rotate, which the swap turns
+ * into the pan the table asked for.
+ */
+function orbitAction(action, event) {
+    const swapped = Boolean(event.ctrlKey || event.metaKey || event.shiftKey);
+    switch (action) {
+        case ORBIT:
+            return swapped ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+        case PAN:
+            return swapped ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+        case ZOOM:
+            return THREE.MOUSE.DOLLY;
+        default:
+            return null;
+    }
+}
 
 /* The imported model's own materials.  A material with nothing in the map
    being inspected is drawn this flat grey. */
@@ -878,9 +905,11 @@ export class Viewer {
         this.controls.zoomToCursor = true;
         /* Blender's navigation, because that is what the people who brush
            retopology already have in their hands: the middle button orbits,
-           the right button pans, and the left button is left to the brush. */
+           the right button pans, and the left button is left to the brush.
+           navigation.js has the whole table, modifiers included; every press
+           re-reads it, so these are only the plain drags. */
         this.controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
-        this._leftButton = null;
+        this._leftDrag = null;
         this._installCameraModifiers();
 
         /* Called once per animation frame, before anything is drawn, so a
@@ -926,21 +955,27 @@ export class Viewer {
     }
 
     /**
-     * Give Alt-drag to the camera, and keep the middle button out of the
-     * browser's hands.
+     * Decide what each drag does to the camera, and keep the middle button
+     * out of the browser's hands.
      *
-     * OrbitControls reads `mouseButtons.LEFT` inside its own pointerdown
-     * listener, which is registered on the canvas before any of ours, so the
-     * decision has to be made earlier still: a capture-phase listener on the
-     * document runs before every listener on the canvas itself, whatever order
-     * those were added in.
+     * The modifiers are read once, when the button goes down, and hold for
+     * the whole drag: letting go of Alt halfway through an orbit must not
+     * turn the rest of it into a brush stroke.
+     *
+     * OrbitControls reads `mouseButtons` inside its own pointerdown listener,
+     * which is registered on the canvas before any of ours, so the decision
+     * has to be made earlier still: a capture-phase listener on the document
+     * runs before every listener on the canvas itself, whatever order those
+     * were added in.
      */
     _installCameraModifiers() {
         this._onPointerDownCapture = (event) => {
-            if (event.button === 0) {
-                this.controls.mouseButtons.LEFT =
-                    event.altKey ? THREE.MOUSE.ROTATE : this._leftButton;
-            } else if (event.button === 1 && event.target === this.canvas) {
+            const slot = BUTTON_SLOTS[event.button];
+            if (slot) {
+                this.controls.mouseButtons[slot] =
+                    orbitAction(dragAction(event.button, event, this._leftDrag), event);
+            }
+            if (event.button === 1 && event.target === this.canvas) {
                 /* Suppressing the compatibility mouse events is what stops
                    Chrome and Firefox opening autoscroll on a middle-drag. */
                 event.preventDefault();
@@ -1557,8 +1592,8 @@ export class Viewer {
     setControlsEnabled(enabled) {
         /* Remembered rather than only assigned: an Alt-drag borrows the left
            button and has to know what to hand back afterwards. */
-        this._leftButton = enabled ? THREE.MOUSE.ROTATE : null;
-        this.controls.mouseButtons.LEFT = this._leftButton;
+        this._leftDrag = enabled ? ORBIT : null;
+        this.controls.mouseButtons.LEFT = orbitAction(this._leftDrag, {});
         this.controls.touches.ONE = enabled ? THREE.TOUCH.ROTATE : null;
         this.canvas.classList.toggle('drawing', !enabled);
     }

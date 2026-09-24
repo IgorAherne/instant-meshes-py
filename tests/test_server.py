@@ -23,6 +23,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 import pytest
@@ -157,8 +158,8 @@ def test_viewer_route_and_static_assets_are_served(client) -> None:
     assert "<canvas" in page.text
 
     for asset in ("main.js", "protocol.js", "renderer.js", "field_material.js",
-                  "tools.js", "net.js", "panel.js", "style.css",
-                  "vendor/three.module.js", "vendor/OrbitControls.js"):
+                  "tools.js", "net.js", "panel.js", "options.js", "navigation.js",
+                  "style.css", "vendor/three.module.js", "vendor/OrbitControls.js"):
         response = client.get(f"{STATIC_URL}/{asset}")
         assert response.status_code == 200, asset
         assert response.content, asset
@@ -168,6 +169,82 @@ def test_viewer_route_and_static_assets_are_served(client) -> None:
     # the document asks for itself, and a mismatch is a blank viewer.
     for url in re.findall(r'(?:src|href)="(/[^"]+)"', page.text):
         assert client.get(url).status_code == 200, url
+
+
+def test_viewer_url_with_no_options_is_the_plain_viewer_path() -> None:
+    """What app.py and every embedder before the options wrote by hand."""
+    assert server.viewer_url("abc123") == "/viewer?session=abc123"
+
+
+def test_viewer_url_leaves_the_defaults_out() -> None:
+    url = server.viewer_url(
+        "abc123", panel="left", export_label="  Export ", export_action="download",
+        host_origin="http://127.0.0.1:7770",  # only host mode uses it
+    )
+    assert url == "/viewer?session=abc123"
+
+
+def test_viewer_url_encodes_every_option() -> None:
+    url = server.viewer_url(
+        "a b&c", panel="right", export_label="Accept  &\tkeep", export_action="host",
+        host_origin="http://127.0.0.1:7770/",
+    )
+
+    parts = urlsplit(url)
+    assert parts.path == "/viewer"
+    # Nothing a value holds may split the query: the '&' and the spaces are
+    # escaped, and each option arrives exactly once.
+    assert " " not in url and url.count("&") == 4
+    assert parse_qs(parts.query, strict_parsing=True) == {
+        "session": ["a b&c"],
+        "panel": ["right"],
+        "export_label": ["Accept & keep"],
+        "export_action": ["host"],
+        # The bare origin, which is what a browser compares messages against.
+        "host_origin": ["http://127.0.0.1:7770"],
+    }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"panel": "top"},
+        {"export_action": "upload"},
+        {"export_action": "host"},
+        {"export_action": "host", "host_origin": ""},
+        {"export_action": "host", "host_origin": "127.0.0.1:7770"},
+        {"export_action": "host", "host_origin": "http://127.0.0.1:7770/page"},
+        {"export_action": "host", "host_origin": "http://127.0.0.1:7770?x=1"},
+        {"export_action": "host", "host_origin": "http://127.0.0.1:7770#top"},
+        {"export_action": "host", "host_origin": "http://me@127.0.0.1:7770"},
+        {"export_action": "host", "host_origin": "http://127.0.0.1:port"},
+        {"export_action": "host", "host_origin": "file:///C:/page.html"},
+        {"export_action": "host", "host_origin": "*"},
+    ],
+)
+def test_viewer_url_refuses_what_the_viewer_would_ignore(options) -> None:
+    """The viewer falls back to its defaults on these, with only a console
+    warning to say so; a host building the URL in Python hears it at once."""
+    with pytest.raises(ValueError):
+        server.viewer_url("abc123", **options)
+
+
+def test_the_viewer_page_is_the_same_whatever_its_options(client) -> None:
+    """The options are the page's to read, from its own URL: the server hands
+    out one document, so a default viewer cannot change by accident."""
+    plain = client.get("/viewer?session=abc123")
+    shaped = client.get(server.viewer_url(
+        "abc123", panel="right", export_label="Accept", export_action="host",
+        host_origin="http://127.0.0.1:7792",
+    ))
+    assert plain.status_code == shaped.status_code == 200
+    assert shaped.headers["content-type"].startswith("text/html")
+    assert shaped.text == plain.text
+
+    # The panel's side is read before the body is drawn, so it never jumps.
+    head = plain.text.split("</head>", 1)[0]
+    assert re.search(r'get\("panel"\)\s*===\s*"right"', head)
+    assert "dataset.panel" in head
 
 
 def test_the_asset_mount_leaves_gradios_alone(client) -> None:

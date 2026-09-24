@@ -87,6 +87,15 @@ const UV_SETTLE_MS = 120;
 /** How long an error holds the status line before the tool hint returns. */
 const ERROR_LINGER_MS = 6000;
 
+/** How long a confirmation holds it: long enough to be read, and no more. */
+const NOTE_LINGER_MS = 4000;
+
+/** The Export button's help when it hands the result to the page around the
+ *  viewer instead of writing a file. */
+const HOST_EXPORT_HINT =
+    'Hand this result, with the settings above, to the program showing this ' +
+    'viewer; it decides where the mesh goes.';
+
 function byId(id) {
     const element = document.getElementById(id);
     if (!element) throw new Error(`the viewer document is missing #${id}`);
@@ -294,6 +303,10 @@ class Hints {
         this.element = element;
         this._current = null;
 
+        const hide = () => {
+            this.element.hidden = true;
+            this._current = null;
+        };
         const show = (event) => {
             const host = event.target.closest('[data-hint]');
             if (host === this._current) return;
@@ -308,13 +321,13 @@ class Hints {
         };
 
         document.addEventListener('pointerover', show);
+        /* No related target: the pointer left the document altogether -- into
+           the host page around the viewer, say -- and the hint goes with it
+           rather than staying up over the viewport. */
         document.addEventListener('pointerout', (event) => {
-            if (!event.relatedTarget) show(event);
+            if (!event.relatedTarget) hide();
         });
-        document.addEventListener('pointerdown', () => {
-            this.element.hidden = true;
-            this._current = null;
-        });
+        document.addEventListener('pointerdown', hide);
         /* A scroll moves the anchor out from under the bubble. */
         document.addEventListener('scroll', () => { this.element.hidden = true; }, true);
     }
@@ -403,6 +416,11 @@ export class Panel {
         this._message = null;
         this._isError = false;
         this._statusTimer = 0;
+
+        /* What the Export button says, which a host page may rename, and
+           whether the page it hands results to is still busy with one. */
+        this._exportLabel = this.el.export.textContent.trim();
+        this._exportBusy = false;
 
         this.el.targetRange.value = targetToSlider(this.el.target.value);
         this._bind();
@@ -636,6 +654,32 @@ export class Panel {
             // pure quad step subdivides afterwards: the target vertex count
             // has to be aimed at a quarter of itself to still come true.
             pure_quad: this.option('pure-quad'),
+        };
+    }
+
+    /**
+     * Every setting in the panel that shapes the output, for a host page that
+     * takes the result from here: it can keep them with the mesh, and open
+     * the viewer with them next time.
+     *
+     * Named for what the controls say rather than for the solver's Config,
+     * and read from the controls rather than from the server, because this
+     * is what the user pressed the button on. The one derived value is
+     * `crease_angle`, which is what "Sharp Creases" means to the solver.
+     */
+    exportSettings() {
+        const config = this.readConfig();
+        return {
+            target_vertices: config.vertex_count,
+            pure_quad: config.pure_quad,
+            symmetry: { rosy: config.rosy, posy: config.posy },
+            smoothing: this.extractOptions().smooth_iter,
+            extrinsic: config.extrinsic,
+            boundaries: config.align_to_boundaries,
+            creases: this.option('creases'),
+            crease_angle: config.crease_angle,
+            format: this.el.format.value,
+            uv_leniency: this.uvLeniency(),
         };
     }
 
@@ -924,6 +968,49 @@ export class Panel {
         link.click();
     }
 
+    /**
+     * Rename the Export button, and say what it does in host mode.
+     *
+     * @param {{exportLabel: string, exportAction: string}} options  from
+     *        options.js; the defaults leave the button exactly as it was
+     */
+    useExportOptions({ exportLabel, exportAction }) {
+        this._exportLabel = exportLabel;
+        this.el.export.textContent = exportLabel;
+        if (exportAction === 'host') this.el.export.dataset.hint = HOST_EXPORT_HINT;
+    }
+
+    /**
+     * Show what the host page is doing with a result it was handed.
+     *
+     * busy: the button spins, says "<label>...", and cannot be pressed again
+     * until the page is done. done: the button comes back and the status line
+     * confirms for a moment. error: the button comes back and the page's
+     * message goes on the status line as an error, which stays until read.
+     *
+     * @param {'busy'|'done'|'error'} state
+     * @param {string} [message]  the page's own words, if it sent any
+     */
+    setExportState(state, message) {
+        const busy = state === 'busy';
+        this._exportBusy = busy;
+        this.el.export.classList.toggle('busy', busy);
+        this.el.export.setAttribute('aria-busy', String(busy));
+        this.el.export.textContent = busy ? `${this._exportLabel}…` : this._exportLabel;
+        this.setSolving(Boolean(this._solving));
+
+        if (state === 'done') {
+            this.setStatus(message || `${this._exportLabel}: done`, false);
+            /* A confirmation is not worth keeping the brush's help away for.
+               Anything said after it cancels this along with it. */
+            this._statusTimer = setTimeout(() => this.setStatus(null), NOTE_LINGER_MS);
+        } else if (state === 'error') {
+            this.setStatus(message || `${this._exportLabel} failed`, true);
+        } else if (busy && message) {
+            this.setStatus(message, false);
+        }
+    }
+
     showTool(tool) {
         for (const button of document.querySelectorAll('button.tool')) {
             button.setAttribute('aria-checked', String(button.dataset.tool === tool.id));
@@ -952,7 +1039,7 @@ export class Panel {
      *  the one place this UI could strand somebody. */
     setSolving(active) {
         this._solving = active;
-        this.el.export.disabled = active || !this._ready;
+        this.el.export.disabled = active || !this._ready || this._exportBusy;
     }
 
     setReady(ready) {

@@ -29,9 +29,11 @@ const ERASE_RADIUS_EDGES = 2;
 
 /* The camera keys, spelled the way a Blender user expects them.  The left
    button belongs to the brush at all times -- that is the whole point of the
-   viewport -- so navigation lives on the middle button and on Alt. */
+   viewport -- so navigation lives on the middle button, the right button and
+   Alt; navigation.js has the full table. */
 const NAVIGATION_HINT =
-    'Middle-drag or Alt-drag orbits, right-drag pans, wheel zooms, F frames the model.';
+    'Middle-drag or Alt + left-drag orbits, right-drag or Shift + middle-drag pans, ' +
+    'wheel, Ctrl + middle-drag or Alt + right-drag zooms, F frames the model.';
 
 /**
  * The four brushes.  `kind` is what goes into the STROKE header: the two

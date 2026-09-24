@@ -41,6 +41,7 @@ from typing import (
     Sequence,
     Tuple,
 )
+from urllib.parse import quote, urlencode, urlsplit
 
 import numpy as np
 import uvicorn
@@ -83,6 +84,15 @@ INDEX_HTML = STATIC_DIR / "index.html"
 #: registered here are matched before the Gradio mount, taking that prefix
 #: would 404 them for every host application.  index.html hard-codes this.
 STATIC_URL = "/imb-assets"
+
+#: The page a host embeds, one per session: ``/viewer?session=<id>``.
+VIEWER_PATH = "/viewer"
+
+#: The viewer's own options, read by static/options.js from its URL; see
+#: :func:`viewer_url`.  The first of each is the default.
+VIEWER_PANEL_SIDES: Tuple[str, ...] = ("left", "right")
+VIEWER_EXPORT_ACTIONS: Tuple[str, ...] = ("download", "host")
+DEFAULT_EXPORT_LABEL = "Export"
 
 DEFAULT_FPS = 15
 MIN_FPS = 1
@@ -142,6 +152,93 @@ _SOLVE_PLANS: Dict[str, Tuple[str, int]] = {
     "orientation": _STROKE_SOLVE,
     "edge": _STROKE_SOLVE,
 }
+
+
+# ---------------------------------------------------------------------------
+#  The viewer page's URL
+# ---------------------------------------------------------------------------
+
+
+def _host_origin(raw: str) -> str:
+    """``raw`` as a bare http(s) origin, or ValueError.
+
+    The same rule the viewer applies (options.js hostOriginOf): a scheme, a
+    host and maybe a port, and nothing else -- a path or a query means the
+    caller has not said which page it means, and host mode must not guess.
+    """
+    parts = urlsplit(raw.strip())
+    try:
+        usable = (
+            parts.scheme in ("http", "https")
+            and bool(parts.hostname)
+            and parts.username is None
+            and parts.password is None
+            and parts.path in ("", "/")
+            and not parts.query
+            and not parts.fragment
+            # Reading the port validates it: "http://host:abc" raises here.
+            and (parts.port is None or parts.port > 0)
+        )
+    except ValueError:
+        usable = False
+    if not usable:
+        raise ValueError(
+            f"host_origin must be a page's origin such as http://127.0.0.1:7770, not {raw!r}"
+        )
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def viewer_url(
+    session_id: str,
+    *,
+    panel: str = "left",
+    export_label: Optional[str] = None,
+    export_action: str = "download",
+    host_origin: Optional[str] = None,
+) -> str:
+    """The path of the viewer page for ``session_id``, with its options.
+
+    ``panel`` docks the control panel on the ``"left"`` (default) or the
+    ``"right"`` of the viewport; on the right, the readout -- the brush's name
+    and the status line -- moves to the viewport's bottom-right corner too.
+    ``export_label`` renames the Export button (``"Accept"``).
+    ``export_action="host"`` makes that button write and download nothing:
+    it posts an ``export-request`` message to the page embedding the viewer,
+    which answers with ``export-state`` messages (README_PYTHON.md has the
+    protocol). It needs ``host_origin``, the embedding page's origin, which is
+    the only origin the viewer then talks to and listens to; it is ignored in
+    the default ``"download"`` mode.
+
+    Options left at their defaults are left out of the URL, so
+    ``viewer_url(session_id)`` is the plain ``/viewer?session=<id>`` every
+    embedder has always used. Everything is URL-encoded.
+
+    Raises ValueError for a side or an action the viewer does not know, and
+    for host mode without a usable ``host_origin``: the viewer itself would
+    only fall back to its defaults and say so in the browser's console, which
+    is a mistake far easier to catch here.
+    """
+    if not session_id:
+        raise ValueError("viewer_url needs a session id")
+    if panel not in VIEWER_PANEL_SIDES:
+        raise ValueError(f"panel must be one of {VIEWER_PANEL_SIDES}, not {panel!r}")
+    if export_action not in VIEWER_EXPORT_ACTIONS:
+        raise ValueError(
+            f"export_action must be one of {VIEWER_EXPORT_ACTIONS}, not {export_action!r}"
+        )
+
+    query: List[Tuple[str, str]] = [("session", session_id)]
+    if panel != VIEWER_PANEL_SIDES[0]:
+        query.append(("panel", panel))
+    label = " ".join((export_label or "").split())
+    if label and label != DEFAULT_EXPORT_LABEL:
+        query.append(("export_label", label))
+    if export_action == "host":
+        if not host_origin:
+            raise ValueError("export_action='host' needs host_origin, the embedding page's origin")
+        query.append(("export_action", export_action))
+        query.append(("host_origin", _host_origin(host_origin)))
+    return f"{VIEWER_PATH}?{urlencode(query, quote_via=quote)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1078,7 +1175,10 @@ def build_app(registry: Optional[SessionRegistry] = None) -> FastAPI:
             response.headers["cache-control"] = "no-cache"
         return response
 
-    @app.get("/viewer", include_in_schema=False)
+    # The page is the same file whatever the query says: the viewer reads its
+    # options (panel side, Export button) from its own URL, so the server
+    # neither parses nor rewrites them. See viewer_url().
+    @app.get(VIEWER_PATH, include_in_schema=False)
     async def viewer() -> FileResponse:
         if not INDEX_HTML.is_file():
             raise HTTPException(status_code=404, detail=f"{INDEX_HTML.name} is not installed")

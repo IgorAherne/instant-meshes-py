@@ -19,6 +19,16 @@
     <script type="importmap">
       { "imports": { "three": "/imb-assets/vendor/three.module.js" } }
     </script>
+    <!--
+      A host page may dock the panel on the right (?panel=right). Read here,
+      before anything is drawn, so the panel never shows up on the wrong side
+      first; main.js reads the rest of the options, this one included.
+    -->
+    <script>
+      if (new URLSearchParams(location.search).get("panel") === "right") {
+        document.documentElement.dataset.panel = "right";
+      }
+    </script>
   </head>
   <body>
     <!--
@@ -29,7 +39,8 @@
 
       The panel carries only what the user acts on; everything the user merely
       reads -- what is loaded, what the tool does, what the solver is doing --
-      sits in the stage's bottom-left corner, where it costs no panel height.
+      sits in the stage's bottom corner beside the panel (bottom-left, or
+      bottom-right with ?panel=right), where it costs no panel height.
     -->
     <div id="app">
       <aside id="panel" aria-label="Controls">

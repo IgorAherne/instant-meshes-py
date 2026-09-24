@@ -123,17 +123,22 @@ solved field, so an attractor's effect does not survive a re-target the way a
 brush stroke does.
 
 The left button always belongs to the selected brush, so navigation lives where
-a Blender user expects it:
+a Blender, 3ds Max, Maya or Unity user expects it:
 
 | | |
 |---|---|
-| Middle-drag, or Alt + left-drag | Orbit |
-| Right-drag | Pan |
-| Wheel | Zoom |
+| Middle-drag, Alt + middle-drag, or Alt + left-drag | Orbit |
+| Right-drag, or Shift + middle-drag | Pan |
+| Wheel (toward the cursor), Ctrl + middle-drag, or Alt + right-drag | Zoom |
 | `F` | Frame the model, keeping the angle |
 | `C` / `E` | Orientation comb / edge brush |
 | `1` / `2` / `3` | Input / Result / Result UV |
 | `Esc` | Cancel the stroke being drawn |
+
+The modifiers are read when the button goes down, so letting go of Alt halfway
+through an orbit does not turn the rest of it into a stroke. The mouse part of
+this table lives in `static/navigation.js`, free of three.js, for a host that
+wants its own model viewer to feel the same in the hand.
 
 The three buttons under the resolution pick the view: **Input** is the surface
 you brush on, **Result** the extracted quad mesh, **Result UV** that mesh
@@ -243,6 +248,88 @@ would 404 your page's own fonts.
 `default_registry().get(session_id)` and call the `BrushSession` coroutines —
 the viewport picks the change up over its own socket, including a mesh you load
 from outside it.
+
+### Viewer options
+
+Any other page can embed the viewer the same way — an `<iframe>` on
+`/viewer?session=<id>` — and shape it with query parameters. All are optional;
+without them the viewer is exactly the one above.
+
+| Parameter | Values | What it does |
+|---|---|---|
+| `panel` | `left` (default), `right` | The side the control panel docks on. On the right, the readout (the brush's name and the status line) moves to the viewport's bottom-right corner with it. |
+| `export_label` | any short text | The Export button's text, e.g. `Accept`. One line, 32 characters at most. |
+| `export_action` | `download` (default), `host` | `download`: Export writes the mesh and the browser downloads it. `host`: the button writes and downloads nothing; it asks the embedding page instead (below). |
+| `host_origin` | an origin, e.g. `http://127.0.0.1:7770` | Required by `export_action=host`: the embedding page's origin. Nothing but a scheme, a host and a port. |
+
+Build the URL in Python rather than by hand; it URL-encodes everything, leaves
+the defaults out, and raises `ValueError` for anything the viewer would ignore:
+
+```python
+from instant_meshes_brush.server import viewer_url
+
+viewer_url("abc123")
+# '/viewer?session=abc123'
+viewer_url("abc123", panel="right", export_label="Accept",
+           export_action="host", host_origin="http://127.0.0.1:7770")
+# '/viewer?session=abc123&panel=right&export_label=Accept&export_action=host&host_origin=http%3A%2F%2F127.0.0.1%3A7770'
+```
+
+The viewer applies the same rules on its side: an unknown value, host mode
+without a valid `host_origin`, or host mode in a page that is not inside a
+frame falls back to the default, and says so as a warning in the browser's
+console.
+
+**Host mode.** With `export_action=host` the button is the page's to answer.
+Messages go through `window.postMessage`, in both directions pinned to
+`host_origin`: the viewer posts only to that origin (the browser drops the
+message if the parent page is anything else), and it takes a message only when
+it comes from its parent window *and* from that origin, so neither another
+frame on the page nor a stranger can speak for the host.
+
+Pressing the button posts to the parent:
+
+```js
+{
+  source: 'instant-meshes',
+  type: 'export-request',
+  session: '<session id>',
+  settings: {
+    target_vertices: 3000,           // Target vertex count
+    pure_quad: false,                // Force Quads
+    symmetry: { rosy: 4, posy: 4 },  // the Output mesh choice, as Config's rosy / posy
+    smoothing: 2,                    // Smoothing (Config's smooth_iter)
+    extrinsic: true,                 // Smooth Flow
+    boundaries: false,               // Follow Borders
+    creases: false,                  // Sharp Creases
+    crease_angle: -1,                // what Sharp Creases means to Config: 30, or -1 for off
+    format: 'obj',                   // the format picker: 'obj' or 'ply'
+    uv_leniency: 0.5,                // UV chunks, 0..1
+  },
+  strokes: 0,                        // guide strokes on the model
+}
+```
+
+Nothing is extracted, written or downloaded by the viewer: the page reads the
+mesh through its own server, which shares the session (for example with
+`BrushSession.extract()` and `export_mesh()`). It then answers:
+
+```js
+viewerFrame.contentWindow.postMessage(
+  { source: 'my-app', type: 'export-state', state: 'busy' },     // 'busy' | 'done' | 'error'
+  viewerOrigin,
+);
+```
+
+| `state` | The viewer shows |
+|---|---|
+| `busy` | A spinner and "Accept…" on the button, which cannot be pressed again until the next state. |
+| `done` | The button back to normal, and a confirmation on the status line for a few seconds: the `message` if one was sent, otherwise "Accept: done". |
+| `error` | The button back to normal, and the `message` (or "Accept failed") on the status line as an error. |
+
+`message` is optional plain text; `source` names the sender and is not
+checked. A second press within two seconds of the first, before any answer, is
+ignored, so a double click asks once.
 
 ---
 
@@ -433,12 +520,14 @@ python/instant_meshes_brush/
     fbx_media.py            an FBX's materials, texture bindings and embedded images
     uv.py                   xatlas atlas, mapped back onto the quads
     session_manager.py      one C++ session per browser, with a TTL sweeper
-    server.py               FastAPI: /viewer, /imb-assets, /ws/{id}, uploads
+    server.py               FastAPI: /viewer, /imb-assets, /ws/{id}, uploads; viewer_url()
     app.py                  the Gradio wrapper -- an iframe and nothing else
     static/
         index.html          the viewport, controls included
         panel.js            the control panel and its hover help
-        main.js             session wiring and frame coalescing
+        main.js             session wiring, frame coalescing, host mode
+        options.js          the viewer options a host page puts in the URL
+        navigation.js       which camera move each drag makes
         renderer.js         three.js scene: surface, strokes, output mesh
         field_material.js   the field grid, ported to WebGL2
 ```

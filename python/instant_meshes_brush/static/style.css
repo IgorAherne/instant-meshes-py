@@ -48,6 +48,12 @@ body {
     height: 100%;
 }
 
+/* A host page that keeps its own controls on the left docks ours on the
+   right (?panel=right), so the two never sandwich the model between them. */
+html[data-panel="right"] #app {
+    flex-direction: row-reverse;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Control panel                                                      */
 /* ------------------------------------------------------------------ */
@@ -59,6 +65,11 @@ body {
     min-width: 0;
     background: var(--panel);
     border-right: 1px solid var(--panel-edge);
+}
+
+html[data-panel="right"] #panel {
+    border-right: 0;
+    border-left: 1px solid var(--panel-edge);
 }
 
 #panel-head {
@@ -194,6 +205,38 @@ button.go {
 
 button.go:hover:not(:disabled) {
     background: var(--go-hot);
+}
+
+/* The host page is working on what the button handed it. Disabled, but not
+   faded like a button that cannot be used: this one is in use. */
+button.go.busy:disabled {
+    opacity: 0.85;
+    cursor: progress;
+}
+
+button.go.busy::before {
+    content: "";
+    display: inline-block;
+    width: 11px;
+    height: 11px;
+    margin-right: 8px;
+    vertical-align: -1px;
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    button.go.busy::before {
+        animation-duration: 2.4s;
+    }
 }
 
 /* The two ends of the workflow: the way in and the way out. They carry the
@@ -649,6 +692,14 @@ kbd {
     /* A stroke drawn across this corner has to reach the canvas underneath. */
     pointer-events: none;
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75);
+}
+
+/* With the panel on the right the readout follows it into the bottom-right
+   corner, so what the brush does is still read right beside where it is
+   chosen. */
+html[data-panel="right"] #readout {
+    align-items: flex-end;
+    text-align: right;
 }
 
 #readout p {
