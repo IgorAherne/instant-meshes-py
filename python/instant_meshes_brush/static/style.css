@@ -133,6 +133,23 @@ html[data-panel="right"] #panel {
         no-repeat center / 100% 1px;
 }
 
+/* Host mode: the button that hands the result to the page, under the scroll. */
+#panel-foot {
+    flex: 0 0 auto;
+    padding: 10px 12px 12px;
+    border-top: 1px solid var(--panel-edge);
+}
+
+#panel-foot #output-stats {
+    margin: 6px 0 0;
+}
+
+/* Host mode: the page brings the model and chooses the file it becomes. */
+html[data-export="host"] #btn-open,
+html[data-export="host"] #format {
+    display: none;
+}
+
 .block h2 {
     margin: 0 0 8px;
     font-size: 11px;

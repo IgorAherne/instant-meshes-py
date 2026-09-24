@@ -281,7 +281,10 @@ frame falls back to the default, and says so as a warning in the browser's
 console.
 
 **Host mode.** With `export_action=host` the button is the page's to answer.
-Messages go through `window.postMessage`, in both directions pinned to
+The page also owns the model: Import mesh and the file-format picker are
+hidden, a file dropped on the viewer is ignored, and the button waits at the
+foot of the panel, under its scrolling part, so it stays in sight in a short
+frame. Messages go through `window.postMessage`, in both directions pinned to
 `host_origin`: the viewer posts only to that origin (the browser drops the
 message if the parent page is anything else), and it takes a message only when
 it comes from its parent window *and* from that origin, so neither another

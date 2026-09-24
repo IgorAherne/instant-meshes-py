@@ -421,6 +421,8 @@ export class Panel {
            whether the page it hands results to is still busy with one. */
         this._exportLabel = this.el.export.textContent.trim();
         this._exportBusy = false;
+        /* Whether a model may be brought in here; a host page brings its own. */
+        this._importsMeshes = true;
 
         this.el.targetRange.value = targetToSlider(this.el.target.value);
         this._bind();
@@ -568,11 +570,13 @@ export class Panel {
         const carriesFiles = (event) =>
             Boolean(event.dataTransfer) && [...event.dataTransfer.types].includes('Files');
 
+        /* Taken even when nothing is imported: a file dropped on the page
+           would otherwise replace the viewer with that file. */
         on(document, 'dragover', (event) => {
             if (!carriesFiles(event)) return;
             event.preventDefault();
-            event.dataTransfer.dropEffect = 'copy';
-            stage.classList.add('dropping');
+            event.dataTransfer.dropEffect = this._importsMeshes ? 'copy' : 'none';
+            if (this._importsMeshes) stage.classList.add('dropping');
         });
         on(document, 'dragleave', (event) => {
             if (!event.relatedTarget) stage.classList.remove('dropping');
@@ -581,6 +585,7 @@ export class Panel {
             if (!carriesFiles(event)) return;
             event.preventDefault();
             stage.classList.remove('dropping');
+            if (!this._importsMeshes) return;
 
             const entries = [...event.dataTransfer.items]
                 .map((item) => item.webkitGetAsEntry && item.webkitGetAsEntry())
@@ -977,7 +982,16 @@ export class Panel {
     useExportOptions({ exportLabel, exportAction }) {
         this._exportLabel = exportLabel;
         this.el.export.textContent = exportLabel;
-        if (exportAction === 'host') this.el.export.dataset.hint = HOST_EXPORT_HINT;
+        if (exportAction !== 'host') return;
+        this.el.export.dataset.hint = HOST_EXPORT_HINT;
+        /* The page brings the model and decides what file it becomes, so the
+           way in (Import mesh, a drop) and the format go; the button that hands
+           the result over waits at the panel's foot, never scrolled away. */
+        this._importsMeshes = false;
+        document.documentElement.dataset.export = 'host';
+        const foot = byId('panel-foot');
+        foot.append(this.el.export, this.el.outputStats);
+        foot.hidden = false;
     }
 
     /**
